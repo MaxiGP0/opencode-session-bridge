@@ -5,6 +5,80 @@ const POLL_MS = 250
 const MAX_TEXT = 4_000
 const MAX_TOTAL = 20_000
 
+type Lang = "es" | "en"
+
+const ES_TO_EN: Array<[string, string]> = [
+  ["Mensaje enviado. La sesión sigue en segundo plano.", "Message sent. The session continues in the background."],
+  [
+    "Usa sessions.reply con el ID de la solicitud para aprobar o rechazar.",
+    "Use sessions.reply with the request ID to approve or reject.",
+  ],
+  ["Usa sessions.reply con el ID de la solicitud para responder.", "Use sessions.reply with the request ID to respond."],
+  ["Usa sessions.reply con sessionID y requestID para responder.", "Use sessions.reply with sessionID and requestID to respond."],
+  ["No se pudo abrir la sesión: ", "Could not open the session: "],
+  ["No se pudo enviar el mensaje: ", "Could not send the message: "],
+  ["No se pudo consultar la sesión: ", "Could not inspect the session: "],
+  ["No se pudieron consultar los permisos: ", "Could not query permissions: "],
+  ["No se pudo responder al permiso: ", "Could not reply to permission: "],
+  ["No se pudo leer la sesión: ", "Could not read the session: "],
+  ["No se pudo esperar la sesión: ", "Could not wait for the session: "],
+  ["No se pudo interrumpir la sesión: ", "Could not interrupt the session: "],
+  ["No se pudieron listar las sesiones: ", "Could not list sessions: "],
+  ["Sesión creada: ", "Session created: "],
+  ["Sesión: ", "Session: "],
+  ["Sesión ", "Session "],
+  ["Título: ", "Title: "],
+  ["Mensaje enviado: ", "Message sent: "],
+  ["Estado: ", "State: "],
+  ["Resultado: ", "Result: "],
+  ["Última actualización: ", "Last update: "],
+  ["Último texto: ", "Last text: "],
+  ["Último mensaje: ", "Last message: "],
+  ["Texto final: (sin texto)", "Final text: (no text)"],
+  ["Texto final:\n", "Final text:\n"],
+  ["Acciones recientes: (ninguna)", "Recent actions: (none)"],
+  ["Acciones: (ninguna)", "Actions: (none)"],
+  ["Acciones recientes (", "Recent actions ("],
+  ["Acciones (", "Actions ("],
+  ["Permisos pendientes (", "Pending permissions ("],
+  ["sigue en ejecución (tiempo agotado)", "still running (timed out)"],
+  ["espera cancelada", "wait cancelled"],
+  ["inactiva (sin turnos)", "idle (no turns)"],
+  ["en ejecución", "running"],
+  ["inactiva", "idle"],
+  ["No hay turnos pendientes.", "No pending turns."],
+  ["No hay sesiones.", "No sessions."],
+  ["Sesiones:\n", "Sessions:\n"],
+  ["Usuario: ", "User: "],
+  ["Asistente [error]: ", "Assistant [error]: "],
+  ["Asistente: ", "Assistant: "],
+  ["— Fin de turno: ", "— End of turn: "],
+  ["(sin mensajes)", "(no messages)"],
+  ["… (transcripción recortada)", "… (transcript truncated)"],
+  ["(sin título)", "(untitled)"],
+  ["(sin texto)", "(no text)"],
+  ["(desconocido)", "(unknown)"],
+  ["(sin recursos)", "(no resources)"],
+  ["recordar: ", "remember: "],
+  [" | padre: ", " | parent: "],
+  ["Solicitud ", "Request "],
+  ["aprobada una vez", "approved once"],
+  ["aprobada y recordada", "approved and saved"],
+  ["rechazada", "rejected"],
+  ["no hay solicitudes de permiso pendientes.", "no pending permission requests."],
+  ["interrumpida", "interrupted"],
+  ["no había un turno activo", "there was no active turn"],
+]
+
+function localize(content: string, language: Lang) {
+  if (language !== "en") return content
+  let result = content
+  for (const [spanish, english] of ES_TO_EN) {
+    result = result.split(spanish).join(english)
+  }
+  return result
+}
+
 type PermissionRule = {
   action: string
   resource: string
@@ -69,6 +143,10 @@ type ListInput = {
   limit?: number
   search?: string
   directory?: string
+}
+
+type LanguageInput = {
+  language?: Lang
 }
 
 type TurnResult = {
@@ -310,13 +388,33 @@ function formatError(error: unknown) {
 export default Plugin.define({
   id: "session-bridge",
   async setup(ctx) {
+    const configured = ctx.options?.language
+    const stored = await ctx.storage?.get("language").catch(() => undefined)
+    let language: Lang =
+      stored === "es" || stored === "en"
+        ? stored
+        : configured === "es" || configured === "en"
+          ? configured
+          : "en"
+
+    const localized = (definition: any) => ({
+      ...definition,
+      execute: async (input: any, context: any) => {
+        const result = await definition.execute(input, context)
+        if (result && typeof result.content === "string") {
+          return { ...result, content: localize(result.content, language) }
+        }
+        return result
+      },
+    })
+
     await ctx.tool.transform((editor) => {
       editor.namespace({
         name: "sessions",
         description: "Open, observe, and control other OpenCode sessions",
       })
 
-      editor.add({
+      editor.add(localized({
         name: "open",
         description:
           "Create a NEW OpenCode session in the current directory, send it a message, and wait for its turn. Returns the final state, response text, and actions (tools) performed. Inherits the current session's model unless another one is specified.",
@@ -406,9 +504,9 @@ export default Plugin.define({
             return { content: `No se pudo abrir la sesión: ${formatError(error)}` }
           }
         },
-      })
+      }))
 
-      editor.add({
+      editor.add(localized({
         name: "send",
         description:
           "Send a message to an existing OpenCode session. Can switch its agent or model, wait for the turn, and return the state, response, and actions performed.",
@@ -476,9 +574,9 @@ export default Plugin.define({
             return { content: `No se pudo enviar el mensaje: ${formatError(error)}` }
           }
         },
-      })
+      }))
 
-      editor.add({
+      editor.add(localized({
         name: "status",
         description:
           "Check right now whether a session is running or idle, its result, the last text it produced, recent tools, and the last message ID for reading further.",
@@ -537,9 +635,9 @@ export default Plugin.define({
             return { content: `No se pudo consultar la sesión: ${formatError(error)}` }
           }
         },
-      })
+      }))
 
-      editor.add({
+      editor.add(localized({
         name: "permissions",
         description:
           "List pending permission requests for a session, with their action, resources, and request ID. Use sessions.reply to approve or reject them.",
@@ -568,9 +666,9 @@ export default Plugin.define({
             return { content: `No se pudieron consultar los permisos: ${formatError(error)}` }
           }
         },
-      })
+      }))
 
-      editor.add({
+      editor.add(localized({
         name: "reply",
         description:
           "Approve or reject a pending permission request. Use once to allow this time, always to allow and save the rule, or reject to deny it.",
@@ -613,9 +711,9 @@ export default Plugin.define({
             return { content: `No se pudo responder al permiso: ${formatError(error)}` }
           }
         },
-      })
+      }))
 
-      editor.add({
+      editor.add(localized({
         name: "read",
         description:
           "Read a session's recent transcript: user messages, assistant text, executed tools (with their input/output), and the result of each turn.",
@@ -676,9 +774,9 @@ export default Plugin.define({
             return { content: `No se pudo leer la sesión: ${formatError(error)}` }
           }
         },
-      })
+      }))
 
-      editor.add({
+      editor.add(localized({
         name: "wait",
         description:
           "Wait for the session to finish the current turn (or the last started turn) and return its result, final text, and actions. If it is already idle, returns immediately.",
@@ -754,9 +852,9 @@ export default Plugin.define({
             return { content: `No se pudo esperar la sesión: ${formatError(error)}` }
           }
         },
-      })
+      }))
 
-      editor.add({
+      editor.add(localized({
         name: "interrupt",
         description: "Interrupt a session's running turn.",
         input: {
@@ -783,9 +881,9 @@ export default Plugin.define({
             return { content: `No se pudo interrumpir la sesión: ${formatError(error)}` }
           }
         },
-      })
+      }))
 
-      editor.add({
+      editor.add(localized({
         name: "list",
         description:
           "List OpenCode sessions in the current directory, with their ID, title, state, result, and last update.",
@@ -822,7 +920,42 @@ export default Plugin.define({
             return { content: `No se pudieron listar las sesiones: ${formatError(error)}` }
           }
         },
-      })
+      }))
+
+      editor.add(localized({
+        name: "language",
+        description:
+          "Get or set the output language of this plugin. Use es for Spanish or en for English. The setting persists across sessions.",
+        input: {
+          type: "object",
+          properties: {
+            language: {
+              type: "string",
+              enum: ["es", "en"],
+              description: "Output language: es (Spanish) or en (English). Omit to read the current setting.",
+            },
+          },
+          required: [],
+          additionalProperties: false,
+        },
+        options: { namespace: "sessions", codemode: true },
+        execute: async (input) => {
+          const data = input as LanguageInput
+          if (data.language === "es" || data.language === "en") {
+            language = data.language
+            await ctx.storage?.set("language", language).catch(() => undefined)
+            return {
+              content: language === "es" ? "Idioma de salida: español." : "Output language: English.",
+            }
+          }
+          return {
+            content:
+              language === "es"
+                ? 'Idioma de salida actual: español. Usa sessions.language con language: "en" para cambiarlo.'
+                : 'Current output language: English. Use sessions.language with language: "es" to change it.',
+          }
+        },
+      }))
     })
   },
 })

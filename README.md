@@ -18,6 +18,7 @@ session list and can be inspected or resumed later.
 - Wait for a turn to finish, with a configurable timeout.
 - Interrupt a running session.
 - Inspect and answer pending permission requests.
+- Switch tool output between English and Spanish.
 - List sessions in a directory with status and outcome.
 
 ## Requirements
@@ -57,6 +58,7 @@ All tools live in the `sessions` namespace.
 | `sessions.status` | Immediate snapshot: running/idle, outcome, last text, recent tools, pending permissions, last message ID. |
 | `sessions.permissions` | List pending permission requests for a session. |
 | `sessions.reply` | Approve or reject a pending permission request (`once`, `always`, or `reject`). |
+| `sessions.language` | Get or set the output language (`en` by default, `es` available). |
 | `sessions.read` | Read the transcript, including tool calls and optional tool output. |
 | `sessions.wait` | Wait for the current turn to finish and return the result. |
 | `sessions.interrupt` | Interrupt the running turn. |
@@ -124,6 +126,29 @@ await tools.sessions.open({
 })
 ```
 
+### Output language
+
+Tool output is English by default. Switch to Spanish (or back) at runtime:
+
+```ts
+await tools.sessions.language({ language: "es" })
+await tools.sessions.language({ language: "en" })
+```
+
+The setting is persisted in the plugin's storage. When the plugin is loaded
+through the `plugins` array, you can also set a default:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "opencode-session-bridge",
+      "options": { "language": "en" }
+    }
+  ]
+}
+```
+
 ## How it works
 
 The plugin uses the OpenCode server session API through the plugin context:
@@ -148,8 +173,9 @@ New sessions inherit the **model of the calling session** by default and use the
   session keeps running and can be checked again with `sessions.status`.
 - The plugin does not delete sessions. Remove old sessions from the UI or the
   API if you create many of them.
-- Tool descriptions are in English, but tool output is currently written in
-  Spanish. The underlying session API is language-agnostic.
+- Tool descriptions are in English. Output is English by default and can be
+  switched at runtime with `sessions.language` or with the `language` plugin
+  option. The underlying session API is language-agnostic.
 
 ## Development
 

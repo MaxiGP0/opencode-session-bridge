@@ -20,6 +20,7 @@ normal de sesiones y se pueden inspeccionar o retomar después.
 - Esperar a que termine un turno, con un límite de tiempo configurable.
 - Interrumpir una sesión en ejecución.
 - Consultar y responder solicitudes de permiso pendientes.
+- Cambiar la salida de las herramientas entre inglés y español.
 - Listar las sesiones de un directorio con su estado y resultado.
 
 ## Requisitos
@@ -59,6 +60,7 @@ Todas las herramientas viven en el namespace `sessions`.
 | `sessions.status` | Consulta inmediata: en ejecución/inactiva, resultado, último texto, herramientas recientes, permisos pendientes y último mensaje. |
 | `sessions.permissions` | Lista las solicitudes de permiso pendientes de una sesión. |
 | `sessions.reply` | Aprueba o rechaza una solicitud pendiente (`once`, `always` o `reject`). |
+| `sessions.language` | Consulta o cambia el idioma de salida (`en` por defecto, `es` disponible). |
 | `sessions.read` | Lee la transcripción, incluyendo herramientas y opcionalmente su salida. |
 | `sessions.wait` | Espera a que termine el turno actual y devuelve el resultado. |
 | `sessions.interrupt` | Interrumpe el turno en ejecución. |
@@ -126,6 +128,30 @@ await tools.sessions.open({
 })
 ```
 
+### Idioma de salida
+
+La salida de las herramientas está en inglés por defecto. Cambia a español (o
+vuelve al inglés) en tiempo de ejecución:
+
+```ts
+await tools.sessions.language({ language: "es" })
+await tools.sessions.language({ language: "en" })
+```
+
+La preferencia se guarda en el almacenamiento del plugin. Si el plugin se carga
+desde el array `plugins`, también puedes fijar un idioma por defecto:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "opencode-session-bridge",
+      "options": { "language": "en" }
+    }
+  ]
+}
+```
+
 ## Cómo funciona
 
 El plugin usa la API de sesiones del servidor de OpenCode a través del contexto
@@ -152,8 +178,9 @@ usan el agente `build`. Ambos se pueden cambiar con las opciones `model` y
   sigue ejecutándose y se puede consultar de nuevo con `sessions.status`.
 - El plugin no elimina sesiones. Borra las antiguas desde la interfaz o la API si
   creas muchas.
-- Las descripciones de las herramientas están en inglés, pero su salida sigue
-  en español. La API de sesiones subyacente es independiente del idioma.
+- Las descripciones están en inglés. La salida está en inglés por defecto y se
+  puede cambiar con `sessions.language` o con la opción `language` del plugin.
+  La API de sesiones subyacente es independiente del idioma.
 
 ## Desarrollo
 
