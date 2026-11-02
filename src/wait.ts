@@ -316,6 +316,8 @@ type RaceOutcome =
   | { kind: "event"; event: SessionEventLike | undefined }
   | { kind: "wait"; outcome: WaitOutcome }
   | { kind: "poll" }
+  | { kind: "permission" }
+  | { kind: "deadline" }
   | { kind: "aborted" }
 
 /**
@@ -345,6 +347,7 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
   let lastPermissionCheck = 0
   let lastProgress = started
   let errorEvent: string | undefined
+  let forcePoll = false
 
   const controller = new AbortController()
   let timedOut = false
@@ -402,6 +405,7 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
     }
   } catch (error) {
     if (!controller.signal.aborted) lastError = formatError(error)
+    lastPermissionCheck = Date.now()
   }
 
   const watcher = startEventWatcher(ctx, options.sessionID, controller.signal)
@@ -444,26 +448,47 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
         }
         racers.push(waitRace)
       }
+      const hasPrimary = Boolean(eventRace || waitRace) && !forcePoll
       const remaining = started + timeoutMs - now
       const sleepController = new AbortController()
       const onSleepAbort = () => sleepController.abort()
       if (controller.signal.aborted) sleepController.abort()
       else controller.signal.addEventListener("abort", onSleepAbort, { once: true })
-      racers.push(
-        sleep(Math.min(pollMs, remaining), sleepController.signal).then((elapsed) => ({
-          kind: elapsed ? ("poll" as const) : ("aborted" as const),
-        })),
-      )
+
+      if (hasPrimary) {
+        // With session.wait or an event stream active, do not poll the
+        // transcript. Only wake for the deadline or a permission check.
+        racers.push(
+          sleep(remaining, sleepController.signal).then((elapsed) => ({
+            kind: elapsed ? ("deadline" as const) : ("aborted" as const),
+          })),
+        )
+        const permissionDue = Math.max(0, permissionPoll - (now - lastPermissionCheck))
+        if (permissionDue < remaining) {
+          racers.push(
+            sleep(permissionDue, sleepController.signal).then((elapsed) => ({
+              kind: elapsed ? ("permission" as const) : ("aborted" as const),
+            })),
+          )
+        }
+      } else {
+        racers.push(
+          sleep(Math.min(pollMs, remaining), sleepController.signal).then((elapsed) => ({
+            kind: elapsed ? ("poll" as const) : ("aborted" as const),
+          })),
+        )
+      }
 
       let outcome: RaceOutcome
       try {
         outcome = await Promise.race(racers)
       } finally {
-        // If an event or session.wait won the race, cancel the fallback timer.
+        // If an event or session.wait won the race, cancel fallback timers.
         sleepController.abort()
         controller.signal.removeEventListener("abort", onSleepAbort)
       }
       if (outcome.kind === "aborted") continue
+      if (outcome.kind === "deadline") continue
 
       if (outcome.kind === "wait") {
         waitOutcome = undefined
@@ -510,8 +535,10 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
         }
       }
 
-      if (Date.now() - lastPermissionCheck >= permissionPoll) {
-        lastPermissionCheck = Date.now()
+      const shouldCheckPermission =
+        outcome.kind === "permission" ||
+        (outcome.kind === "poll" && Date.now() - lastPermissionCheck >= permissionPoll)
+      if (shouldCheckPermission) {
         try {
           const pending = await listPermissions(
             ctx,
@@ -526,7 +553,9 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
         } catch (error) {
           if (!controller.signal.aborted) lastError = formatError(error)
         }
+        lastPermissionCheck = Date.now()
       }
+      if (outcome.kind === "permission") continue
 
       fetchCount++
       try {
@@ -535,12 +564,14 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
         if (controller.signal.aborted) continue
         lastError = formatError(error)
         consecutiveErrors++
+        forcePoll = true
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) return finish("error")
         pollMs = Math.min(pollMs * 2, maxPoll)
         continue
       }
 
       consecutiveErrors = 0
+      forcePoll = false
       const evaluation = evaluateTurn(messages, options)
       startIndex = evaluation.startIndex
       if (evaluation.done) {

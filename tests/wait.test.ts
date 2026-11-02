@@ -149,6 +149,44 @@ describe("waitForTurn", () => {
     expect(stats.contextCalls).toBeGreaterThanOrEqual(3)
   })
 
+  it("does not poll context while session.wait is active", async () => {
+    const { ctx, stats } = makeContext({
+      wait: async () => {
+        await delay(120)
+      },
+      context: () => [user("prompt", "hello"), assistant("answer", "world"), idle("done")],
+    })
+    const started = Date.now()
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      timeoutMs: 1_000,
+      requireAnchor: true,
+      pollIntervalMs: 10,
+      permissionPollMs: 1_000,
+    })
+    expect(result.state).toBe("idle")
+    expect(stats.contextCalls).toBe(1)
+    expect(Date.now() - started).toBeGreaterThanOrEqual(100)
+  })
+
+  it("does not poll context while the event stream is active", async () => {
+    const { ctx, stats } = makeContext({
+      context: () => [user("prompt", "hello"), assistant("answer", "world"), idle("done")],
+      events: eventStream([{ type: "session.idle", data: { sessionID: "ses_1" } }], 120),
+    })
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      timeoutMs: 1_000,
+      requireAnchor: true,
+      pollIntervalMs: 10,
+      permissionPollMs: 1_000,
+    })
+    expect(result.state).toBe("idle")
+    expect(stats.contextCalls).toBe(1)
+  })
+
   it("does not return the idle of a previous turn when waiting for a later prompt", async () => {
     const messages = [
       user("a", "A", 1),
@@ -274,6 +312,57 @@ describe("waitForTurn", () => {
     })
     expect(result.state).toBe("permission")
     expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("detects a permission that appears during a wait without polling context", async () => {
+    const permission: PermissionLike = {
+      id: "per_2",
+      sessionID: "ses_1",
+      action: "edit",
+      resources: ["src/*"],
+    }
+    const { ctx, stats } = makeContext({
+      wait: () => new Promise<void>(() => undefined),
+      context: () => [user("prompt", "running")],
+      permissions: (call) => (call === 1 ? [] : [permission]),
+    })
+    const started = Date.now()
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      timeoutMs: 1_000,
+      requireAnchor: true,
+      pollIntervalMs: 10,
+      permissionPollMs: 20,
+    })
+    expect(result.state).toBe("permission")
+    expect(result.pendingPermissions?.[0]?.id).toBe("per_2")
+    expect(stats.contextCalls).toBe(0)
+    expect(Date.now() - started).toBeLessThan(300)
+  })
+
+  it("retries context after a transient failure even while session.wait is active", async () => {
+    let call = 0
+    const { ctx, stats } = makeContext({
+      wait: async () => {
+        await delay(20)
+      },
+      context: () => {
+        call++
+        if (call === 1) throw new Error("transient")
+        return [user("prompt", "hello"), assistant("answer", "world"), idle("done")]
+      },
+    })
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      timeoutMs: 1_000,
+      requireAnchor: true,
+      pollIntervalMs: 10,
+      permissionPollMs: 1_000,
+    })
+    expect(result.state).toBe("idle")
+    expect(stats.contextCalls).toBe(2)
   })
 
   it("returns an error after permanent context failures instead of waiting for the timeout", async () => {
