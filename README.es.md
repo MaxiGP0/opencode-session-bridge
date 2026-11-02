@@ -1,5 +1,7 @@
 # opencode-session-bridge
 
+[![CI](https://github.com/MaxiGP0/opencode-session-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/MaxiGP0/opencode-session-bridge/actions/workflows/ci.yml)
+
 [English](README.md) | [Español](README.es.md)
 
 Plugin de [OpenCode](https://opencode.ai) v2 que permite al agente abrir,
@@ -26,6 +28,7 @@ normal de sesiones y se pueden inspeccionar o retomar después.
 ## Requisitos
 
 - OpenCode v2 (probado con `2.2.5`).
+- Node.js 24+ para desarrollo y tests (el plugin se ejecuta dentro de OpenCode).
 - Una cuenta de GitHub solo si quieres instalarlo desde GitHub.
 
 ## Instalación
@@ -184,11 +187,19 @@ usan el agente `build`. Ambos se pueden cambiar con las opciones `model` y
 
 ## Desarrollo
 
-- Edita `index.ts`; no hay paso de compilación.
+```sh
+npm install
+npm run typecheck
+npm test
+```
+
+- `index.ts` contiene el plugin; no hay paso de compilación.
+- `tests/helpers.test.ts` cubre el parseo de modelos, el formato de mensajes, la
+  detección de estado, los permisos y la traducción de la salida.
+- La CI ejecuta el typecheck y los tests en cada push a `main` y en cada pull
+  request.
 - Carga el directorio con `opencode plugin add /ruta/absoluta/a/este/repo` o
   cópialo a un directorio de plugins.
-- Prueba las herramientas pidiéndole al agente que abra una sesión y interactúe
-  con ella.
 
 ## Licencia
 

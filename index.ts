@@ -58,6 +58,7 @@ const ES_TO_EN: Array<[string, string]> = [
   ["(sin título)", "(untitled)"],
   ["(sin texto)", "(no text)"],
   ["(desconocido)", "(unknown)"],
+  ["Nueva sesión", "New session"],
   ["(sin recursos)", "(no resources)"],
   ["recordar: ", "remember: "],
   [" | padre: ", " | parent: "],
@@ -369,9 +370,9 @@ async function waitForPrompt(
   while (Date.now() < deadline) {
     try {
       const messages = await ctx.session.context({ sessionID })
-      const anchorIndex = anchorID ? messages.findIndex((message) => message.id === anchorID) : -1
+      const anchorIndex = anchorID ? messages.findIndex((message: any) => message.id === anchorID) : -1
       const startIndex = anchorIndex >= 0 ? anchorIndex + 1 : beforeCount
-      if (messages.slice(startIndex).some((message) => message.type === "user")) return true
+      if (messages.slice(startIndex).some((message: any) => message.type === "user")) return true
     } catch {
       // Retry until the deadline.
     }
@@ -454,7 +455,7 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { namespace: "sessions", codemode: true },
-        execute: async (input, context) => {
+        execute: async (input: any, context: any) => {
           const data = input as OpenInput
           try {
             let fallback: any
@@ -532,7 +533,7 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { namespace: "sessions", codemode: true },
-        execute: async (input, context) => {
+        execute: async (input: any, context: any) => {
           const data = input as SendInput
           try {
             const session = await ctx.session.get({ sessionID: data.sessionID })
@@ -590,7 +591,7 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { namespace: "sessions", codemode: true },
-        execute: async (input) => {
+        execute: async (input: any) => {
           const data = input as StatusInput
           try {
             const session = await ctx.session.get({ sessionID: data.sessionID })
@@ -650,7 +651,7 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { namespace: "sessions", codemode: true },
-        execute: async (input) => {
+        execute: async (input: any) => {
           const data = input as PermissionsInput
           try {
             const pending = await ctx.permission.list({ sessionID: data.sessionID })
@@ -691,7 +692,7 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { namespace: "sessions", codemode: true },
-        execute: async (input) => {
+        execute: async (input: any) => {
           const data = input as ReplyInput
           try {
             const payload: any = {
@@ -736,7 +737,7 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { namespace: "sessions", codemode: true },
-        execute: async (input) => {
+        execute: async (input: any) => {
           const data = input as ReadInput
           try {
             const messages = await ctx.session.context({ sessionID: data.sessionID })
@@ -790,7 +791,7 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { namespace: "sessions", codemode: true },
-        execute: async (input, context) => {
+        execute: async (input: any, context: any) => {
           const data = input as WaitInput
           try {
             let session = await ctx.session.get({ sessionID: data.sessionID })
@@ -870,7 +871,7 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { namespace: "sessions", codemode: true },
-        execute: async (input) => {
+        execute: async (input: any) => {
           const data = input as InterruptInput
           try {
             const result = await ctx.session.interrupt({ sessionID: data.sessionID, resume: data.resume ?? false })
@@ -898,7 +899,7 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { namespace: "sessions", codemode: true },
-        execute: async (input) => {
+        execute: async (input: any) => {
           const data = input as ListInput
           try {
             const page = await ctx.session.list({
@@ -939,7 +940,7 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { namespace: "sessions", codemode: true },
-        execute: async (input) => {
+        execute: async (input: any) => {
           const data = input as LanguageInput
           if (data.language === "es" || data.language === "en") {
             language = data.language
@@ -959,3 +960,22 @@ export default Plugin.define({
     })
   },
 })
+
+export {
+  parseModel,
+  modelRef,
+  titleFromPrompt,
+  compact,
+  assistantText,
+  lastAssistant,
+  lastIdle,
+  lastUser,
+  isRunning,
+  toolsOf,
+  toolLine,
+  summarizeTurn,
+  formatSummary,
+  permissionLine,
+  localize,
+  formatError,
+}
