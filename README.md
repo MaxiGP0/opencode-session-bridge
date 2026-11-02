@@ -17,6 +17,7 @@ session list and can be inspected or resumed later.
 - Read the transcript: user messages, assistant text, tool calls, and tool output.
 - Wait for a turn to finish, with a configurable timeout.
 - Interrupt a running session.
+- Inspect and answer pending permission requests.
 - List sessions in a directory with status and outcome.
 
 ## Requirements
@@ -53,7 +54,9 @@ All tools live in the `sessions` namespace.
 | --- | --- |
 | `sessions.open` | Create a new session, send a prompt, and (by default) wait for the turn to finish. |
 | `sessions.send` | Send a message to an existing session. Can switch its agent or model first. |
-| `sessions.status` | Immediate snapshot: running/idle, outcome, last text, recent tools, last message ID. |
+| `sessions.status` | Immediate snapshot: running/idle, outcome, last text, recent tools, pending permissions, last message ID. |
+| `sessions.permissions` | List pending permission requests for a session. |
+| `sessions.reply` | Approve or reject a pending permission request (`once`, `always`, or `reject`). |
 | `sessions.read` | Read the transcript, including tool calls and optional tool output. |
 | `sessions.wait` | Wait for the current turn to finish and return the result. |
 | `sessions.interrupt` | Interrupt the running turn. |
@@ -95,6 +98,32 @@ const transcript = await tools.sessions.read({
 })
 ```
 
+### Handling permissions
+
+If a background session hits an interactive permission, `sessions.wait` returns
+after the timeout with the pending request IDs. You can inspect and answer them
+without leaving the agent:
+
+```ts
+const pending = await tools.sessions.permissions({ sessionID: created.id })
+// Each entry includes the request ID, action, and resources.
+
+await tools.sessions.reply({
+  sessionID: created.id,
+  requestID: "per_...",
+  decision: "once", // once | always | reject
+})
+```
+
+New sessions can also receive their own permission rules:
+
+```ts
+await tools.sessions.open({
+  prompt: "Run the test suite and report failures.",
+  permissions: [{ action: "shell", resource: "*", effect: "ask" }],
+})
+```
+
 ## How it works
 
 The plugin uses the OpenCode server session API through the plugin context:
@@ -112,8 +141,9 @@ New sessions inherit the **model of the calling session** by default and use the
 ## Permissions and limitations
 
 - Each session uses its own tool permissions. If a background session asks for
-  an interactive permission, it can stay blocked until you approve it in that
-  session or the timeout expires.
+  an interactive permission, `sessions.wait` times out with the pending request
+  IDs; use `sessions.permissions` and `sessions.reply` to handle them from the
+  agent.
 - Waiting defaults to 120 seconds (`timeoutMs`). If the timeout is reached, the
   session keeps running and can be checked again with `sessions.status`.
 - The plugin does not delete sessions. Remove old sessions from the UI or the

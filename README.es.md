@@ -19,6 +19,7 @@ normal de sesiones y se pueden inspeccionar o retomar después.
   ejecutadas y su salida.
 - Esperar a que termine un turno, con un límite de tiempo configurable.
 - Interrumpir una sesión en ejecución.
+- Consultar y responder solicitudes de permiso pendientes.
 - Listar las sesiones de un directorio con su estado y resultado.
 
 ## Requisitos
@@ -55,7 +56,9 @@ Todas las herramientas viven en el namespace `sessions`.
 | --- | --- |
 | `sessions.open` | Crea una sesión nueva, envía un mensaje y (por defecto) espera a que termine el turno. |
 | `sessions.send` | Envía un mensaje a una sesión existente. Puede cambiar antes su agente o modelo. |
-| `sessions.status` | Consulta inmediata: en ejecución/inactiva, resultado, último texto, herramientas recientes y último mensaje. |
+| `sessions.status` | Consulta inmediata: en ejecución/inactiva, resultado, último texto, herramientas recientes, permisos pendientes y último mensaje. |
+| `sessions.permissions` | Lista las solicitudes de permiso pendientes de una sesión. |
+| `sessions.reply` | Aprueba o rechaza una solicitud pendiente (`once`, `always` o `reject`). |
 | `sessions.read` | Lee la transcripción, incluyendo herramientas y opcionalmente su salida. |
 | `sessions.wait` | Espera a que termine el turno actual y devuelve el resultado. |
 | `sessions.interrupt` | Interrumpe el turno en ejecución. |
@@ -97,6 +100,32 @@ const transcript = await tools.sessions.read({
 })
 ```
 
+### Gestionar permisos
+
+Si una sesión en segundo plano pide un permiso interactivo, `sessions.wait`
+termina por tiempo agotado e incluye los IDs de las solicitudes pendientes.
+Puedes consultarlas y responderlas sin salir del agente:
+
+```ts
+const pending = await tools.sessions.permissions({ sessionID: created.id })
+// Cada entrada incluye el ID de la solicitud, la acción y los recursos.
+
+await tools.sessions.reply({
+  sessionID: created.id,
+  requestID: "per_...",
+  decision: "once", // once | always | reject
+})
+```
+
+Las sesiones nuevas también pueden recibir sus propias reglas de permisos:
+
+```ts
+await tools.sessions.open({
+  prompt: "Ejecuta las pruebas y reporta los fallos.",
+  permissions: [{ action: "shell", resource: "*", effect: "ask" }],
+})
+```
+
 ## Cómo funciona
 
 El plugin usa la API de sesiones del servidor de OpenCode a través del contexto
@@ -116,8 +145,9 @@ usan el agente `build`. Ambos se pueden cambiar con las opciones `model` y
 ## Permisos y limitaciones
 
 - Cada sesión usa sus propios permisos de herramientas. Si una sesión en segundo
-  plano pide un permiso interactivo, puede quedarse bloqueada hasta que lo
-  apruebes en esa sesión o venza el tiempo de espera.
+  plano pide un permiso interactivo, `sessions.wait` termina por tiempo agotado
+  e incluye los IDs pendientes; usa `sessions.permissions` y `sessions.reply`
+  para gestionarlos desde el agente.
 - La espera es de 120 segundos por defecto (`timeoutMs`). Si se agota, la sesión
   sigue ejecutándose y se puede consultar de nuevo con `sessions.status`.
 - El plugin no elimina sesiones. Borra las antiguas desde la interfaz o la API si

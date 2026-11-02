@@ -5,6 +5,12 @@ const POLL_MS = 250
 const MAX_TEXT = 4_000
 const MAX_TOTAL = 20_000
 
+type PermissionRule = {
+  action: string
+  resource: string
+  effect: "allow" | "deny" | "ask"
+}
+
 type OpenInput = {
   prompt: string
   title?: string
@@ -12,6 +18,18 @@ type OpenInput = {
   model?: string
   wait?: boolean
   timeoutMs?: number
+  permissions?: PermissionRule[]
+}
+
+type PermissionsInput = {
+  sessionID: string
+}
+
+type ReplyInput = {
+  sessionID: string
+  requestID: string
+  decision: "once" | "always" | "reject"
+  message?: string
 }
 
 type SendInput = {
@@ -205,6 +223,27 @@ function formatSummary(title: string, summary: ReturnType<typeof summarizeTurn>,
   return lines.join("\n")
 }
 
+function permissionLine(request: any) {
+  const resources = Array.isArray(request.resources) && request.resources.length ? request.resources.join(", ") : "(sin recursos)"
+  const save = Array.isArray(request.save) && request.save.length ? ` | recordar: ${request.save.join(", ")}` : ""
+  const metadata = request.metadata ? ` | metadata: ${compact(request.metadata, 160)}` : ""
+  const message = request.message ? ` | ${compact(request.message, 200)}` : ""
+  return `  · ${request.id} | ${request.action} | ${resources}${save}${metadata}${message}`
+}
+
+async function permissionHint(ctx: any, sessionID: string) {
+  try {
+    const pending = await ctx.permission.list({ sessionID })
+    if (!pending.length) return ""
+    return `\n\nPermisos pendientes (${pending.length}):\n${pending
+      .slice(0, 5)
+      .map(permissionLine)
+      .join("\n")}\nUsa sessions.reply con el ID de la solicitud para aprobar o rechazar.`
+  } catch {
+    return ""
+  }
+}
+
 async function waitForTurn(
   ctx: any,
   sessionID: string,
@@ -294,6 +333,24 @@ export default Plugin.define({
                 "If true (default), wait for the turn to finish. Use false to keep working in the background and check later with sessions.status.",
             },
             timeoutMs: { type: "integer", description: "Maximum wait time in milliseconds. Defaults to 120000." },
+            permissions: {
+              type: "array",
+              description: "Optional permission rules for the new session.",
+              items: {
+                type: "object",
+                properties: {
+                  action: { type: "string", description: "Action to match, for example edit, shell, or webfetch." },
+                  resource: { type: "string", description: "Resource or glob pattern to match." },
+                  effect: {
+                    type: "string",
+                    enum: ["allow", "deny", "ask"],
+                    description: "Whether to allow, deny, or ask for matching actions.",
+                  },
+                },
+                required: ["action", "resource", "effect"],
+                additionalProperties: false,
+              },
+            },
           },
           required: ["prompt"],
           additionalProperties: false,
@@ -316,6 +373,7 @@ export default Plugin.define({
               title: titleFromPrompt(data.prompt, data.title),
               agent: data.agent ?? "build",
               model: parseModel(data.model) ?? fallback,
+              permissions: data.permissions,
             } as any)
 
             const before = await ctx.session.context({ sessionID: created.id }).catch(() => [])
@@ -341,7 +399,9 @@ export default Plugin.define({
             const summary = summarizeTurn(turn.messages, turn.startIndex)
             const state =
               turn.state === "idle" ? undefined : turn.state === "timeout" ? "sigue en ejecución (tiempo agotado)" : "espera cancelada"
-            return { content: formatSummary(header, summary, state) }
+            let content = formatSummary(header, summary, state)
+            if (turn.state !== "idle") content += await permissionHint(ctx, created.id)
+            return { content }
           } catch (error) {
             return { content: `No se pudo abrir la sesión: ${formatError(error)}` }
           }
@@ -409,7 +469,9 @@ export default Plugin.define({
             const summary = summarizeTurn(turn.messages, turn.startIndex)
             const state =
               turn.state === "idle" ? undefined : turn.state === "timeout" ? "sigue en ejecución (tiempo agotado)" : "espera cancelada"
-            return { content: formatSummary(header, summary, state) }
+            let content = formatSummary(header, summary, state)
+            if (turn.state !== "idle") content += await permissionHint(ctx, data.sessionID)
+            return { content }
           } catch (error) {
             return { content: `No se pudo enviar el mensaje: ${formatError(error)}` }
           }
@@ -441,6 +503,12 @@ export default Plugin.define({
             const text = assistantText(assistant)
             const recent = (data.recent ?? 8)
             const tools = messages.flatMap(toolsOf).slice(-recent)
+            let pending: any[] = []
+            try {
+              pending = await ctx.permission.list({ sessionID: data.sessionID })
+            } catch {
+              pending = []
+            }
 
             const lines = [
               `Sesión: ${session.id}`,
@@ -456,12 +524,93 @@ export default Plugin.define({
             } else {
               lines.push("Acciones recientes: (ninguna)")
             }
+            if (pending.length) {
+              lines.push(`Permisos pendientes (${pending.length}):`)
+              lines.push(pending.slice(0, 8).map(permissionLine).join("\n"))
+              lines.push("Usa sessions.reply con el ID de la solicitud para responder.")
+            }
             const error = assistant?.error?.message ?? idle?.error?.message
             if (error) lines.push(`Error: ${compact(error, 1_000)}`)
             if (messages.length) lines.push(`Último mensaje: ${messages[messages.length - 1].id}`)
             return { content: lines.join("\n") }
           } catch (error) {
             return { content: `No se pudo consultar la sesión: ${formatError(error)}` }
+          }
+        },
+      })
+
+      editor.add({
+        name: "permissions",
+        description:
+          "List pending permission requests for a session, with their action, resources, and request ID. Use sessions.reply to approve or reject them.",
+        input: {
+          type: "object",
+          properties: {
+            sessionID: { type: "string", description: "ID of the session whose pending permissions should be listed." },
+          },
+          required: ["sessionID"],
+          additionalProperties: false,
+        },
+        options: { namespace: "sessions", codemode: true },
+        execute: async (input) => {
+          const data = input as PermissionsInput
+          try {
+            const pending = await ctx.permission.list({ sessionID: data.sessionID })
+            if (!pending.length) {
+              return { content: `Sesión ${data.sessionID}: no hay solicitudes de permiso pendientes.` }
+            }
+            return {
+              content: `Permisos pendientes (${pending.length}):\n${pending
+                .map(permissionLine)
+                .join("\n")}\n\nUsa sessions.reply con sessionID y requestID para responder.`,
+            }
+          } catch (error) {
+            return { content: `No se pudieron consultar los permisos: ${formatError(error)}` }
+          }
+        },
+      })
+
+      editor.add({
+        name: "reply",
+        description:
+          "Approve or reject a pending permission request. Use once to allow this time, always to allow and save the rule, or reject to deny it.",
+        input: {
+          type: "object",
+          properties: {
+            sessionID: { type: "string", description: "ID of the session that owns the request." },
+            requestID: { type: "string", description: "Permission request ID, for example per_abc123." },
+            decision: {
+              type: "string",
+              enum: ["once", "always", "reject"],
+              description: "once allows this request, always allows and saves it, reject denies it.",
+            },
+            message: {
+              type: "string",
+              description: "Optional message to include with the decision, especially when rejecting.",
+            },
+          },
+          required: ["sessionID", "requestID", "decision"],
+          additionalProperties: false,
+        },
+        options: { namespace: "sessions", codemode: true },
+        execute: async (input) => {
+          const data = input as ReplyInput
+          try {
+            const payload: any = {
+              sessionID: data.sessionID,
+              requestID: data.requestID,
+              decision: data.decision,
+            }
+            if (data.message) payload.message = data.message
+            await ctx.permission.reply(payload)
+            const labels = {
+              once: "aprobada una vez",
+              always: "aprobada y recordada",
+              reject: "rechazada",
+            }
+            return { content: `Solicitud ${data.requestID}: ${labels[data.decision]}.` }
+          } catch (error) {
+            return { content: `No se pudo responder al permiso: ${formatError(error)}` }
           }
         },
       })
@@ -594,13 +743,13 @@ export default Plugin.define({
             const summary = summarizeTurn(turn.messages, Math.max(0, startIndex))
             const state =
               turn.state === "idle" ? undefined : turn.state === "timeout" ? "sigue en ejecución (tiempo agotado)" : "espera cancelada"
-            return {
-              content: formatSummary(
-                `Sesión: ${session.id}\nTítulo: ${session.title ?? "(sin título)"}`,
-                summary,
-                state,
-              ),
-            }
+            let content = formatSummary(
+              `Sesión: ${session.id}\nTítulo: ${session.title ?? "(sin título)"}`,
+              summary,
+              state,
+            )
+            if (turn.state !== "idle") content += await permissionHint(ctx, data.sessionID)
+            return { content }
           } catch (error) {
             return { content: `No se pudo esperar la sesión: ${formatError(error)}` }
           }
