@@ -326,6 +326,7 @@ describe("sessions tools", () => {
     const content = await harness.execute("open", { prompt: "hi", messageID: "msg_fixed" })
     expect(harness.state.promptCalls[0]?.id).toBe("msg_fixed")
     expect(content).toContain("Message ID: msg_fixed")
+    expect(harness.state.contextCalls).toBeLessThanOrEqual(2)
   })
 
   it("send with queue waits for the exact queued turn", async () => {
@@ -464,6 +465,13 @@ describe("sessions tools", () => {
     expect(alwaysContent).toContain("approved and saved")
     expect(alwaysAllowed.state.replyCalls).toHaveLength(1)
 
+    const onceContent = await alwaysAllowed.execute("reply", {
+      sessionID: "ses_new",
+      requestID: "per_2",
+      decision: "once",
+    })
+    expect(onceContent).toContain("approved once")
+
     const foreign = makeHarness()
     const foreignDenied = await foreign.execute("reply", {
       sessionID: "ses_foreign",
@@ -511,6 +519,16 @@ describe("sessions tools", () => {
     expect(content).toContain("archived: yes")
     expect(harness.state.updateCalls).toHaveLength(1)
     expect(harness.state.removeCalls).toHaveLength(0)
+  })
+
+  it("rejects allow permission rules in update by default", async () => {
+    const harness = makeHarness()
+    const content = await harness.execute("update", {
+      sessionID: "ses_1",
+      permissions: [{ action: "*", resource: "*", effect: "allow" }],
+    })
+    expect(content).toContain("allowPermissionRules")
+    expect(harness.state.updateCalls).toHaveLength(0)
   })
 
   it("lists with cursor, filters, and a timestamp snapshot", async () => {

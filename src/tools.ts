@@ -1,4 +1,4 @@
-import { t } from "./i18n.ts"
+import { t, type StringKey } from "./i18n.ts"
 import {
   assistantText,
   capOutput,
@@ -202,7 +202,7 @@ function renderTurn(
     maxToolLine: options.maxToolLine,
     maxPermissions: options.maxPermissions,
     promptMessageID: turn.promptMessageID,
-    lastError: turn.lastError,
+    lastError: turn.state === "idle" ? undefined : turn.lastError,
     pendingPermissions: turn.pendingPermissions,
   })
 }
@@ -236,7 +236,7 @@ function formatTimestamp(value: number | undefined, lang: Lang): string {
 }
 
 export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
-  const add = (definition: ToolDefinition, execute: ToolExecute) => {
+  const add = (definition: ToolDefinition, execute: ToolExecute, errorKey?: StringKey) => {
     const tool = {
       ...definition,
       execute: async (input: unknown, context: ToolExecuteContext) => {
@@ -245,7 +245,10 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           const result = await execute(input, context, lang)
           return { content: capOutput(result.content, deps.options.maxOutputChars, lang) }
         } catch (error) {
-          return { content: capOutput(formatError(error), deps.options.maxOutputChars, lang) }
+          const prefix = errorKey ? `${t(lang, errorKey)}: ` : ""
+          return {
+            content: capOutput(`${prefix}${formatError(error)}`, deps.options.maxOutputChars, lang),
+          }
         }
       },
     }
@@ -378,6 +381,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         return { content: `${t(lang, "couldNotOpen")}: ${formatError(error)}${suffix}` }
       }
     },
+    "couldNotOpen",
   )
 
   add(
@@ -489,6 +493,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         return { content: `${t(lang, "couldNotSend")}: ${formatError(error)}${suffix}` }
       }
     },
+    "couldNotSend",
   )
 
   add(
@@ -543,6 +548,8 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       const pending = pendingResult.status === "fulfilled" ? pendingResult.value : []
       const contextError =
         messagesResult.status === "rejected" ? formatError(messagesResult.reason) : undefined
+      const permissionError =
+        pendingResult.status === "rejected" ? formatError(pendingResult.reason) : undefined
 
       const running = isRunning(session, messages)
       const idle = lastIdle(messages)
@@ -570,9 +577,13 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       }
 
       if (data.includeText) {
+        const textBudget = Math.min(
+          data.maxText,
+          Math.max(200, Math.floor(data.maxOutputChars / 3)),
+        )
         lines.push(
           `${t(lang, "lastText")}: ${
-            text ? truncateCodePoints(text, data.maxText) : t(lang, "noText")
+            text ? truncateCodePoints(text, textBudget) : t(lang, "noText")
           }`,
         )
       }
@@ -605,11 +616,13 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       const error = assistant?.error?.message ?? idle?.error?.message
       if (error) lines.push(`${t(lang, "error")}: ${compact(error, 1_000)}`)
       if (contextError) lines.push(`${t(lang, "error")}: ${compact(contextError, 1_000)}`)
+      if (permissionError) lines.push(`${t(lang, "error")}: ${compact(permissionError, 1_000)}`)
       if (messages.length) {
         lines.push(`${t(lang, "lastMessage")}: ${messages[messages.length - 1]?.id ?? ""}`)
       }
       return { content: capOutput(lines.join("\n"), data.maxOutputChars, lang) }
     },
+    "couldNotInspect",
   )
 
   add(
@@ -653,6 +666,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       lines.push(t(lang, "replyHint3"))
       return { content: capOutput(lines.join("\n"), data.maxOutputChars, lang) }
     },
+    "couldNotQueryPermissions",
   )
 
   add(
@@ -715,6 +729,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         )}: ${data.sessionID}`,
       }
     },
+    "couldNotReplyPermission",
   )
 
   add(
@@ -767,6 +782,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         }),
       }
     },
+    "couldNotRead",
   )
 
   add(
@@ -872,6 +888,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       }
       return { content }
     },
+    "couldNotWait",
   )
 
   add(
@@ -908,6 +925,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         }),
       }
     },
+    "couldNotInterrupt",
   )
 
   add(
@@ -970,13 +988,14 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           "model",
         )}: ${modelLabel(session) || t(lang, "unknown")} | ${t(lang, "cost")}: ${
           compact(session.cost, 100) || t(lang, "unknown")
-        }`
+        } | ${t(lang, "tokens")}: ${compact(session.tokens, 200) || t(lang, "unknown")}`
       })
 
       let content = `${t(lang, "sessions")}:\n${lines.join("\n")}\n\n${t(lang, "statusSnapshot")}`
       if (page.cursor?.next) content += `\n${t(lang, "cursorNext")}: ${page.cursor.next}`
       return { content: capOutput(content, data.maxOutputChars, lang) }
     },
+    "couldNotList",
   )
 
   add(
@@ -1065,10 +1084,11 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         )
       }
       if (data.permissions !== undefined) {
-        lines.push(`${t(lang, "pendingPermissions")}: ${data.permissions.length}`)
+        lines.push(`${t(lang, "permissionRules")}: ${data.permissions.length}`)
       }
       return { content: capOutput(lines.join("\n"), data.maxOutputChars, lang) }
     },
+    "couldNotUpdate",
   )
 
   add(
@@ -1103,5 +1123,6 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       await forgetOwnedSession(deps.ctx, deps.ownedSessions, data.sessionID)
       return { content: `${t(lang, "removed")}: ${data.sessionID}` }
     },
+    "couldNotRemove",
   )
 }

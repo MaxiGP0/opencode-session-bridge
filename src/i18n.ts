@@ -132,6 +132,7 @@ const es = {
   actionsCount: "Acciones ({count}):",
   recentActionsCount: "Acciones recientes ({count}):",
   pendingPermissionsCount: "Permisos pendientes ({count}):",
+  permissionRules: "Reglas de permiso",
   yes: "sí",
   no: "no",
   languageSetEs: "Idioma de salida: español.",
@@ -276,6 +277,7 @@ const en: Record<StringKey, string> = {
   actionsCount: "Actions ({count}):",
   recentActionsCount: "Recent actions ({count}):",
   pendingPermissionsCount: "Pending permissions ({count}):",
+  permissionRules: "Permission rules",
   yes: "yes",
   no: "no",
   languageSetEs: "Output language: Spanish.",
@@ -341,6 +343,7 @@ type Prefix = {
 
 const PREFIXES: Prefix[] = [
   { spanish: "Sesión creada: ", english: `${t("en", "created")}: ` },
+  { spanish: "Sesiones: ", english: `${t("en", "sessions")}: ` },
   { spanish: "Sesión: ", english: `${t("en", "session")}: ` },
   { spanish: "Título: ", english: `${t("en", "title")}: ` },
   { spanish: "Mensaje enviado: ", english: `${t("en", "messageSent")}: ` },

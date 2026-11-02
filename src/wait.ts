@@ -166,6 +166,7 @@ function isRelevant(message: MessageLike | undefined): boolean {
 }
 
 function evaluateTurn(messages: MessageLike[], options: WaitOptions): Evaluation {
+  const requireAnchor = options.requireAnchor ?? Boolean(options.anchorID)
   let anchorIndex = options.anchorID
     ? messages.findIndex((message) => message.id === options.anchorID)
     : -1
@@ -198,7 +199,7 @@ function evaluateTurn(messages: MessageLike[], options: WaitOptions): Evaluation
     if (isRelevant(messages[index])) lastRelevant = index
   }
 
-  if (options.requireAnchor) {
+  if (requireAnchor) {
     return { done: false, startIndex: messages.length, anchorFound: false }
   }
 
@@ -520,9 +521,9 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
         }
       }
 
+      fetchCount++
       try {
         messages = await fetchContext(ctx, options.sessionID, controller.signal, requestTimeout)
-        fetchCount++
       } catch (error) {
         if (controller.signal.aborted) continue
         lastError = formatError(error)

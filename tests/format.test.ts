@@ -113,6 +113,31 @@ describe("output budget", () => {
     expect(report).toContain("60 actions omitted")
   })
 
+  it("reserves budget for the omission summary even with long assistant text", () => {
+    const tools = Array.from({ length: 100 }, (_, index) => tool(index))
+    const summary = summarizeTurn(
+      [
+        { id: "u1", type: "user", text: "run", time: { created: 1 } },
+        {
+          id: "a1",
+          type: "assistant",
+          content: [{ type: "text", text: "x".repeat(20_000) }, ...tools],
+          time: { created: 2 },
+        },
+        idle,
+      ],
+      0,
+    )
+    const report = formatSummary("Session: ses_1", summary, {
+      lang: "en",
+      maxOutputChars: 2_000,
+      maxTools: 40,
+      maxTextChars: 4_000,
+    })
+    expect(report.length).toBeLessThanOrEqual(2_000)
+    expect(report).toContain("60 actions omitted")
+  })
+
   it("collects only the most recent tools", () => {
     const messages = [
       {

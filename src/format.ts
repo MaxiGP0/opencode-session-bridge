@@ -284,6 +284,7 @@ export function formatSummary(title: string, summary: Summary, options: SummaryO
   const maxTools = options.maxTools ?? DEFAULT_MAX_TOOLS
   const maxToolLine = options.maxToolLine ?? DEFAULT_MAX_TOOL_LINE
   const maxPermissions = options.maxPermissions ?? DEFAULT_MAX_PERMISSIONS
+  const textBudget = Math.min(maxTextChars, Math.max(200, Math.floor(maxOutputChars / 3)))
 
   const lines = [title]
   if (summary.user?.text) {
@@ -302,7 +303,7 @@ export function formatSummary(title: string, summary: Summary, options: SummaryO
   lines.push(`${t(lang, "state")}: ${status}`)
 
   if (summary.text) {
-    lines.push(`${t(lang, "finalText")}:\n${truncateCodePoints(summary.text, maxTextChars)}`)
+    lines.push(`${t(lang, "finalText")}:\n${truncateCodePoints(summary.text, textBudget)}`)
   } else {
     lines.push(`${t(lang, "finalText")}: ${t(lang, "noText")}`)
   }
@@ -381,9 +382,14 @@ export type TranscriptOptions = {
 function fileLine(file: unknown, lang: Lang): string | undefined {
   if (!isRecord(file)) return undefined
   const name = typeof file.name === "string" ? file.name : undefined
-  const uri = typeof file.uri === "string" ? file.uri : undefined
-  if (!name && !uri) return undefined
-  return `${t(lang, "files")}: ${name ?? uri}${name && uri ? ` (${uri})` : ""}`
+  const description = typeof file.description === "string" ? file.description : undefined
+  const directURI = typeof file.uri === "string" ? file.uri : undefined
+  const source = isRecord(file.source) ? file.source : undefined
+  const sourceURI = source && typeof source.uri === "string" ? source.uri : undefined
+  const uri = directURI ?? sourceURI
+  if (!name && !description && !uri) return undefined
+  const label = name ?? description ?? uri
+  return `${t(lang, "files")}: ${label}${uri && uri !== label ? ` (${uri})` : ""}`
 }
 
 /**

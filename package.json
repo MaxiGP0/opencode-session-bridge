@@ -1,19 +1,26 @@
 {
   "name": "opencode-session-bridge",
-  "version": "1.1.0",
-  "description": "OpenCode plugin to open, interact with, monitor, read, wait for, and interrupt other OpenCode sessions.",
+  "version": "2.0.0",
+  "description": "OpenCode plugin to open, interact with, monitor, read, wait for, and safely manage other OpenCode sessions.",
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "pack:check": "npm pack --dry-run"
   },
   "exports": {
     ".": "./index.ts"
   },
   "files": [
     "index.ts",
+    "src",
     "README.md",
     "README.es.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "keywords": [
@@ -34,7 +41,7 @@
     "url": "https://github.com/MaxiGP0/opencode-session-bridge/issues"
   },
   "dependencies": {
-    "@opencode/plugin": "latest"
+    "@opencode/plugin": "2.2.5"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

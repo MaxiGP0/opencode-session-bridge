@@ -149,6 +149,30 @@ describe("waitForTurn", () => {
     expect(stats.contextCalls).toBeGreaterThanOrEqual(3)
   })
 
+  it("does not return the idle of a previous turn when waiting for a later prompt", async () => {
+    const messages = [
+      user("a", "A", 1),
+      assistant("a-answer", "A answer", 2),
+      idle("a-idle", 3),
+      user("b", "B", 4),
+      assistant("b-answer", "B answer", 5),
+      idle("b-idle", 6),
+    ]
+    const { ctx } = makeContext({ context: () => messages })
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "b",
+      timeoutMs: 1_000,
+      requireAnchor: true,
+      pollIntervalMs: 10,
+      permissionPollMs: 1_000,
+    })
+    expect(result.state).toBe("idle")
+    expect(result.idle?.id).toBe("b-idle")
+    expect(result.startIndex).toBe(3)
+    expect(summarizeTurn(result.messages, result.startIndex).text).toBe("B answer")
+  })
+
   it("filters idle events by sessionID", async () => {
     const { ctx, stats } = makeContext({
       context: () => [user("prompt", "hello"), assistant("answer", "world"), idle("done")],
