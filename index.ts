@@ -14,13 +14,22 @@ export default Plugin.define({
   id: "session-bridge",
   async setup(ctx: PluginContext) {
     const options = parseOptions(ctx.options as Record<string, unknown>)
-    const stored = await ctx.storage?.get(LANGUAGE_KEY).catch(() => undefined)
+    let stored: unknown
+    try {
+      stored = await ctx.storage?.get(LANGUAGE_KEY)
+    } catch {
+      stored = undefined
+    }
     let language: Lang = stored === "es" || stored === "en" ? stored : options.language
     const ownedSessions = await loadOwnedSessions(ctx)
 
     const setLanguage = async (lang: Lang) => {
       language = lang
-      await ctx.storage?.set(LANGUAGE_KEY, lang).catch(() => undefined)
+      try {
+        await ctx.storage?.set(LANGUAGE_KEY, lang)
+      } catch {
+        // The in-memory language still applies if storage is unavailable.
+      }
     }
 
     await ctx.tool.transform((editor) => {

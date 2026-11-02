@@ -358,25 +358,32 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
     controller.abort(new DOMException("Turn timed out", "TimeoutError"))
   }, timeoutMs)
 
-  const finish = (state: TurnState, extra: Partial<TurnResult> = {}): TurnResult => ({
-    state,
-    messages,
-    startIndex,
-    lastError,
-    pendingPermissions,
-    elapsedMs: Date.now() - started,
-    fetchCount,
-    promptMessageID: options.promptMessageID,
-    queued,
-    ...extra,
-  })
+  const finish = (state: TurnState, extra: Partial<TurnResult> = {}): TurnResult => {
+    clearTimeout(deadlineTimer)
+    options.signal?.removeEventListener("abort", onUserAbort)
+    // Cancel a pending session.wait or event subscription as soon as the
+    // result is known; no request should outlive the wait.
+    controller.abort()
+    return {
+      state,
+      messages,
+      startIndex,
+      lastError,
+      pendingPermissions,
+      elapsedMs: Date.now() - started,
+      fetchCount,
+      promptMessageID: options.promptMessageID,
+      queued,
+      ...extra,
+    }
+  }
+
+  if (options.signal?.aborted) return finish("aborted")
 
   if (options.initialMessages) {
     const evaluation = evaluateTurn(options.initialMessages, options)
     startIndex = evaluation.startIndex
     if (evaluation.done) {
-      clearTimeout(deadlineTimer)
-      options.signal?.removeEventListener("abort", onUserAbort)
       return finish("idle", {
         messages: options.initialMessages,
         startIndex: evaluation.startIndex,
@@ -554,6 +561,7 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
   } finally {
     clearTimeout(deadlineTimer)
     options.signal?.removeEventListener("abort", onUserAbort)
+    controller.abort()
     await watcher?.close()
   }
 }

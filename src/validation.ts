@@ -326,7 +326,7 @@ export function parseReplyInput(input: unknown, lang: Lang, options: BridgeOptio
     sessionID: requireString(data.sessionID, "invalidSessionID", lang),
     requestID: requireString(data.requestID, "invalidRequestID", lang),
     decision: validateDecision(data.decision, lang),
-    message: optionalString(data.message, "invalidInput", lang),
+    message: optionalString(data.message, "invalidMessage", lang),
     maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
   }
 }

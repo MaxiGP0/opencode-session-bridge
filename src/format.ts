@@ -279,11 +279,19 @@ export type SummaryOptions = {
 
 export function formatSummary(title: string, summary: Summary, options: SummaryOptions = {}): string {
   const lang = options.lang ?? "es"
-  const maxOutputChars = options.maxOutputChars ?? DEFAULT_MAX_OUTPUT
-  const maxTextChars = options.maxTextChars ?? DEFAULT_MAX_TEXT
-  const maxTools = options.maxTools ?? DEFAULT_MAX_TOOLS
-  const maxToolLine = options.maxToolLine ?? DEFAULT_MAX_TOOL_LINE
-  const maxPermissions = options.maxPermissions ?? DEFAULT_MAX_PERMISSIONS
+  const maxOutputChars =
+    options.maxOutputChars && options.maxOutputChars > 0
+      ? options.maxOutputChars
+      : DEFAULT_MAX_OUTPUT
+  const maxTextChars =
+    options.maxTextChars && options.maxTextChars > 0 ? options.maxTextChars : DEFAULT_MAX_TEXT
+  const maxTools = options.maxTools && options.maxTools > 0 ? options.maxTools : DEFAULT_MAX_TOOLS
+  const maxToolLine =
+    options.maxToolLine && options.maxToolLine > 0 ? options.maxToolLine : DEFAULT_MAX_TOOL_LINE
+  const maxPermissions =
+    options.maxPermissions && options.maxPermissions > 0
+      ? options.maxPermissions
+      : DEFAULT_MAX_PERMISSIONS
   const textBudget = Math.min(maxTextChars, Math.max(200, Math.floor(maxOutputChars / 3)))
 
   const lines = [title]
@@ -410,6 +418,7 @@ export function renderTranscript(messages: MessageLike[], options: TranscriptOpt
     maxToolLine,
   } = options
 
+  const effectiveLimit = limit > 0 ? limit : 30
   let selected: MessageLike[]
   let warning: string | undefined
   if (afterMessageID) {
@@ -417,11 +426,11 @@ export function renderTranscript(messages: MessageLike[], options: TranscriptOpt
     if (index >= 0) {
       selected = messages.slice(index + 1)
     } else {
-      warning = t(lang, "afterNotFound", { id: afterMessageID, limit })
-      selected = messages.slice(-limit)
+      warning = t(lang, "afterNotFound", { id: afterMessageID, limit: effectiveLimit })
+      selected = messages.slice(-effectiveLimit)
     }
   } else {
-    selected = messages.slice(-limit)
+    selected = messages.slice(-effectiveLimit)
   }
 
   let content = ""

@@ -53,6 +53,7 @@ type HarnessOptions = {
   contextSnapshots?: MessageLike[][]
   promptError?: Error
   cursorNext?: string | null
+  modelDefault?: unknown
 }
 
 function fakeSession(id: string, overrides: Partial<FakeSession> = {}): FakeSession {
@@ -74,6 +75,7 @@ function makeHarness(options: HarnessOptions = {}) {
   const promptCalls: Array<{ sessionID: string; text: string; id?: string; delivery?: string }> = []
   const admissions = new Map<string, FakeAdmission>()
   const updateCalls: Array<Record<string, unknown>> = []
+  const createInputs: Array<Record<string, unknown>> = []
   const removeCalls: string[] = []
   const replyCalls: Array<Record<string, unknown>> = []
   const switchModelCalls: Array<Record<string, unknown>> = []
@@ -111,7 +113,7 @@ function makeHarness(options: HarnessOptions = {}) {
       scan: async () => ({ entries: [] }),
     },
     model: {
-      default: async () => ({ providerID: "p", id: "m" }),
+      default: async () => options.modelDefault ?? { providerID: "p", id: "m" },
     },
     session: {
       get: async (input: { sessionID: string }) => {
@@ -121,6 +123,7 @@ function makeHarness(options: HarnessOptions = {}) {
       },
       create: async (input: { title?: string; agent?: string; model?: unknown }) => {
         createCalls++
+        createInputs.push(input as Record<string, unknown>)
         const id = sessions.has("ses_new") ? `ses_new_${createCalls}` : "ses_new"
         const created = fakeSession(id, {
           title: input.title,
@@ -252,6 +255,7 @@ function makeHarness(options: HarnessOptions = {}) {
     promptCalls,
     admissions,
     updateCalls,
+    createInputs,
     removeCalls,
     replyCalls,
     switchModelCalls,
@@ -319,6 +323,18 @@ describe("sessions tools", () => {
     })
     expect(allowedContent).toContain("Session created: ses_new")
     expect(allowed.state.createCalls).toBe(1)
+  })
+
+  it("uses model.default's data wrapper when the caller has no model", async () => {
+    const harness = makeHarness({
+      sessions: [fakeSession("ses_caller")],
+      modelDefault: {
+        location: { directory: "C:/repo" },
+        data: { id: "m", modelID: "m", providerID: "p" },
+      },
+    })
+    await harness.execute("open", { prompt: "hi" })
+    expect(harness.state.createInputs[0]?.model).toEqual({ providerID: "p", id: "m" })
   })
 
   it("anchors open and send on the admitted prompt ID", async () => {

@@ -254,6 +254,28 @@ describe("waitForTurn", () => {
     expect(Date.now() - started).toBeLessThan(200)
   })
 
+  it("cleans up its deadline timer when permission is pending", async () => {
+    vi.useFakeTimers()
+    const permission: PermissionLike = {
+      id: "per_1",
+      sessionID: "ses_1",
+      action: "shell",
+      resources: ["echo *"],
+    }
+    const { ctx } = makeContext({
+      context: () => [],
+      permissions: () => [permission],
+    })
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      timeoutMs: 5_000,
+      requireAnchor: true,
+    })
+    expect(result.state).toBe("permission")
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it("returns an error after permanent context failures instead of waiting for the timeout", async () => {
     const { ctx } = makeContext({
       context: () => {

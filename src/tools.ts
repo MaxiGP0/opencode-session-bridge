@@ -193,6 +193,8 @@ function renderTurn(
   options: BridgeOptions,
 ): string {
   const summary = summarizeTurn(turn.messages, turn.startIndex)
+  const showLastError =
+    turn.state !== "idle" || summary.outcome === "failed" || summary.outcome === "interrupted"
   return formatSummary(header, summary, {
     lang,
     state: turnStateLabel(lang, turn),
@@ -202,7 +204,7 @@ function renderTurn(
     maxToolLine: options.maxToolLine,
     maxPermissions: options.maxPermissions,
     promptMessageID: turn.promptMessageID,
-    lastError: turn.state === "idle" ? undefined : turn.lastError,
+    lastError: showLastError ? turn.lastError : undefined,
     pendingPermissions: turn.pendingPermissions,
   })
 }
@@ -232,7 +234,9 @@ async function appendPermissionHint(
 }
 
 function formatTimestamp(value: number | undefined, lang: Lang): string {
-  return value ? new Date(value).toISOString() : t(lang, "unknownF")
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? new Date(value).toISOString()
+    : t(lang, "unknownF")
 }
 
 export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
@@ -301,8 +305,9 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       try {
         let fallback: { providerID: string; id: string } | undefined
         if (context.sessionID) {
+          const callerSessionID = context.sessionID
           const caller = await withRequest(signalOf(context), deps.options.requestTimeoutMs, (signal) =>
-            deps.ctx.session.get({ sessionID: context.sessionID as string }, { signal }),
+            deps.ctx.session.get({ sessionID: callerSessionID }, { signal }),
           ).catch(() => undefined)
           fallback = modelRef(caller?.model)
         }
@@ -312,7 +317,8 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
             deps.options.requestTimeoutMs,
             (signal) => deps.ctx.model.default(undefined, { signal }),
           ).catch(() => undefined)
-          fallback = modelRef(preferred)
+          // `model.default` returns `{ location, data: ModelInfo | null }`.
+          fallback = modelRef(preferred?.data)
         }
 
         const title = titleFromPrompt(data.prompt, data.title, t(lang, "newSession"))
@@ -327,12 +333,13 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
             { signal },
           ),
         )
-        await rememberOwnedSession(deps.ctx, deps.ownedSessions, created.id)
+        const createdSessionID = created.id
+        await rememberOwnedSession(deps.ctx, deps.ownedSessions, createdSessionID)
 
         const admitted = await withRequest(signalOf(context), deps.options.requestTimeoutMs, (signal) =>
           deps.ctx.session.prompt(
             {
-              sessionID: created?.id as string,
+              sessionID: createdSessionID,
               text: data.prompt,
               delivery: data.delivery,
               id: data.messageID,
@@ -432,13 +439,11 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           applied.push(`${t(lang, "model")}: ${data.model}`)
         }
         if (data.agent) {
+          const agent = data.agent
           await withRequest(signalOf(context), deps.options.requestTimeoutMs, (signal) =>
-            deps.ctx.session.switchAgent(
-              { sessionID: data.sessionID, agent: data.agent as string },
-              { signal },
-            ),
+            deps.ctx.session.switchAgent({ sessionID: data.sessionID, agent }, { signal }),
           )
-          applied.push(`${t(lang, "agent")}: ${data.agent}`)
+          applied.push(`${t(lang, "agent")}: ${agent}`)
         }
 
         const admitted = await withRequest(signalOf(context), deps.options.requestTimeoutMs, (signal) =>
@@ -868,6 +873,8 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       const turn = await waitForTurn(deps.ctx, {
         sessionID: data.sessionID,
         anchorID: user?.id,
+        promptText: user?.text,
+        admittedAt: user?.time?.created,
         timeoutMs: data.timeoutMs,
         signal,
         initialMessages: messages,

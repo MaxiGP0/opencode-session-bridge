@@ -138,6 +138,32 @@ describe("output budget", () => {
     expect(report).toContain("60 actions omitted")
   })
 
+  it("treats zero helper limits as defaults, not unlimited", () => {
+    const tools = Array.from({ length: 100 }, (_, index) => tool(index))
+    const summary = summarizeTurn(
+      [
+        { id: "u1", type: "user", text: "run", time: { created: 1 } },
+        {
+          id: "a1",
+          type: "assistant",
+          content: [{ type: "text", text: "done" }, ...tools],
+          time: { created: 2 },
+        },
+        idle,
+      ],
+      0,
+    )
+    const report = formatSummary("Session: ses_1", summary, {
+      lang: "en",
+      maxOutputChars: 0,
+      maxTextChars: 0,
+      maxTools: 0,
+      maxPermissions: 0,
+    })
+    expect(report.length).toBeLessThanOrEqual(20_000)
+    expect(report).toContain("60 actions omitted")
+  })
+
   it("collects only the most recent tools", () => {
     const messages = [
       {
@@ -176,6 +202,20 @@ describe("renderTranscript", () => {
     expect((content.match(/User:/g) ?? []).length).toBe(30)
     expect(content).not.toContain("message 0")
     expect(content).toContain("message 39")
+  })
+
+  it("treats a zero limit as the default in the pure renderer too", () => {
+    const content = renderTranscript(messages, {
+      lang: "en",
+      limit: 0,
+      includeTools: true,
+      includeToolOutput: false,
+      includeReasoning: false,
+      maxOutputChars: 20_000,
+      maxTextChars: 4_000,
+      maxToolLine: 500,
+    })
+    expect((content.match(/User:/g) ?? []).length).toBe(30)
   })
 
   it("warns when afterMessageID does not exist", () => {
