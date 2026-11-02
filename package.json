@@ -1,0 +1,35 @@
+{
+  "name": "opencode-session-bridge",
+  "version": "1.0.0",
+  "description": "OpenCode plugin to open, interact with, monitor, read, wait for, and interrupt other OpenCode sessions.",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "README.es.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "sessions",
+    "agents",
+    "automation"
+  ],
+  "author": "Máximo Gomez Pessoa (https://github.com/MaxiGP0)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MaxiGP0/opencode-session-bridge.git"
+  },
+  "homepage": "https://github.com/MaxiGP0/opencode-session-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/MaxiGP0/opencode-session-bridge/issues"
+  },
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  }
+}
