@@ -118,8 +118,8 @@ New sessions inherit the **model of the calling session** by default and use the
   session keeps running and can be checked again with `sessions.status`.
 - The plugin does not delete sessions. Remove old sessions from the UI or the
   API if you create many of them.
-- Tool descriptions and tool output are currently written in Spanish. The
-  underlying session API is language-agnostic.
+- Tool descriptions are in English, but tool output is currently written in
+  Spanish. The underlying session API is language-agnostic.
 
 ## Development
 

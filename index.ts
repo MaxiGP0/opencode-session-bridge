@@ -222,7 +222,7 @@ async function waitForTurn(
     try {
       messages = await ctx.session.context({ sessionID })
     } catch {
-      // La sesión puede estar entre estados; se reintenta hasta el límite.
+      // The session may be between states; retry until the deadline.
     }
 
     const anchorIndex = anchorID ? messages.findIndex((message) => message.id === anchorID) : -1
@@ -256,7 +256,7 @@ async function waitForPrompt(
       const startIndex = anchorIndex >= 0 ? anchorIndex + 1 : beforeCount
       if (messages.slice(startIndex).some((message) => message.type === "user")) return true
     } catch {
-      // Se reintenta hasta el límite.
+      // Retry until the deadline.
     }
     await sleep(150)
   }
@@ -274,26 +274,26 @@ export default Plugin.define({
     await ctx.tool.transform((editor) => {
       editor.namespace({
         name: "sessions",
-        description: "Abrir, observar y controlar otras sesiones de OpenCode",
+        description: "Open, observe, and control other OpenCode sessions",
       })
 
       editor.add({
         name: "open",
         description:
-          "Crea una sesión NUEVA de OpenCode en el directorio actual, le envía un mensaje y espera su turno. Devuelve el estado final, el texto de la respuesta y las acciones (herramientas) realizadas. Hereda el modelo de la sesión actual si no se indica otro.",
+          "Create a NEW OpenCode session in the current directory, send it a message, and wait for its turn. Returns the final state, response text, and actions (tools) performed. Inherits the current session's model unless another one is specified.",
         input: {
           type: "object",
           properties: {
-            prompt: { type: "string", description: "Mensaje inicial que se enviará a la sesión nueva." },
-            title: { type: "string", description: "Título de la sesión. Si se omite, se deriva del mensaje." },
-            agent: { type: "string", description: "ID del agente. Por defecto build." },
-            model: { type: "string", description: "Modelo en formato provider/model. Por defecto, el de esta sesión." },
+            prompt: { type: "string", description: "Initial message to send to the new session." },
+            title: { type: "string", description: "Session title. If omitted, it is derived from the message." },
+            agent: { type: "string", description: "Agent ID. Defaults to build." },
+            model: { type: "string", description: "Model in provider/model format. Defaults to this session's model." },
             wait: {
               type: "boolean",
               description:
-                "Si es true (por defecto), espera a que termine el turno. Usa false para seguir en segundo plano y consultar luego con sessions.status.",
+                "If true (default), wait for the turn to finish. Use false to keep working in the background and check later with sessions.status.",
             },
-            timeoutMs: { type: "integer", description: "Tiempo máximo de espera en milisegundos. Por defecto 120000." },
+            timeoutMs: { type: "integer", description: "Maximum wait time in milliseconds. Defaults to 120000." },
           },
           required: ["prompt"],
           additionalProperties: false,
@@ -351,24 +351,24 @@ export default Plugin.define({
       editor.add({
         name: "send",
         description:
-          "Envía un mensaje a una sesión de OpenCode existente. Puede cambiar su agente o modelo, esperar el turno y devolver el estado, la respuesta y las acciones realizadas.",
+          "Send a message to an existing OpenCode session. Can switch its agent or model, wait for the turn, and return the state, response, and actions performed.",
         input: {
           type: "object",
           properties: {
-            sessionID: { type: "string", description: "ID de la sesión destino, por ejemplo ses_abc123." },
-            prompt: { type: "string", description: "Mensaje que se enviará a la sesión." },
-            agent: { type: "string", description: "Opcional: cambia el agente de la sesión antes de enviar." },
-            model: { type: "string", description: "Opcional: cambia el modelo (provider/model) antes de enviar." },
+            sessionID: { type: "string", description: "Target session ID, for example ses_abc123." },
+            prompt: { type: "string", description: "Message to send to the session." },
+            agent: { type: "string", description: "Optional: switch the session's agent before sending." },
+            model: { type: "string", description: "Optional: switch the model (provider/model) before sending." },
             delivery: {
               type: "string",
               enum: ["steer", "queue"],
-              description: "steer (por defecto) interrumpe/guía el turno actual; queue espera su turno.",
+              description: "steer (default) interrupts/steers the current turn; queue waits for its turn.",
             },
             wait: {
               type: "boolean",
-              description: "Si es true (por defecto), espera a que termine el turno. Usa false para no bloquear.",
+              description: "If true (default), wait for the turn to finish. Use false to avoid blocking.",
             },
-            timeoutMs: { type: "integer", description: "Tiempo máximo de espera en milisegundos. Por defecto 120000." },
+            timeoutMs: { type: "integer", description: "Maximum wait time in milliseconds. Defaults to 120000." },
           },
           required: ["sessionID", "prompt"],
           additionalProperties: false,
@@ -419,12 +419,12 @@ export default Plugin.define({
       editor.add({
         name: "status",
         description:
-          "Consulta ahora mismo si una sesión está en ejecución o inactiva, su resultado, el último texto que produjo, las herramientas recientes y el ID del último mensaje para seguir leyendo.",
+          "Check right now whether a session is running or idle, its result, the last text it produced, recent tools, and the last message ID for reading further.",
         input: {
           type: "object",
           properties: {
-            sessionID: { type: "string", description: "ID de la sesión a consultar." },
-            recent: { type: "integer", description: "Número de acciones recientes a mostrar. Por defecto 8." },
+            sessionID: { type: "string", description: "ID of the session to inspect." },
+            recent: { type: "integer", description: "Number of recent actions to show. Defaults to 8." },
           },
           required: ["sessionID"],
           additionalProperties: false,
@@ -469,20 +469,20 @@ export default Plugin.define({
       editor.add({
         name: "read",
         description:
-          "Lee la transcripción reciente de una sesión: mensajes del usuario, texto del asistente, herramientas ejecutadas (con su entrada/salida) y el resultado de cada turno.",
+          "Read a session's recent transcript: user messages, assistant text, executed tools (with their input/output), and the result of each turn.",
         input: {
           type: "object",
           properties: {
-            sessionID: { type: "string", description: "ID de la sesión a leer." },
-            limit: { type: "integer", description: "Cantidad de mensajes recientes. Por defecto 30." },
+            sessionID: { type: "string", description: "ID of the session to read." },
+            limit: { type: "integer", description: "Number of recent messages. Defaults to 30." },
             afterMessageID: {
               type: "string",
-              description: "Opcional: devuelve solo los mensajes posteriores a este ID.",
+              description: "Optional: return only messages after this ID.",
             },
-            includeTools: { type: "boolean", description: "Incluir herramientas ejecutadas. Por defecto true." },
+            includeTools: { type: "boolean", description: "Include executed tools. Defaults to true." },
             includeToolOutput: {
               type: "boolean",
-              description: "Incluir un extracto de la salida de cada herramienta. Por defecto false.",
+              description: "Include an excerpt of each tool's output. Defaults to false.",
             },
           },
           required: ["sessionID"],
@@ -532,12 +532,12 @@ export default Plugin.define({
       editor.add({
         name: "wait",
         description:
-          "Espera a que la sesión termine el turno actual (o el último turno iniciado) y devuelve su resultado, texto final y acciones. Si ya está inactiva, responde de inmediato.",
+          "Wait for the session to finish the current turn (or the last started turn) and return its result, final text, and actions. If it is already idle, returns immediately.",
         input: {
           type: "object",
           properties: {
-            sessionID: { type: "string", description: "ID de la sesión a esperar." },
-            timeoutMs: { type: "integer", description: "Tiempo máximo de espera en milisegundos. Por defecto 120000." },
+            sessionID: { type: "string", description: "ID of the session to wait for." },
+            timeoutMs: { type: "integer", description: "Maximum wait time in milliseconds. Defaults to 120000." },
           },
           required: ["sessionID"],
           additionalProperties: false,
@@ -609,14 +609,14 @@ export default Plugin.define({
 
       editor.add({
         name: "interrupt",
-        description: "Interrumpe el turno en ejecución de una sesión.",
+        description: "Interrupt a session's running turn.",
         input: {
           type: "object",
           properties: {
-            sessionID: { type: "string", description: "ID de la sesión a interrumpir." },
+            sessionID: { type: "string", description: "ID of the session to interrupt." },
             resume: {
               type: "boolean",
-              description: "Si es true, reanuda los mensajes pendientes. Por defecto false.",
+              description: "If true, resume pending messages. Defaults to false.",
             },
           },
           required: ["sessionID"],
@@ -639,13 +639,13 @@ export default Plugin.define({
       editor.add({
         name: "list",
         description:
-          "Lista las sesiones de OpenCode del directorio actual, con su ID, título, estado, resultado y última actualización.",
+          "List OpenCode sessions in the current directory, with their ID, title, state, result, and last update.",
         input: {
           type: "object",
           properties: {
-            limit: { type: "integer", description: "Número máximo de sesiones. Por defecto 10." },
-            search: { type: "string", description: "Texto para filtrar por título." },
-            directory: { type: "string", description: "Directorio cuyas sesiones se listan. Por defecto, el actual." },
+            limit: { type: "integer", description: "Maximum number of sessions. Defaults to 10." },
+            search: { type: "string", description: "Text to filter by title." },
+            directory: { type: "string", description: "Directory whose sessions are listed. Defaults to the current one." },
           },
           required: [],
           additionalProperties: false,

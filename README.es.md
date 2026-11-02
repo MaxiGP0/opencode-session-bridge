@@ -122,8 +122,8 @@ usan el agente `build`. Ambos se pueden cambiar con las opciones `model` y
   sigue ejecutándose y se puede consultar de nuevo con `sessions.status`.
 - El plugin no elimina sesiones. Borra las antiguas desde la interfaz o la API si
   creas muchas.
-- Las descripciones de las herramientas y su salida están actualmente en
-  español. La API de sesiones subyacente es independiente del idioma.
+- Las descripciones de las herramientas están en inglés, pero su salida sigue
+  en español. La API de sesiones subyacente es independiente del idioma.
 
 ## Desarrollo
 
