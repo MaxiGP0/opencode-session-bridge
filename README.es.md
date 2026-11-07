@@ -14,26 +14,46 @@ normal de sesiones y se pueden inspeccionar o retomar después.
 
 ## Funciones
 
-- Crear una sesión nueva y enviarle su primer mensaje.
+- Crear o reutilizar una sesión y enviarle su primer mensaje.
 - Enviar mensajes de seguimiento a cualquier sesión existente, con entrega
   `steer` o `queue`.
 - Esperar el **turno exacto** admitido por `session.prompt`, anclado por el ID
   de mensaje que devuelve el servidor.
-- Espera basada en eventos (`session.wait` + eventos `session.idle`) con un
-  fallback de polling acotado.
-- Reintentos idempotentes con `messageID` opcional.
-- Saber si una sesión está en ejecución o inactiva usando timestamps y mensajes
-  relevantes de la transcripción; los mensajes de control se ignoran.
+- Esperar un turno encolado o en segundo plano concreto con
+  `wait({ messageID })`.
+- Espera basada en eventos (`session.wait` + eventos `session.idle` /
+  `session.status`) con un fallback de polling acotado, una fase breve de
+  estabilización cuando la transcripción va por detrás del evento terminal y
+  rearme automático cuando la señal pertenece a un turno anterior.
+- Estado de reintento del proveedor: `status` y `wait` informan `retrying` con
+  el intento, el motivo y el próximo reintento en vez de tratarlo como error.
+- Cola background por sesión: FIFO con `queuedCount`, `queuedMessageIDs`, TTL,
+  límite de tamaño y limpieza en `interrupt`/`remove`.
+- Reintentos idempotentes con `messageID` opcional y `open({ sessionID })`; el
+  plugin persiste un mapping `messageID -> sessionID` por directorio y serializa
+  los `open` concurrentes con la misma clave.
+- Saber si una sesión está en ejecución, encolada, reintentando o inactiva
+  usando timestamps, mensajes relevantes y el estado en vivo de la sesión.
 - Leer la transcripción: mensajes del usuario, texto del asistente,
   herramientas, archivos, shell, sintéticos, compactación y razonamiento
   opcional.
+- Leer de forma incremental con `afterMessageID` + `limit` y continuar con
+  `nextAfterMessageID`.
 - Consultar y responder solicitudes de permiso pendientes con defaults
   conservadores.
+- Pasar las acciones peligrosas por las reglas `permission.assert` del host.
 - Renombrar y archivar sesiones sin borrarlas.
 - Borrar sesiones solo con opt-in explícito y `confirm: true`.
-- Salida estructurada en español/inglés que nunca traduce el contenido del
-  asistente, del usuario ni de las herramientas.
-- Presupuestos de salida y validación de entradas configurables.
+- Restringir `interrupt`/`update` a sesiones creadas o adoptadas por el plugin
+  salvo que se active el opt-in de sesiones ajenas correspondiente.
+- Valores `output` estructurados para Code Mode, además de `content` legible que
+  nunca traduce el contenido del asistente, del usuario ni de las herramientas.
+- Presupuestos de salida que conservan sesión, estado, IDs de mensaje, permisos
+  y errores, con flags `textTruncated`, `textLength`, `pendingTotal` y
+  `pendingTruncated`.
+- Límites de entrada para prompts, títulos, búsquedas, reglas de permiso y
+  metadata.
+- Registro LRU/TTL de sesiones propias y mappings por directorio.
 - Listar sesiones con paginación por cursor y filtros.
 
 ## Requisitos
@@ -70,13 +90,13 @@ Todas las herramientas viven en el namespace `sessions`.
 
 | Herramienta | Descripción |
 | --- | --- |
-| `sessions.open` | Crea una sesión nueva, envía un mensaje y (por defecto) espera el turno exacto. |
+| `sessions.open` | Crea o reutiliza una sesión, envía un mensaje y (por defecto) espera el turno exacto. |
 | `sessions.send` | Envía un mensaje a una sesión existente. Admite `steer`, `queue`, cambio de modelo/agente y `messageID`. |
-| `sessions.status` | Consulta inmediata: en ejecución/inactiva/permiso, resultado, último texto, herramientas recientes, permisos pendientes y último mensaje. |
+| `sessions.status` | Consulta inmediata: en ejecución/encolada/reintentando/inactiva/permiso, resultado, último texto, herramientas recientes, permisos pendientes e IDs de mensaje. |
 | `sessions.permissions` | Lista las solicitudes de permiso pendientes de una sesión. |
 | `sessions.reply` | Aprueba o rechaza una solicitud (`once`, `always` o `reject`), sujeto a opt-ins de seguridad. |
-| `sessions.read` | Lee una transcripción acotada, incluyendo herramientas y opcionalmente salida/razonamiento. |
-| `sessions.wait` | Espera el turno actual o el último iniciado. Devuelve `state: "permission"` en cuanto hay una solicitud pendiente. |
+| `sessions.read` | Lee una transcripción acotada, incluyendo herramientas y opcionalmente salida/razonamiento. Admite paginación incremental. |
+| `sessions.wait` | Espera el turno actual, el último iniciado o el `messageID` indicado. Devuelve `state: "permission"` en cuanto hay una solicitud pendiente. |
 | `sessions.interrupt` | Interrumpe el turno en ejecución. |
 | `sessions.list` | Lista sesiones con paginación por cursor, filtros y una foto por timestamps. |
 | `sessions.update` | Renombra, archiva/desarchiva, cambia metadata o ajusta permisos sin borrar. |
@@ -87,7 +107,8 @@ Todas las herramientas viven en el namespace `sessions`.
 
 - el mensaje que se envió;
 - el ID del mensaje admitido (`Message ID`);
-- el estado final (`idle`, `timeout`, `aborted`, `permission` o `error`);
+- el estado final (`idle`, `running`, `queued`, `retrying`, `timeout`,
+  `aborted`, `permission` o `error`);
 - el resultado y el texto final del asistente;
 - las herramientas ejecutadas, con un resumen de omitidas si se supera el
   presupuesto;
@@ -97,6 +118,38 @@ Todas las herramientas viven en el namespace `sessions`.
 
 `delivery: "queue"` no devuelve hasta que termina **el turno del prompt
 encolado**. Un idle anterior del turno actual no se acepta como resultado.
+
+Todas las herramientas devuelven también un objeto `output`. En Code Mode la
+llamada resuelve a ese objeto; en modo texto el modelo sigue recibiendo
+`content`, cuyo formato no cambia. Las herramientas encadenables exponen al
+menos:
+
+| Herramienta | Campos útiles de `output` |
+| --- | --- |
+| `open`, `send`, `wait` | `sessionID`, `title`, `messageID`, `state`, `outcome`, `lastMessageID`, `text`, `textLength`, `textTruncated`, `elapsedMs`, `fetchCount`, `queued`, `retry`, `pendingPermissions`, `pendingTotal`, `pendingTruncated`, `error`, `errorTruncated` |
+| `status` | `sessionID`, `state`, `running`, `queued`, `queuedCount`, `queuedMessageIDs`, `nextQueuedMessageID`, `lastOutcome`, `retry`, `promptMessageID`, `lastMessageID`, `text`, `textLength`, `textTruncated`, `tools`, `pendingPermissions`, `pendingTotal`, `pendingTruncated` |
+| `read` | `sessionID`, `lastMessageID`, `hasMore`, `nextAfterMessageID`, `truncated`, `count` |
+| `list` | `sessions[]`, `nextCursor`, `count` |
+| `permissions` | `sessionID`, `pending[]`, `pendingTotal`, `pendingTruncated`, `hasMore` |
+
+`output` está acotado de forma independiente de `content`: el texto por
+`maxTextChars`, los títulos por `maxTitleChars`, los errores por
+`maxErrorChars`, los permisos por `maxPermissions` (o el `limit` de la
+herramienta) y las listas por `limit`. Los campos críticos (`sessionID`,
+`state`, IDs de mensaje, IDs de permisos y error) se conservan siempre. Cualquier
+error de validación o de API devuelve `{ state: "error", error, sessionID? }`;
+las denegaciones de `permission.assert` siguen propagándose como error de
+herramienta, no como salida exitosa.
+
+Usa `created.sessionID`, no `created.id`:
+
+```ts
+const created = await tools.sessions.open({ prompt: "Revisa el módulo de auth." })
+if (created.state === "idle") {
+  const status = await tools.sessions.status({ sessionID: created.sessionID })
+  console.log(status.text)
+}
+```
 
 ## Uso
 
@@ -120,18 +173,19 @@ const created = await tools.sessions.open({
 })
 
 const status = await tools.sessions.status({
-  sessionID: created.id,
+  sessionID: created.sessionID,
   recent: 8,
   verbose: true,
 })
 
 const result = await tools.sessions.wait({
-  sessionID: created.id,
+  sessionID: created.sessionID,
+  messageID: created.messageID, // opcional: turno exacto
   timeoutMs: 120_000,
 })
 
 const transcript = await tools.sessions.read({
-  sessionID: created.id,
+  sessionID: created.sessionID,
   limit: 30,
   includeTools: true,
   includeToolOutput: true,
@@ -142,18 +196,68 @@ const transcript = await tools.sessions.read({
 ### Entrega en cola e idempotencia
 
 ```ts
-await tools.sessions.send({
+const sent = await tools.sessions.send({
   sessionID: "ses_...",
   prompt: "Ejecuta las pruebas después de la tarea actual.",
   delivery: "queue",
+  wait: false,
   messageID: "msg_test_suite_1",
+})
+
+// Más tarde, espera exactamente ese turno encolado.
+const result = await tools.sessions.wait({
+  sessionID: sent.sessionID,
+  messageID: sent.messageID,
   timeoutMs: 120_000,
 })
 ```
 
 Reutilizar el mismo `messageID` no crea un segundo mensaje. El ancla de espera
 es el ID que devuelve `session.prompt`, así que la llamada solo termina cuando
-ese turno encolado concreto ha finalizado.
+ese turno encolado concreto ha finalizado. Sin `messageID`, `wait` usa el primer
+prompt encolado de esa sesión (FIFO) y, si no hay cola, el último mensaje del
+usuario por compatibilidad.
+
+La cola background es FIFO por sesión. `status` informa `queuedCount`,
+`queuedMessageIDs` y `nextQueuedMessageID`; las entradas expiran según
+`queueTtlMs`, están limitadas por `maxQueuedPrompts` y se limpian con
+`interrupt` y `remove`.
+
+`open` es idempotente de dos formas:
+
+- Pasa `sessionID` para crear ese ID concreto o reutilizar una sesión existente.
+  Un `open({ sessionID })` correcto adopta la sesión, así que los posteriores
+  `interrupt`/`update` se permiten sin opt-in de sesiones ajenas.
+- Reutiliza el mismo `messageID`: el plugin persiste un mapping
+  `messageID -> sessionID` por directorio durante 7 días (máximo 500 entradas)
+  y reutiliza la sesión mapeada. Los `open` concurrentes con el mismo
+  `messageID` o `sessionID` comparten una operación, así que solo se crea una
+  sesión y un prompt.
+
+Si el prompt falla después de crear la sesión, la salida de error incluye el
+`sessionID` para que un reintento no deje una sesión huérfana.
+
+### Lecturas paginadas
+
+Sin `afterMessageID`, `limit` selecciona los mensajes más recientes. Con
+`afterMessageID`, selecciona los **primeros** `limit` mensajes posteriores al
+ancla, lo que hace predecible el polling:
+
+```ts
+const page = await tools.sessions.read({
+  sessionID: "ses_...",
+  afterMessageID: "msg_last_seen",
+  limit: 50,
+})
+
+if (page.hasMore && page.nextAfterMessageID) {
+  const next = await tools.sessions.read({
+    sessionID: "ses_...",
+    afterMessageID: page.nextAfterMessageID,
+    limit: 50,
+  })
+}
+```
 
 ### Renombrar, archivar y eliminar
 
@@ -181,11 +285,11 @@ devuelve `state: "permission"` con los IDs pendientes en lugar de esperar el
 timeout completo. Puedes consultarlos y responderlos sin salir del agente:
 
 ```ts
-const pending = await tools.sessions.permissions({ sessionID: created.id })
+const pending = await tools.sessions.permissions({ sessionID: created.sessionID })
 // Cada entrada incluye el ID de la solicitud, la acción y los recursos.
 
 await tools.sessions.reply({
-  sessionID: created.id,
+  sessionID: created.sessionID,
   requestID: "per_...",
   decision: "once", // once | always | reject
 })
@@ -217,6 +321,34 @@ Para permitir una regla, hay que optar explícitamente:
 }
 ```
 
+### Reglas de permiso del host
+
+Los opt-ins anteriores son los defaults del plugin. Las herramientas
+peligrosas también llaman a `permission.assert` del host antes de actuar, así
+que las reglas `deny`/`ask` de OpenCode se aplican por encima:
+
+| Acción | Herramienta |
+| --- | --- |
+| `session_bridge.open` | `open` |
+| `session_bridge.send` | `send` |
+| `session_bridge.reply` | `reply` |
+| `session_bridge.update` | `update` |
+| `session_bridge.remove` | `remove` |
+| `session_bridge.interrupt` | `interrupt` |
+
+Las herramientas de solo lectura (`status`, `read`, `wait`, `list`,
+`permissions`, `language`) no piden permiso. Un rechazo del host se devuelve
+como error de herramienta y la acción no se ejecuta. Ejemplo conservador:
+
+```jsonc
+{
+  "permissions": [
+    { "action": "session_bridge.reply", "resource": "*", "effect": "ask" },
+    { "action": "session_bridge.remove", "resource": "*", "effect": "ask" }
+  ]
+}
+```
+
 ### Idioma de salida
 
 La salida de las herramientas está en inglés por defecto. Cambia a español (o
@@ -241,11 +373,19 @@ default.
 | --- | --- | --- |
 | `language` | `"en"` | Idioma inicial de salida (`es` o `en`). |
 | `defaultTimeoutMs` | `120000` | Timeout de espera por defecto. |
-| `maxOutputChars` | `20000` | Techo duro para toda salida de herramienta. |
+| `maxOutputChars` | `20000` | Techo duro para el `content` de cada herramienta. |
 | `maxTools` | `40` | Herramientas mostradas en un resumen; el resto se resume. |
 | `maxToolLine` | `500` | Caracteres máximos por línea de herramienta. |
-| `maxTextChars` | `4000` | Caracteres máximos por bloque de texto. |
-| `maxPermissions` | `20` | Líneas máximas de permisos en un informe. |
+| `maxTextChars` | `4000` | Caracteres máximos por bloque de texto y por `output.text`. |
+| `maxErrorChars` | `1000` | Caracteres máximos para `output.error` y motivos de retry. |
+| `maxTitleChars` | `500` | Longitud máxima de título en entrada y salida (se sanean los saltos de línea). |
+| `maxPermissions` | `20` | Ítems máximos de permisos en `status`/turno. |
+| `maxPromptChars` | `100000` | Caracteres máximos de `prompt` y `reply.message`. |
+| `maxSearchChars` | `500` | Caracteres máximos de `list.search`. |
+| `maxPermissionRules` | `100` | Reglas de permiso máximas en `open`/`update`. |
+| `maxMetadataBytes` | `32768` | Bytes serializados máximos de `update.metadata`. |
+| `queueTtlMs` | `3600000` | TTL de las entradas de la cola background. |
+| `maxQueuedPrompts` | `100` | Prompts encolados máximos por sesión. |
 | `pollIntervalMs` | `500` | Intervalo inicial del fallback de polling. |
 | `maxPollIntervalMs` | `2000` | Backoff máximo de polling. |
 | `permissionPollMs` | `1500` | Intervalo de consulta de permisos sin eventos. |
@@ -254,6 +394,8 @@ default.
 | `allowPermissionRules` | `false` | Permite reglas `effect: "allow"` en `open`/`update`. |
 | `allowPersistentPermissions` | `false` | Permite `decision: "always"` en `reply`. |
 | `allowReplyToForeignSessions` | `false` | Permite responder a sesiones ajenas. |
+| `allowInterruptForeignSessions` | `false` | Permite interrumpir sesiones no creadas o adoptadas por el plugin. |
+| `allowUpdateForeignSessions` | `false` | Permite renombrar/archivar/cambiar metadata de sesiones ajenas. |
 | `allowSessionRemoval` | `false` | Habilita `sessions.remove`. |
 | `debug` | `false` | Reservado para diagnóstico. |
 
@@ -274,26 +416,53 @@ default.
 
 ## Cómo funciona
 
-1. `session.create` crea una sesión real.
+1. `session.create` crea una sesión real, o `session.get` reutiliza un
+   `sessionID` explícito / el mapping persistido de `messageID`.
 2. `session.prompt` admite el mensaje y devuelve su ID. Ese ID es el ancla del
    turno.
 3. El plugin espera con `session.wait` y eventos de sesión
-   (`session.idle`, `session.execution.failed`,
-   `session.execution.interrupted`, `permission.asked`). Solo acepta la
-   finalización cuando el ancla aparece como mensaje de usuario y le sigue un
-   mensaje `idle`.
-4. Si ambas fuentes de eventos no están disponibles o fallan, usa polling con
-   backoff (500 ms → 1 s → 2 s). El fallback está acotado por el timeout y por
-   cinco errores consecutivos.
-5. Un turno normal hace como máximo dos lecturas de `session.context`: lo normal
-   es una al final. La transcripción completa se lee porque 2.2.5 no expone
-   lectura paginada de mensajes desde el contexto del plugin.
-6. Las salidas se construyen con presupuesto y se truncan de forma segura, sin
-   partir pares sustitutos Unicode.
+   (`session.idle`, `session.status`, `session.execution.failed`,
+   `session.execution.interrupted`, `permission.asked`).
+4. Tras una señal terminal, una fase acotada de estabilización reintenta la
+   transcripción unas pocas veces (delays cortos, como máximo cuatro reintentos)
+   para que un evento que llega antes de persistir el mensaje `idle` no provoque
+   un timeout falso. Si la señal terminal pertenece a un turno anterior, se
+   rearman `session.wait`/los eventos un número acotado de veces en vez de caer
+   en polling completo.
+5. Un turno exitoso requiere el ancla como mensaje de usuario, un `idle`
+   posterior y un mensaje de assistant/compaction después del ancla. Los idles
+   del turno anterior se ignoran, incluso tras prompts encolados o `steer`. Un
+   idle failed/interrupted puede completar un turno sin texto del asistente.
+6. Un retry del proveedor (`session.status` con `type: "retry"`) se informa como
+   `retrying` con intento, motivo y próximo reintento; no es un error y no corta
+   la espera.
+7. Si ambas fuentes de eventos no están disponibles o fallan, usa
+   `session.get` (barato) más polling con backoff (500 ms → 1 s → 2 s), y lee la
+   transcripción solo cuando la sesión pasa a idle o cada cinco segundos como
+   red de seguridad. El fallback está acotado por el timeout y por cinco errores
+   consecutivos. Una última lectura corta en el deadline puede devolver `idle`
+   si el turno terminó justo a tiempo.
+8. Las acciones peligrosas consultan las reglas de permiso del host antes de
+   tocar la sesión.
+9. Un turno normal hace unas pocas lecturas de `session.context`, normalmente
+   una al final más los reintentos de estabilización. La transcripción completa
+   se lee porque 2.2.5 no expone lectura paginada de mensajes desde el contexto
+   del plugin.
+10. Las salidas se construyen con un presupuesto que reserva sesión, estado, IDs
+    de mensaje, permisos pendientes y errores antes del texto/herramientas
+    opcionales. El truncado es seguro para pares sustitutos Unicode y está
+    acotado por los límites solicitados.
+11. Una cache en vivo observa hooks de prompt y eventos `session.inbox.*` (solo
+    IDs y delivery, nunca el texto del prompt) para informar trabajo encolado de
+    sesiones ajenas. Siempre se apoya en la transcripción y la cola local cuando
+    las APIs experimentales no están disponibles.
+12. Las sesiones propias y los mappings se guardan por directorio con TTL de 30
+    días / 7 días, evicción LRU y limpieza en `remove`.
 
 Las sesiones nuevas heredan el **modelo de la sesión que las crea** por defecto y
 usan el agente `build`. Ambos se pueden cambiar con las opciones `model` y
-`agent`.
+`agent`. Un `model` explícito evita las consultas a la sesión llamadora y al
+modelo por defecto. Las variantes usan `provider/model#variant`.
 
 ## Permisos y seguridad
 
@@ -312,9 +481,17 @@ usan el agente `build`. Ambos se pueden cambiar con las opciones `model` y
   Activar `allowReplyToForeignSessions` permite al agente aprobar solicitudes de
   cualquier sesión, incluidas las que no creó. Úsalo solo en entornos de
   confianza.
+- `sessions.interrupt` y `sessions.update` también rechazan sesiones ajenas por
+  defecto. Usa `open({ sessionID })` para adoptar una sesión, o activa
+  `allowInterruptForeignSessions` / `allowUpdateForeignSessions` de forma
+  explícita. `send` no adopta la sesión.
 - `sessions.remove` está deshabilitado por defecto y requiere `confirm: true`.
   Detiene la ejecución y no se puede deshacer. Usa `sessions.update` con
   `archived: true` para la limpieza normal.
+- Las acciones peligrosas llaman a `permission.assert` con acciones
+  `session_bridge.*` separadas. Un `deny` del host o un `ask` rechazado aborta
+  la acción y se muestra como error de herramienta; nunca se convierte en un
+  informe exitoso.
 - El plugin nunca aprueba permisos automáticamente.
 
 ## Límites y diagnóstico
@@ -322,15 +499,35 @@ usan el agente `build`. Ambos se pueden cambiar con las opciones `model` y
 - OpenCode 2.2.5 no expone `session.diff`, `session.inbox`,
   `session.message.list`, `session.active` ni `session.fork` desde el contexto
   del plugin. Este plugin no los usa.
-- `read` siempre lee el contexto completo una vez; `limit` selecciona la cola a
-  renderizar. La lectura paginada de mensajes no está disponible en 2.2.5.
+- `read` siempre lee el contexto completo una vez; la API no expone lectura
+  paginada de mensajes en 2.2.5. Sin `afterMessageID`, `limit` selecciona la
+  cola reciente. Con `afterMessageID`, devuelve los primeros `limit` mensajes
+  posteriores al ancla e informa `hasMore` / `nextAfterMessageID`.
+- `status` con `includeText: false` e `includeTools: false` evita leer la
+  transcripción y devuelve solo estado/timestamps. `queued` se infiere de la cola
+  FIFO local, la cache en vivo de inbox/prompts y heurísticas de la transcripción.
 - El estado de `list` es una foto por timestamps y puede cambiar justo después
-  de la respuesta.
+  de la respuesta. `cost`/`tokens` solo se incluyen con `verbose: true`.
 - Un timeout no detiene la sesión. Vuelve a consultar con `sessions.status` o
-  `sessions.wait`.
+  `sessions.wait`, usando el `messageID` devuelto cuando el turno estaba
+  encolado.
 - Si un permiso bloquea un turno, responde y vuelve a llamar a `sessions.wait`.
-- `model` usa `provider/model`; el ID del modelo puede contener `/`.
-- Si la salida se trunca, sube `maxOutputChars` o baja `recent`/`limit`.
+- `model` usa `provider/model`; el ID del modelo puede contener `/`. La variante
+  se añade como `#variant`.
+- `output.text`, `output.error`, títulos, permisos pendientes y resultados de
+  `list` están acotados; revisa `textTruncated`, `textLength`, `pendingTotal`,
+  `pendingTruncated` y `errorTruncated`. Sube `maxTextChars`, `maxTitleChars`,
+  `maxPermissions` o `maxOutputChars`, o baja `recent`/`limit`.
+- Los límites de entrada son configurables (`maxPromptChars`, `maxTitleChars`,
+  `maxSearchChars`, `maxPermissionRules`, `maxMetadataBytes`) y se aplican tanto
+  en JSON Schema como en la validación runtime.
+- `localize` es un helper legacy deprecado. El código nuevo debe usar `t()`; el
+  helper copia literalmente el contenido multilínea del asistente y las líneas
+  de herramientas que no son permisos. Su eliminación está prevista para
+  `3.0.0`.
+- El mapping de `open` expira a los 7 días y guarda como máximo 500 entradas por
+  directorio. Las sesiones propias expiran a los 30 días. Usa un `sessionID`
+  explícito si la ventana de reintento es mayor.
 - El plugin no elimina sesiones salvo que `allowSessionRemoval` esté activo.
 
 ## Desarrollo

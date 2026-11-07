@@ -14,24 +14,43 @@ session list and can be inspected or resumed later.
 
 ## Features
 
-- Create a new session and send its first prompt.
+- Create or reuse a session and send its first prompt.
 - Send follow-up messages to any existing session, with `steer` or `queue`
   delivery.
 - Wait for the **exact turn** admitted by `session.prompt`, anchored by the
   message ID returned by the server.
-- Event-driven waiting (`session.wait` + `session.idle` events) with a bounded
-  polling fallback.
-- Idempotent retries with an optional `messageID`.
-- Check whether a session is running or idle using timestamps and relevant
-  transcript messages; control messages are ignored.
+- Wait for a specific queued or background turn with `wait({ messageID })`.
+- Event-driven waiting (`session.wait` + `session.idle` / `session.status`
+  events) with a bounded polling fallback, a short settle phase when the
+  transcript lags behind the terminal event, and automatic re-arming when an
+  event belongs to a previous turn.
+- Live provider retry state: `status` and `wait` report `retrying` with the
+  attempt, reason, and next retry instead of treating a backoff as an error.
+- Background queue tracking: FIFO per session with `queuedCount`,
+  `queuedMessageIDs`, a TTL, a size limit, and cleanup on `interrupt`/`remove`.
+- Idempotent retries with an optional `messageID` and `open({ sessionID })`;
+  the plugin persists a per-directory `messageID -> sessionID` mapping and
+  serializes concurrent `open` calls with the same key.
+- Check whether a session is running, queued, retrying, or idle using
+  timestamps, relevant transcript messages, and the live session status.
 - Read the transcript: user messages, assistant text, tools, files, shell,
   synthetic, compaction, and optional reasoning.
+- Read incrementally with `afterMessageID` + `limit` and continue with
+  `nextAfterMessageID`.
 - Inspect and answer pending permission requests, with conservative defaults.
+- Route dangerous actions through the host's `permission.assert` rules.
 - Rename and archive sessions without deleting them.
 - Delete sessions only with an explicit opt-in and `confirm: true`.
-- Structured Spanish/English output that never translates assistant, user, or
-  tool content.
-- Configurable output budgets and input validation.
+- Restrict `interrupt`/`update` to sessions created or adopted by this plugin
+  unless the corresponding foreign-session opt-in is enabled.
+- Structured `output` values for Code Mode, plus readable `content` that never
+  translates assistant, user, or tool content.
+- Configurable output budgets that preserve session, state, message IDs,
+  permissions, and errors, with `textTruncated`, `textLength`,
+  `pendingTotal`, and `pendingTruncated` flags.
+- Input size limits for prompts, titles, searches, permission rules, and
+  metadata.
+- A per-directory LRU/TTL registry for owned sessions and open mappings.
 - List sessions with cursor pagination and filters.
 
 ## Requirements
@@ -68,13 +87,13 @@ All tools live in the `sessions` namespace.
 
 | Tool | Description |
 | --- | --- |
-| `sessions.open` | Create a new session, send a prompt, and (by default) wait for the exact turn. |
+| `sessions.open` | Create or reuse a session, send a prompt, and (by default) wait for the exact turn. |
 | `sessions.send` | Send a message to an existing session. Supports `steer`, `queue`, model/agent switches, and `messageID`. |
-| `sessions.status` | Immediate snapshot: running/idle/permission, outcome, last text, recent tools, pending permissions, and last message ID. |
+| `sessions.status` | Immediate snapshot: running/queued/retrying/idle/permission, outcome, last text, recent tools, pending permissions, and message IDs. |
 | `sessions.permissions` | List pending permission requests for a session. |
 | `sessions.reply` | Approve or reject a pending permission request (`once`, `always`, or `reject`), subject to security opt-ins. |
-| `sessions.read` | Read a bounded transcript, including tools and optional tool output/reasoning. |
-| `sessions.wait` | Wait for the current or last started turn. Returns `state: "permission"` as soon as a request is pending. |
+| `sessions.read` | Read a bounded transcript, including tools and optional tool output/reasoning. Supports incremental pagination. |
+| `sessions.wait` | Wait for the current, last started, or explicit `messageID` turn. Returns `state: "permission"` as soon as a request is pending. |
 | `sessions.interrupt` | Interrupt the running turn. |
 | `sessions.list` | List sessions with cursor pagination, filters, and a timestamp snapshot. |
 | `sessions.update` | Rename, archive/unarchive, change metadata, or adjust permission rules without deleting. |
@@ -85,7 +104,8 @@ All tools live in the `sessions` namespace.
 
 - the prompt that was sent;
 - the admitted message ID (`Message ID`);
-- the final state (`idle`, `timeout`, `aborted`, `permission`, or `error`);
+- the final state (`idle`, `running`, `queued`, `retrying`, `timeout`,
+  `aborted`, `permission`, or `error`);
 - the outcome and the assistant's final text;
 - the tools that were executed, with an omission summary when the budget is
   exceeded;
@@ -94,6 +114,36 @@ All tools live in the `sessions` namespace.
 
 `delivery: "queue"` does not return until the **queued prompt's own turn**
 finishes. An earlier idle from the current turn is not accepted as the result.
+
+Every tool also returns an `output` object. In Code Mode the call resolves to
+that object; in text mode the model still receives `content`, whose format has
+not changed. The chaining tools expose at least:
+
+| Tool | Useful output fields |
+| --- | --- |
+| `open`, `send`, `wait` | `sessionID`, `title`, `messageID`, `state`, `outcome`, `lastMessageID`, `text`, `textLength`, `textTruncated`, `elapsedMs`, `fetchCount`, `queued`, `retry`, `pendingPermissions`, `pendingTotal`, `pendingTruncated`, `error`, `errorTruncated` |
+| `status` | `sessionID`, `state`, `running`, `queued`, `queuedCount`, `queuedMessageIDs`, `nextQueuedMessageID`, `lastOutcome`, `retry`, `promptMessageID`, `lastMessageID`, `text`, `textLength`, `textTruncated`, `tools`, `pendingPermissions`, `pendingTotal`, `pendingTruncated` |
+| `read` | `sessionID`, `lastMessageID`, `hasMore`, `nextAfterMessageID`, `truncated`, `count` |
+| `list` | `sessions[]`, `nextCursor`, `count` |
+| `permissions` | `sessionID`, `pending[]`, `pendingTotal`, `pendingTruncated`, `hasMore` |
+
+`output` is bounded independently of `content`: text is capped by
+`maxTextChars`, titles by `maxTitleChars`, errors by `maxErrorChars`, pending
+permission arrays by `maxPermissions` (or the tool's `limit`), and list results
+by `limit`. Critical fields (`sessionID`, `state`, message IDs, permission IDs,
+and error) are always kept. Every validation or API error returns
+`{ state: "error", error, sessionID? }`; host permission denials still surface
+as tool errors instead of successful output.
+
+Use `created.sessionID`, not `created.id`:
+
+```ts
+const created = await tools.sessions.open({ prompt: "Review the auth module." })
+if (created.state === "idle") {
+  const status = await tools.sessions.status({ sessionID: created.sessionID })
+  console.log(status.text)
+}
+```
 
 ## Usage
 
@@ -117,18 +167,19 @@ const created = await tools.sessions.open({
 })
 
 const status = await tools.sessions.status({
-  sessionID: created.id,
+  sessionID: created.sessionID,
   recent: 8,
   verbose: true,
 })
 
 const result = await tools.sessions.wait({
-  sessionID: created.id,
+  sessionID: created.sessionID,
+  messageID: created.messageID, // optional: exact turn
   timeoutMs: 120_000,
 })
 
 const transcript = await tools.sessions.read({
-  sessionID: created.id,
+  sessionID: created.sessionID,
   limit: 30,
   includeTools: true,
   includeToolOutput: true,
@@ -139,18 +190,68 @@ const transcript = await tools.sessions.read({
 ### Queue delivery and idempotency
 
 ```ts
-await tools.sessions.send({
+const sent = await tools.sessions.send({
   sessionID: "ses_...",
   prompt: "Run the test suite after the current task.",
   delivery: "queue",
+  wait: false,
   messageID: "msg_test_suite_1",
+})
+
+// Later, wait for exactly this queued turn.
+const result = await tools.sessions.wait({
+  sessionID: sent.sessionID,
+  messageID: sent.messageID,
   timeoutMs: 120_000,
 })
 ```
 
 Reusing the same `messageID` does not create a second message. The wait anchor
 is the ID returned by `session.prompt`, so the call returns only when that
-specific queued turn has finished.
+specific queued turn has finished. Without `messageID`, `wait` uses the first
+queued prompt tracked for that session (FIFO), then falls back to the last user
+message for compatibility.
+
+Background queue state is FIFO per session. `status` reports
+`queuedCount`, `queuedMessageIDs`, and `nextQueuedMessageID`; the queue entries
+expire after `queueTtlMs`, are capped by `maxQueuedPrompts`, and are cleared by
+`interrupt` and `remove`.
+
+`open` is idempotent in two ways:
+
+- Pass `sessionID` to create that specific ID or reuse an existing session.
+  A successful `open({ sessionID })` adopts the session, so later
+  `interrupt`/`update` calls are allowed without a foreign-session opt-in.
+- Reuse the same `messageID`: the plugin persists a per-directory
+  `messageID -> sessionID` mapping for 7 days (up to 500 entries) and reuses
+  the mapped session. Concurrent `open` calls with the same `messageID` or
+  `sessionID` share one operation, so only one session and one prompt are
+  created.
+
+If the prompt fails after the session was created, the error output includes the
+`sessionID` so a retry does not leave an orphan session behind.
+
+### Paginated reads
+
+Without `afterMessageID`, `limit` selects the most recent messages. With
+`afterMessageID`, it selects the **first** `limit` messages after that anchor,
+which makes polling predictable:
+
+```ts
+const page = await tools.sessions.read({
+  sessionID: "ses_...",
+  afterMessageID: "msg_last_seen",
+  limit: 50,
+})
+
+if (page.hasMore && page.nextAfterMessageID) {
+  const next = await tools.sessions.read({
+    sessionID: "ses_...",
+    afterMessageID: page.nextAfterMessageID,
+    limit: 50,
+  })
+}
+```
 
 ### Rename, archive, and remove
 
@@ -178,11 +279,11 @@ If a background session hits an interactive permission, `sessions.wait` returns
 full timeout. You can inspect and answer them without leaving the agent:
 
 ```ts
-const pending = await tools.sessions.permissions({ sessionID: created.id })
+const pending = await tools.sessions.permissions({ sessionID: created.sessionID })
 // Each entry includes the request ID, action, and resources.
 
 await tools.sessions.reply({
-  sessionID: created.id,
+  sessionID: created.sessionID,
   requestID: "per_...",
   decision: "once", // once | always | reject
 })
@@ -214,6 +315,34 @@ To allow a rule, opt in explicitly:
 }
 ```
 
+### Host permission rules
+
+The security opt-ins above are the plugin's own defaults. Dangerous tools also
+call the host's `permission.assert` before acting, so OpenCode `deny`/`ask`
+rules apply on top:
+
+| Action | Used by |
+| --- | --- |
+| `session_bridge.open` | `open` |
+| `session_bridge.send` | `send` |
+| `session_bridge.reply` | `reply` |
+| `session_bridge.update` | `update` |
+| `session_bridge.remove` | `remove` |
+| `session_bridge.interrupt` | `interrupt` |
+
+Read-only tools (`status`, `read`, `wait`, `list`, `permissions`, `language`)
+do not ask for permission. A host denial is returned as a tool error and the
+action is not executed. Example conservative configuration:
+
+```jsonc
+{
+  "permissions": [
+    { "action": "session_bridge.reply", "resource": "*", "effect": "ask" },
+    { "action": "session_bridge.remove", "resource": "*", "effect": "ask" }
+  ]
+}
+```
+
 ### Output language
 
 Tool output is English by default. Switch to Spanish (or back) at runtime:
@@ -236,11 +365,19 @@ default.
 | --- | --- | --- |
 | `language` | `"en"` | Initial output language (`es` or `en`). |
 | `defaultTimeoutMs` | `120000` | Default wait timeout. |
-| `maxOutputChars` | `20000` | Hard ceiling for every tool output. |
+| `maxOutputChars` | `20000` | Hard ceiling for every tool `content`. |
 | `maxTools` | `40` | Tools shown in a summary; the rest are summarized. |
 | `maxToolLine` | `500` | Maximum characters per tool line. |
-| `maxTextChars` | `4000` | Maximum characters per assistant/user text block. |
-| `maxPermissions` | `20` | Maximum permission lines in a report. |
+| `maxTextChars` | `4000` | Maximum characters per assistant/user text block and `output.text`. |
+| `maxErrorChars` | `1000` | Maximum characters for `output.error` and retry reasons. |
+| `maxTitleChars` | `500` | Maximum title length in input and output (newlines are sanitized). |
+| `maxPermissions` | `20` | Maximum permission items in `status`/turn output. |
+| `maxPromptChars` | `100000` | Maximum characters for `prompt` and `reply.message`. |
+| `maxSearchChars` | `500` | Maximum characters for `list.search`. |
+| `maxPermissionRules` | `100` | Maximum permission rules in `open`/`update`. |
+| `maxMetadataBytes` | `32768` | Maximum serialized bytes for `update.metadata`. |
+| `queueTtlMs` | `3600000` | Background queue entry TTL. |
+| `maxQueuedPrompts` | `100` | Maximum tracked queued prompts per session. |
 | `pollIntervalMs` | `500` | Initial polling fallback interval. |
 | `maxPollIntervalMs` | `2000` | Maximum polling backoff. |
 | `permissionPollMs` | `1500` | Permission check interval when no event is available. |
@@ -249,6 +386,8 @@ default.
 | `allowPermissionRules` | `false` | Allow `effect: "allow"` rules in `open`/`update`. |
 | `allowPersistentPermissions` | `false` | Allow `decision: "always"` in `reply`. |
 | `allowReplyToForeignSessions` | `false` | Allow replying to sessions not created by this plugin. |
+| `allowInterruptForeignSessions` | `false` | Allow interrupting sessions not created or adopted by this plugin. |
+| `allowUpdateForeignSessions` | `false` | Allow renaming/archiving/metadata changes on foreign sessions. |
 | `allowSessionRemoval` | `false` | Enable `sessions.remove`. |
 | `debug` | `false` | Reserved for diagnostic logging. |
 
@@ -269,25 +408,50 @@ default.
 
 ## How it works
 
-1. `session.create` creates a real session.
+1. `session.create` creates a real session, or `session.get` reuses an explicit
+   `sessionID` / persisted `messageID` mapping.
 2. `session.prompt` admits the message and returns its ID. That ID is the
    anchor for the turn.
 3. The plugin waits using `session.wait` and session events
-   (`session.idle`, `session.execution.failed`,
-   `session.execution.interrupted`, `permission.asked`). It accepts completion
-   only when the anchor appears as a user message and an `idle` message follows
-   it.
-4. If both event sources are unavailable or fail, the plugin falls back to
-   polling with backoff (500 ms → 1 s → 2 s). The fallback is bounded by the
-   timeout and by five consecutive request errors.
-5. A normal turn performs at most two `session.context` reads: normally one at
-   the end. The complete transcript is read because 2.2.5 does not expose
-   paginated message reads from the plugin context.
-6. Outputs are built with a budget and truncated safely, without splitting
-   Unicode surrogate pairs.
+   (`session.idle`, `session.status`, `session.execution.failed`,
+   `session.execution.interrupted`, `permission.asked`).
+4. After a terminal signal, a bounded settle phase retries the transcript a few
+   times (short delays, at most four retries) so an event that arrives before
+   the `idle` message is persisted does not cause a false timeout. If the
+   terminal signal belongs to a previous turn, `session.wait`/events are
+   re-armed a bounded number of times instead of falling back to full polling.
+5. A successful turn requires the anchor as a user message, a later `idle`, and
+   an assistant/compaction message after the anchor. Idles from the previous
+   turn are ignored, including after queued/steered prompts. A failed or
+   interrupted idle can complete a turn without assistant text.
+6. A provider retry (`session.status` with `type: "retry"`) is reported as
+   `retrying` with the attempt, reason, and next retry; it is not an error and
+   does not stop the wait.
+7. If both event sources are unavailable or fail, the plugin falls back to
+   `session.get` (cheap) plus polling with backoff (500 ms → 1 s → 2 s), and
+   reads the transcript only when the session becomes idle or every five
+   seconds as a safety net. The fallback is bounded by the timeout and by five
+   consecutive request errors. A final short read at the deadline can still
+   return `idle` when the turn completed just in time.
+8. Dangerous actions call the host permission rules before touching the
+   session.
+9. A normal turn performs at most a few `session.context` reads, normally one
+   at the end plus settle retries. The complete transcript is read because
+   2.2.5 does not expose paginated message reads from the plugin context.
+10. Outputs are built with a budget that reserves session IDs, state, message
+    IDs, pending permissions, and errors before optional text/tools. Truncation
+    is safe for Unicode surrogate pairs and bounded by the requested limits.
+11. A live in-memory cache observes prompt hooks and `session.inbox.*` events
+    (IDs and delivery only, never prompt text) to report foreign queued work.
+    It is always backed by the transcript and the local queue when the
+    experimental APIs are unavailable.
+12. Owned sessions and open mappings are stored per directory with a 30-day
+    TTL / 7-day TTL, LRU eviction, and cleanup on `remove`.
 
 New sessions inherit the **model of the calling session** by default and use the
-`build` agent. Both can be overridden with the `model` and `agent` options.
+`build` agent. Both can be overridden with the `model` and `agent` options. An
+explicit `model` skips the caller-session and default-model lookups. Model
+variants use `provider/model#variant`.
 
 ## Permissions and security
 
@@ -304,9 +468,16 @@ New sessions inherit the **model of the calling session** by default and use the
   Enabling `allowReplyToForeignSessions` lets the agent approve requests from
   any session, including sessions it did not create. Use it only in trusted
   environments.
+- `sessions.interrupt` and `sessions.update` also reject foreign sessions by
+  default. Use `open({ sessionID })` to adopt a session, or enable
+  `allowInterruptForeignSessions` / `allowUpdateForeignSessions` explicitly.
+  `send` does not adopt a session.
 - `sessions.remove` is disabled by default and requires `confirm: true`. It
   stops execution and cannot be undone. Use `sessions.update` with
   `archived: true` for normal cleanup.
+- Dangerous actions call `permission.assert` with separate
+  `session_bridge.*` actions. A host `deny` or rejected `ask` aborts the action
+  and surfaces as a tool error; it is never converted into a success report.
 - The plugin never approves permissions automatically.
 
 ## Limits and troubleshooting
@@ -314,15 +485,34 @@ New sessions inherit the **model of the calling session** by default and use the
 - OpenCode 2.2.5 does not expose `session.diff`, `session.inbox`,
   `session.message.list`, `session.active`, or `session.fork` through the
   plugin context. This plugin does not use them.
-- `read` always reads the full context once; `limit` selects the tail to render.
-  Paginated message reads are not available in 2.2.5.
+- `read` always reads the full context once; the API does not expose paginated
+  message reads in 2.2.5. Without `afterMessageID`, `limit` selects the recent
+  tail. With `afterMessageID`, it returns the first `limit` messages after the
+  anchor and reports `hasMore` / `nextAfterMessageID`.
+- `status` with `includeText: false` and `includeTools: false` skips the
+  transcript read and returns state/timestamps only. `queued` is inferred from
+  the local FIFO queue, the live inbox/prompt cache, and transcript heuristics.
 - `list` state is a timestamp snapshot and may change immediately after the
-  response.
+  response. `cost`/`tokens` are included only with `verbose: true`.
 - A timeout does not stop the session. Check again with `sessions.status` or
-  `sessions.wait`.
+  `sessions.wait`, using the returned `messageID` when the turn was queued.
 - If a permission blocks a turn, reply and then call `sessions.wait` again.
-- `model` uses `provider/model`; the model ID may contain `/`.
-- If output is truncated, raise `maxOutputChars` or lower `recent`/`limit`.
+- `model` uses `provider/model`; the model ID may contain `/`. A variant is
+  appended as `#variant`.
+- `output.text`, `output.error`, titles, pending permissions, and list results
+  are bounded; check `textTruncated`, `textLength`, `pendingTotal`,
+  `pendingTruncated`, and `errorTruncated`. Raise `maxTextChars`,
+  `maxTitleChars`, `maxPermissions`, or `maxOutputChars`, or lower
+  `recent`/`limit`.
+- Input limits are configurable (`maxPromptChars`, `maxTitleChars`,
+  `maxSearchChars`, `maxPermissionRules`, `maxMetadataBytes`) and are enforced
+  both by JSON Schema and runtime validation.
+- `localize` is a deprecated legacy helper. New code should use `t()`; the
+  helper copies multiline assistant content and non-permission tool lines
+  verbatim. Removal is planned for `3.0.0`.
+- The `open` mapping expires after 7 days and stores at most 500 entries per
+  directory. Owned sessions expire after 30 days. Use an explicit `sessionID`
+  when the retry window is longer.
 - The plugin does not delete sessions unless `allowSessionRemoval` is enabled.
 
 ## Development
