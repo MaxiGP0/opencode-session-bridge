@@ -1,9 +1,12 @@
-import { formatError } from "./format.ts"
+import { formatError, isRunning } from "./format.ts"
 import type {
   MessageLike,
   PermissionLike,
   ProgressInfo,
+  RetryInfo,
   SessionEventLike,
+  SessionStatusLike,
+  TerminalSignal,
   TurnResult,
   TurnState,
   WaitContext,
@@ -11,17 +14,25 @@ import type {
 
 const EVENT_TYPES = [
   "session.idle",
+  "session.status",
   "session.execution.failed",
   "session.execution.interrupted",
   "permission.asked",
 ] as const
 
 const MAX_CONSECUTIVE_ERRORS = 5
+const MAX_SETTLE_ATTEMPTS = 4
+const MAX_REARMS = 4
+const MAX_WAIT_ERRORS = 2
+const INITIAL_SETTLE_DELAY_MS = 25
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000
 const DEFAULT_POLL_MS = 500
 const DEFAULT_MAX_POLL_MS = 2_000
 const DEFAULT_PERMISSION_POLL_MS = 1_500
 const DEFAULT_PROGRESS_INTERVAL_MS = 5_000
+const FALLBACK_CONTEXT_INTERVAL_MS = 5_000
+const FINAL_READ_TIMEOUT_MS = 500
+const FINAL_PERMISSION_TIMEOUT_MS = 250
 
 export type WaitOptions = {
   sessionID: string
@@ -55,11 +66,15 @@ export function requestSignal(parent: AbortSignal | undefined, timeoutMs: number
   const controller = new AbortController()
   const onAbort = () => controller.abort(parent?.reason)
   if (parent) {
-    if (parent.aborted) controller.abort(parent.reason)
-    else parent.addEventListener("abort", onAbort, { once: true })
+    if (parent.aborted) {
+      controller.abort(parent.reason)
+    } else {
+      parent.addEventListener("abort", onAbort, { once: true })
+      if (parent.aborted) onAbort()
+    }
   }
   const timer =
-    timeoutMs > 0
+    timeoutMs > 0 && !controller.signal.aborted
       ? setTimeout(() => {
           controller.abort(new DOMException("Request timed out", "TimeoutError"))
         }, timeoutMs)
@@ -97,32 +112,10 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<boolean> {
       signal?.removeEventListener("abort", onAbort)
       resolve(false)
     }
-    signal?.addEventListener("abort", onAbort, { once: true })
-  })
-}
-
-function settleWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
-  return new Promise((resolve) => {
-    let settled = false
-    const timer = setTimeout(() => {
-      if (settled) return
-      settled = true
-      resolve(undefined)
-    }, ms)
-    promise.then(
-      (value) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        resolve(value)
-      },
-      () => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        resolve(undefined)
-      },
-    )
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true })
+      if (signal.aborted) onAbort()
+    }
   })
 }
 
@@ -135,6 +128,23 @@ async function fetchContext(
   const request = requestSignal(signal, timeoutMs)
   try {
     return await ctx.session.context({ sessionID }, { signal: request.signal })
+  } finally {
+    request.cleanup()
+  }
+}
+
+type SessionGetResult = Awaited<ReturnType<WaitContext["session"]["get"]>>
+
+async function fetchSession(
+  ctx: WaitContext,
+  sessionID: string,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<SessionGetResult | undefined> {
+  if (typeof ctx.session.get !== "function") return undefined
+  const request = requestSignal(signal, timeoutMs)
+  try {
+    return await ctx.session.get({ sessionID }, { signal: request.signal })
   } finally {
     request.cleanup()
   }
@@ -154,19 +164,25 @@ async function listPermissions(
   }
 }
 
-type Evaluation = {
+export type Evaluation = {
   done: boolean
   startIndex: number
+  endIndex?: number
   idle?: MessageLike
   anchorFound: boolean
+  anchorMessage?: MessageLike
+  anchorCreatedAt?: number
+  hasTurnAssistant: boolean
+  queued: boolean
 }
 
 function isRelevant(message: MessageLike | undefined): boolean {
   return message?.type === "user" || message?.type === "assistant" || message?.type === "compaction"
 }
 
-function evaluateTurn(messages: MessageLike[], options: WaitOptions): Evaluation {
+export function evaluateTurn(messages: MessageLike[], options: WaitOptions): Evaluation {
   const requireAnchor = options.requireAnchor ?? Boolean(options.anchorID)
+  const hasExplicitAnchor = Boolean(options.anchorID || (options.promptText && options.admittedAt !== undefined))
   let anchorIndex = options.anchorID
     ? messages.findIndex((message) => message.id === options.anchorID)
     : -1
@@ -175,7 +191,7 @@ function evaluateTurn(messages: MessageLike[], options: WaitOptions): Evaluation
     for (let index = messages.length - 1; index >= 0; index--) {
       const message = messages[index]
       if (
-        message.type === "user" &&
+        message?.type === "user" &&
         message.text === options.promptText &&
         (message.time?.created ?? 0) >= options.admittedAt
       ) {
@@ -185,35 +201,173 @@ function evaluateTurn(messages: MessageLike[], options: WaitOptions): Evaluation
     }
   }
 
-  if (anchorIndex >= 0) {
-    for (let index = anchorIndex + 1; index < messages.length; index++) {
-      if (messages[index]?.type === "idle") {
-        return { done: true, startIndex: anchorIndex, idle: messages[index], anchorFound: true }
+  if (anchorIndex < 0) {
+    if (requireAnchor) {
+      return {
+        done: false,
+        startIndex: messages.length,
+        anchorFound: false,
+        hasTurnAssistant: false,
+        queued: Boolean(options.anchorID),
       }
     }
-    return { done: false, startIndex: anchorIndex, anchorFound: true }
+
+    let lastUserIndex = -1
+    let lastRelevantIndex = -1
+    for (let index = 0; index < messages.length; index++) {
+      const message = messages[index]
+      if (message?.type === "user") lastUserIndex = index
+      if (isRelevant(message)) lastRelevantIndex = index
+    }
+
+    if (lastRelevantIndex < 0) {
+      return {
+        done: false,
+        startIndex: 0,
+        anchorFound: false,
+        hasTurnAssistant: false,
+        queued: false,
+      }
+    }
+    anchorIndex = lastUserIndex >= 0 ? lastUserIndex : lastRelevantIndex
   }
 
-  let lastRelevant = -1
-  for (let index = 0; index < messages.length; index++) {
-    if (isRelevant(messages[index])) lastRelevant = index
-  }
+  const anchorMessage = messages[anchorIndex]
+  const anchorCreatedAt = anchorMessage?.time?.created ?? options.admittedAt
+  const anchorFound = hasExplicitAnchor
 
-  if (requireAnchor) {
-    return { done: false, startIndex: messages.length, anchorFound: false }
-  }
-
-  if (lastRelevant < 0) return { done: false, startIndex: 0, anchorFound: false }
-  for (let index = lastRelevant + 1; index < messages.length; index++) {
-    if (messages[index]?.type === "idle") {
-      return { done: true, startIndex: lastRelevant, idle: messages[index], anchorFound: false }
+  if (anchorMessage?.type !== "user") {
+    for (let index = anchorIndex + 1; index < messages.length; index++) {
+      if (messages[index]?.type === "idle") {
+        return {
+          done: true,
+          startIndex: anchorIndex,
+          endIndex: index,
+          idle: messages[index],
+          anchorFound,
+          anchorMessage,
+          anchorCreatedAt,
+          hasTurnAssistant: anchorMessage?.type === "assistant",
+          queued: false,
+        }
+      }
+    }
+    return {
+      done: false,
+      startIndex: anchorIndex,
+      anchorFound,
+      anchorMessage,
+      anchorCreatedAt,
+      hasTurnAssistant: anchorMessage?.type === "assistant",
+      queued: false,
     }
   }
-  return { done: false, startIndex: lastRelevant, anchorFound: false }
+
+  let priorRelevantIndex = -1
+  let priorIdleIndex = -1
+  for (let index = 0; index < anchorIndex; index++) {
+    const message = messages[index]
+    if (message?.type === "idle") priorIdleIndex = index
+    if (isRelevant(message)) priorRelevantIndex = index
+  }
+  let unclosedPriorTurn = priorRelevantIndex > priorIdleIndex
+
+  let lastTurnAssistant: MessageLike | undefined
+  let hasForeignIdle = false
+
+  for (let index = anchorIndex + 1; index < messages.length; index++) {
+    const message = messages[index]
+    if (message?.type === "assistant" || message?.type === "compaction") {
+      const created = message.time?.created
+      if (
+        typeof created !== "number" ||
+        typeof anchorCreatedAt !== "number" ||
+        created >= anchorCreatedAt
+      ) {
+        lastTurnAssistant = message
+        unclosedPriorTurn = false
+      }
+      continue
+    }
+
+    if (message?.type === "idle") {
+      const idleCreated = message.time?.created
+      if (
+        typeof idleCreated === "number" &&
+        typeof anchorCreatedAt === "number" &&
+        idleCreated < anchorCreatedAt
+      ) {
+        unclosedPriorTurn = false
+        hasForeignIdle = true
+        continue
+      }
+
+      if (lastTurnAssistant) {
+        const assistantCompleted = lastTurnAssistant.time?.completed
+        if (
+          typeof idleCreated === "number" &&
+          typeof assistantCompleted === "number" &&
+          idleCreated < assistantCompleted
+        ) {
+          continue
+        }
+        return {
+          done: true,
+          startIndex: anchorIndex,
+          endIndex: index,
+          idle: message,
+          anchorFound,
+          anchorMessage,
+          anchorCreatedAt,
+          hasTurnAssistant: true,
+          queued: false,
+        }
+      }
+
+      if (unclosedPriorTurn) {
+        unclosedPriorTurn = false
+        hasForeignIdle = true
+        continue
+      }
+
+      const isFailureOrInterrupt =
+        message.outcome === "failed" ||
+        message.outcome === "interrupted" ||
+        Boolean(message.error)
+      if (isFailureOrInterrupt) {
+        return {
+          done: true,
+          startIndex: anchorIndex,
+          endIndex: index,
+          idle: message,
+          anchorFound,
+          anchorMessage,
+          anchorCreatedAt,
+          hasTurnAssistant: false,
+          queued: false,
+        }
+      }
+
+      hasForeignIdle = true
+    }
+  }
+
+  const queued = !lastTurnAssistant && (unclosedPriorTurn || hasForeignIdle)
+  return {
+    done: false,
+    startIndex: anchorIndex,
+    anchorFound,
+    anchorMessage,
+    anchorCreatedAt,
+    hasTurnAssistant: Boolean(lastTurnAssistant),
+    queued,
+  }
 }
 
 type EventWatcher = {
   next: () => Promise<SessionEventLike | undefined>
+  drainTerminal: () => boolean
+  isClosed: () => boolean
   close: () => Promise<void>
 }
 
@@ -226,14 +380,17 @@ function startEventWatcher(
 
   const controller = new AbortController()
   const onAbort = () => controller.abort(signal.reason)
-  if (signal.aborted) controller.abort(signal.reason)
-  else signal.addEventListener("abort", onAbort, { once: true })
+  if (signal.aborted) {
+    controller.abort(signal.reason)
+  } else {
+    signal.addEventListener("abort", onAbort, { once: true })
+    if (signal.aborted) onAbort()
+  }
 
   const queue: SessionEventLike[] = []
   let pending: ((event: SessionEventLike | undefined) => void) | undefined
   let closed = false
   let iterator: AsyncIterator<SessionEventLike> | undefined
-  let task: Promise<void> | undefined
 
   try {
     const stream = ctx.event.subscribe({
@@ -241,7 +398,7 @@ function startEventWatcher(
       signal: controller.signal,
     }) as unknown as AsyncIterable<SessionEventLike>
     iterator = stream[Symbol.asyncIterator]()
-    task = (async () => {
+    void (async () => {
       try {
         while (true) {
           const step = await iterator?.next()
@@ -280,16 +437,34 @@ function startEventWatcher(
         pending = resolve
       })
     },
+    drainTerminal() {
+      let sawTerminal = false
+      for (let i = queue.length - 1; i >= 0; i--) {
+        const event = queue[i]
+        const type = event?.type
+        if (
+          type === "session.idle" ||
+          type === "session.execution.failed" ||
+          type === "session.execution.interrupted" ||
+          (type === "session.status" && event?.data?.status?.type === "idle")
+        ) {
+          sawTerminal = true
+          queue.splice(i, 1)
+        }
+      }
+      return sawTerminal
+    },
+    isClosed() {
+      return closed
+    },
     async close() {
       controller.abort()
       signal.removeEventListener("abort", onAbort)
       try {
-        const returned = iterator?.return?.()
-        if (returned) await settleWithTimeout(Promise.resolve(returned), 100)
+        void Promise.resolve(iterator?.return?.()).catch(() => undefined)
       } catch {
         // Ignore iterator cleanup errors.
       }
-      if (task) await settleWithTimeout(task, 100)
     },
   }
 }
@@ -316,6 +491,7 @@ type RaceOutcome =
   | { kind: "event"; event: SessionEventLike | undefined }
   | { kind: "wait"; outcome: WaitOutcome }
   | { kind: "poll" }
+  | { kind: "settle" }
   | { kind: "permission" }
   | { kind: "deadline" }
   | { kind: "aborted" }
@@ -323,10 +499,12 @@ type RaceOutcome =
 /**
  * Waits for a specific turn. The anchor is the ID returned by
  * `session.prompt`; a turn is complete only when that user message appears and
- * an idle message follows it. This is what makes `delivery: "queue"` exact.
+ * an idle message for that turn follows it. This is what makes `delivery: "queue"` exact.
  *
  * Primary signals: `session.wait` and `session.idle` events. Polling is the
- * bounded fallback when both are unavailable or the event stream fails.
+ * bounded fallback when both are unavailable or the event stream fails, and
+ * a short bounded settle phase bridges the gap when a terminal signal arrives
+ * slightly before `session.context` persists the `idle` message.
  */
 export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promise<TurnResult> {
   const started = Date.now()
@@ -342,19 +520,35 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
   let pendingPermissions: PermissionLike[] | undefined
   let messages: MessageLike[] = options.initialMessages ?? []
   let startIndex = 0
-  let queued = false
+  let endIndex: number | undefined
+  let anchorMessage: MessageLike | undefined
+  let anchorCreatedAt: number | undefined
+  let terminalSignal: TerminalSignal | undefined
+  let queued = Boolean(options.anchorID)
   let consecutiveErrors = 0
   let lastPermissionCheck = 0
   let lastProgress = started
+  let lastContextAt = 0
   let errorEvent: string | undefined
+  let retry: RetryInfo | undefined
   let forcePoll = false
+  let settleRemaining = 0
+  let settleDelayMs = Math.min(pollInterval, INITIAL_SETTLE_DELAY_MS)
+  let waitErrors = 0
+  let rearmCount = 0
+  let pollMs = pollInterval
+  let finalizing = false
 
   const controller = new AbortController()
   let timedOut = false
   const onUserAbort = () => controller.abort(options.signal?.reason)
   if (options.signal) {
-    if (options.signal.aborted) controller.abort(options.signal.reason)
-    else options.signal.addEventListener("abort", onUserAbort, { once: true })
+    if (options.signal.aborted) {
+      controller.abort(options.signal.reason)
+    } else {
+      options.signal.addEventListener("abort", onUserAbort, { once: true })
+      if (options.signal.aborted) onUserAbort()
+    }
   }
   const deadlineTimer = setTimeout(() => {
     timedOut = true
@@ -367,31 +561,104 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
     // Cancel a pending session.wait or event subscription as soon as the
     // result is known; no request should outlive the wait.
     controller.abort()
+    const resolvedSignal: TerminalSignal | undefined =
+      extra.terminalSignal ??
+      terminalSignal ??
+      (state === "timeout" ? "timeout" : state === "aborted" ? "abort" : undefined)
     return {
       state,
       messages,
       startIndex,
+      endIndex,
       lastError,
       pendingPermissions,
       elapsedMs: Date.now() - started,
       fetchCount,
       promptMessageID: options.promptMessageID,
       queued,
+      anchorMessage,
+      anchorCreatedAt,
+      terminalSignal: resolvedSignal,
+      retry,
       ...extra,
     }
   }
 
-  if (options.signal?.aborted) return finish("aborted")
+  /**
+   * At the deadline, make one short best-effort read. A turn that persisted its
+   * idle message just before the timer fired should return idle, not timeout.
+   */
+  const finalizeTimeout = async (): Promise<TurnResult> => {
+    if (finalizing) return finish("timeout", { terminalSignal: "timeout" })
+    finalizing = true
+    const userSignal = options.signal
+    if (!userSignal?.aborted) {
+      const readSignal = userSignal ?? new AbortController().signal
+      try {
+        const pending = await listPermissions(
+          ctx,
+          options.sessionID,
+          readSignal,
+          Math.min(requestTimeout, FINAL_PERMISSION_TIMEOUT_MS),
+        )
+        if (pending.length) {
+          pendingPermissions = pending
+          return finish("permission", {
+            pendingPermissions: pending,
+            terminalSignal: "timeout",
+          })
+        }
+      } catch {
+        // Permission listing is best effort at the deadline.
+      }
+      try {
+        const lastMessages = await fetchContext(
+          ctx,
+          options.sessionID,
+          readSignal,
+          Math.min(requestTimeout, FINAL_READ_TIMEOUT_MS),
+        )
+        fetchCount++
+        messages = lastMessages
+        const evaluation = evaluateTurn(lastMessages, options)
+        startIndex = evaluation.startIndex
+        endIndex = evaluation.endIndex
+        anchorMessage = evaluation.anchorMessage
+        anchorCreatedAt = evaluation.anchorCreatedAt
+        queued = evaluation.queued
+        if (evaluation.done) {
+          queued = false
+          return finish("idle", {
+            idle: evaluation.idle,
+            endIndex: evaluation.endIndex,
+            lastError: evaluation.idle?.error?.message ?? lastError,
+            queued: false,
+          })
+        }
+      } catch {
+        // The turn may have completed, but the final read is best effort only.
+      }
+    }
+    return finish("timeout", { terminalSignal: "timeout" })
+  }
+
+  if (options.signal?.aborted) return finish("aborted", { terminalSignal: "abort" })
 
   if (options.initialMessages) {
     const evaluation = evaluateTurn(options.initialMessages, options)
     startIndex = evaluation.startIndex
+    endIndex = evaluation.endIndex
+    anchorMessage = evaluation.anchorMessage
+    anchorCreatedAt = evaluation.anchorCreatedAt
+    queued = evaluation.queued
     if (evaluation.done) {
       return finish("idle", {
         messages: options.initialMessages,
         startIndex: evaluation.startIndex,
+        endIndex: evaluation.endIndex,
         idle: evaluation.idle,
         lastError: evaluation.idle?.error?.message ?? lastError,
+        queued: false,
       })
     }
   }
@@ -408,26 +675,66 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
     lastPermissionCheck = Date.now()
   }
 
-  const watcher = startEventWatcher(ctx, options.sessionID, controller.signal)
+  let watcher = startEventWatcher(ctx, options.sessionID, controller.signal)
   let waitOutcome = startWait(ctx, options.sessionID, controller.signal)
   let eventPromise = watcher?.next()
   let eventRace: Promise<RaceOutcome> | undefined
   let waitRace: Promise<RaceOutcome> | undefined
-  let pollMs = pollInterval
+
+  const armPrimarySignals = (): void => {
+    if (!watcher || watcher.isClosed()) {
+      void watcher?.close()
+      watcher = startEventWatcher(ctx, options.sessionID, controller.signal)
+      eventPromise = watcher?.next()
+      eventRace = undefined
+    } else if (!eventPromise) {
+      eventPromise = watcher.next()
+      eventRace = undefined
+    }
+    if (!waitOutcome && waitErrors < MAX_WAIT_ERRORS) {
+      waitOutcome = startWait(ctx, options.sessionID, controller.signal)
+      waitRace = undefined
+    }
+  }
+
+  const rearmSignals = async (delayMs: number): Promise<boolean> => {
+    if (rearmCount >= MAX_REARMS || controller.signal.aborted) return false
+    const canRearm =
+      typeof ctx.session.wait === "function" || typeof ctx.event?.subscribe === "function"
+    if (!canRearm) return false
+    rearmCount++
+    if (delayMs > 0) {
+      const remaining = Math.max(1, started + timeoutMs - Date.now())
+      const waited = await sleep(Math.min(delayMs, remaining), controller.signal)
+      if (!waited) return false
+    }
+    settleRemaining = 0
+    settleDelayMs = Math.max(10, Math.min(pollInterval, INITIAL_SETTLE_DELAY_MS))
+    forcePoll = false
+    armPrimarySignals()
+    return true
+  }
 
   try {
     while (true) {
       if (controller.signal.aborted) {
-        return timedOut ? finish("timeout") : finish("aborted")
+        return timedOut
+          ? await finalizeTimeout()
+          : finish("aborted", { terminalSignal: "abort" })
       }
 
       const now = Date.now()
-      if (now >= started + timeoutMs) return finish("timeout")
+      if (now >= started + timeoutMs) return await finalizeTimeout()
 
       if (now - lastProgress >= progressInterval) {
         lastProgress = now
         try {
-          options.onProgress?.({ elapsedMs: now - started, fetchCount, lastEvent: errorEvent })
+          options.onProgress?.({
+            elapsedMs: now - started,
+            fetchCount,
+            lastEvent: retry ? "retry" : errorEvent,
+            ...(retry ? { state: "retrying" as const, retry } : {}),
+          })
         } catch {
           // Progress reporting must never break the wait.
         }
@@ -448,14 +755,20 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
         }
         racers.push(waitRace)
       }
-      const hasPrimary = Boolean(eventRace || waitRace) && !forcePoll
+      const hasPrimary = Boolean(eventRace || waitRace) && !forcePoll && settleRemaining === 0
       const remaining = started + timeoutMs - now
       const sleepController = new AbortController()
       const onSleepAbort = () => sleepController.abort()
       if (controller.signal.aborted) sleepController.abort()
       else controller.signal.addEventListener("abort", onSleepAbort, { once: true })
 
-      if (hasPrimary) {
+      if (settleRemaining > 0) {
+        racers.push(
+          sleep(Math.min(settleDelayMs, remaining), sleepController.signal).then((elapsed) => ({
+            kind: elapsed ? ("settle" as const) : ("aborted" as const),
+          })),
+        )
+      } else if (hasPrimary) {
         // With session.wait or an event stream active, do not poll the
         // transcript. Only wake for the deadline or a permission check.
         racers.push(
@@ -490,11 +803,20 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
       if (outcome.kind === "aborted") continue
       if (outcome.kind === "deadline") continue
 
+      let receivedTerminalSignal = false
+
       if (outcome.kind === "wait") {
         waitOutcome = undefined
         waitRace = undefined
-        if (outcome.outcome.kind === "wait-error" && !controller.signal.aborted) {
-          lastError = formatError(outcome.outcome.error)
+        if (outcome.outcome.kind === "wait-error") {
+          waitErrors++
+          if (!controller.signal.aborted) {
+            lastError = formatError(outcome.outcome.error)
+          }
+        } else {
+          terminalSignal = "wait"
+          receivedTerminalSignal = true
+          watcher?.drainTerminal()
         }
       } else if (outcome.kind === "event") {
         const event = outcome.event
@@ -521,18 +843,66 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
             }
             continue
           }
-          if (event.type === "session.execution.failed") {
+          if (event.type === "session.status") {
+            const status: SessionStatusLike | undefined = event.data?.status
+            if (status?.type === "retry") {
+              retry = {
+                attempt: status.attempt,
+                message: status.message,
+                next: status.next,
+              }
+              if (!controller.signal.aborted) {
+                try {
+                  options.onProgress?.({
+                    elapsedMs: Date.now() - started,
+                    fetchCount,
+                    lastEvent: "retry",
+                    state: "retrying",
+                    retry,
+                  })
+                } catch {
+                  // Progress reporting must never break the wait.
+                }
+              }
+              continue
+            }
+            if (status?.type === "busy") {
+              // The turn started; the anchor may still be queued in context.
+              continue
+            }
+            if (status?.type === "idle") {
+              errorEvent = undefined
+              terminalSignal = "event"
+              receivedTerminalSignal = true
+            }
+          } else if (event.type === "session.execution.failed") {
             errorEvent = event.data?.error?.message ?? "session.execution.failed"
             lastError = errorEvent
+            terminalSignal = "event"
+            receivedTerminalSignal = true
           } else if (event.type === "session.execution.interrupted") {
             errorEvent = event.data?.reason
               ? `interrupted: ${event.data.reason}`
               : "session.execution.interrupted"
             lastError = errorEvent
+            terminalSignal = "event"
+            receivedTerminalSignal = true
           } else if (event.type === "session.idle") {
             errorEvent = undefined
+            terminalSignal = "event"
+            receivedTerminalSignal = true
           }
         }
+      } else if (outcome.kind === "poll") {
+        terminalSignal = terminalSignal ?? "poll"
+      }
+
+      if (receivedTerminalSignal && settleRemaining === 0) {
+        settleRemaining = errorEvent ? 2 : MAX_SETTLE_ATTEMPTS
+        settleDelayMs = Math.max(10, Math.min(pollInterval, INITIAL_SETTLE_DELAY_MS))
+      } else if (outcome.kind === "settle" && settleRemaining > 0) {
+        settleRemaining--
+        settleDelayMs = Math.min(settleDelayMs * 2, maxPoll)
       }
 
       const shouldCheckPermission =
@@ -557,6 +927,46 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
       }
       if (outcome.kind === "permission") continue
 
+      // If both session.idle and session.wait resolved right after each other
+      // while we are already settling from the first terminal read, wait one
+      // short settle interval before reading context a second time.
+      if (
+        outcome.kind === "wait" &&
+        receivedTerminalSignal &&
+        fetchCount > (options.initialFetchCount ?? 0) &&
+        settleRemaining > 0
+      ) {
+        const waited = await sleep(
+          Math.min(settleDelayMs, Math.max(1, started + timeoutMs - Date.now())),
+          controller.signal,
+        )
+        if (!waited) continue
+      }
+
+      // Cheap fallback: session.get is much smaller than a full transcript.
+      // While the session is still running and the anchor is visible, skip the
+      // context read until the session reports idle or a safety interval passes.
+      if (outcome.kind === "poll" && !receivedTerminalSignal && settleRemaining === 0) {
+        try {
+          const session = await fetchSession(
+            ctx,
+            options.sessionID,
+            controller.signal,
+            requestTimeout,
+          )
+          if (session) {
+            const running = isRunning(session, [])
+            const sinceContext = Date.now() - lastContextAt
+            if (anchorMessage !== undefined && running && sinceContext < FALLBACK_CONTEXT_INTERVAL_MS) {
+              pollMs = Math.min(pollMs * 2, maxPoll)
+              continue
+            }
+          }
+        } catch (error) {
+          if (!controller.signal.aborted) lastError = formatError(error)
+        }
+      }
+
       fetchCount++
       try {
         messages = await fetchContext(ctx, options.sessionID, controller.signal, requestTimeout)
@@ -570,23 +980,64 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
         continue
       }
 
+      lastContextAt = Date.now()
       consecutiveErrors = 0
       forcePoll = false
       const evaluation = evaluateTurn(messages, options)
       startIndex = evaluation.startIndex
+      endIndex = evaluation.endIndex
+      anchorMessage = evaluation.anchorMessage
+      anchorCreatedAt = evaluation.anchorCreatedAt
+      queued = evaluation.queued
+
       if (evaluation.done) {
         queued = false
         return finish("idle", {
           idle: evaluation.idle,
+          endIndex: evaluation.endIndex,
           lastError: evaluation.idle?.error?.message ?? lastError,
+          queued: false,
         })
       }
-      if (evaluation.anchorFound) {
-        queued = false
-      } else if (options.anchorID) {
-        queued = true
+
+      if (errorEvent && settleRemaining === 0) {
+        // A failure for a queued turn that has not started yet is not the
+        // anchored turn's failure. Give the primary signals one more chance.
+        if (evaluation.queued && rearmCount < MAX_REARMS) {
+          const ok = await rearmSignals(Math.min(pollInterval, 250))
+          if (ok) {
+            pollMs = pollInterval
+            continue
+          }
+        }
+        return finish("error")
       }
-      if (errorEvent) return finish("error")
+
+      if (settleRemaining === 0 && !receivedTerminalSignal) {
+        const lostPrimary = !waitOutcome && !eventPromise
+        const shouldRearm = lostPrimary && rearmCount === 0
+        if (shouldRearm && rearmCount < MAX_REARMS) {
+          const ok = await rearmSignals(Math.min(pollInterval, 250))
+          if (ok) {
+            pollMs = pollInterval
+            continue
+          }
+        }
+        if (!waitOutcome && !eventPromise) forcePoll = true
+      } else if (rearmCount < MAX_REARMS) {
+        // A terminal signal that did not complete the anchored turn (for
+        // example an idle from the previous turn) must not leave the wait
+        // without its primary signal. Re-arm session.wait/events immediately,
+        // with a small backoff to avoid a tight loop if they resolve instantly.
+        const ok = await rearmSignals(Math.min(pollInterval, 250))
+        if (ok) {
+          pollMs = pollInterval
+          continue
+        }
+        if (!waitOutcome && !eventPromise) forcePoll = true
+      } else if (!waitOutcome && !eventPromise) {
+        forcePoll = true
+      }
       pollMs = Math.min(pollMs * 2, maxPoll)
     }
   } finally {

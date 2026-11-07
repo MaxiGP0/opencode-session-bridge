@@ -32,13 +32,22 @@ const idle = (id: string, created = 3): MessageLike => ({
 type FakeOptions = {
   context: (call: number) => MessageLike[] | Promise<MessageLike[]>
   wait?: (call: number) => Promise<void>
+  get?: (call: number) =>
+    | { time?: { busy?: number; idle?: number; updated?: number }; outcome?: string }
+    | Promise<{ time?: { busy?: number; idle?: number; updated?: number }; outcome?: string }>
   permissions?: (call: number) => PermissionLike[]
   events?: (signal?: AbortSignal) => AsyncIterable<SessionEventLike>
   sessionID?: string
 }
 
 function makeContext(options: FakeOptions) {
-  const stats = { contextCalls: 0, waitCalls: 0, permissionCalls: 0 }
+  const stats = {
+    contextCalls: 0,
+    waitCalls: 0,
+    permissionCalls: 0,
+    getCalls: 0,
+    subscribeCalls: 0,
+  }
   const sessionID = options.sessionID ?? "ses_1"
   const ctx = {
     session: {
@@ -46,6 +55,12 @@ function makeContext(options: FakeOptions) {
         stats.contextCalls++
         return options.context(stats.contextCalls)
       },
+      get: options.get
+        ? async () => {
+            stats.getCalls++
+            return options.get?.(stats.getCalls)
+          }
+        : undefined,
       wait: options.wait
         ? async () => {
             stats.waitCalls++
@@ -61,8 +76,10 @@ function makeContext(options: FakeOptions) {
     },
     event: options.events
       ? {
-          subscribe: (subscribeOptions?: { signal?: AbortSignal }) =>
-            options.events?.(subscribeOptions?.signal),
+          subscribe: (subscribeOptions?: { signal?: AbortSignal }) => {
+            stats.subscribeCalls++
+            return options.events?.(subscribeOptions?.signal)
+          },
         }
       : undefined,
   }
@@ -81,6 +98,17 @@ function eventStream(events: SessionEventLike[], delayMs = 5) {
         if (signal?.aborted) resolve()
         else signal?.addEventListener("abort", () => resolve(), { once: true })
       })
+    },
+  })
+}
+
+function finiteEventStream(events: SessionEventLike[]) {
+  return (signal?: AbortSignal): AsyncIterable<SessionEventLike> => ({
+    async *[Symbol.asyncIterator]() {
+      for (const event of events) {
+        if (signal?.aborted) return
+        yield event
+      }
     },
   })
 }
@@ -422,5 +450,294 @@ describe("waitForTurn", () => {
     expect(result.state).toBe("timeout")
     expect(updates.length).toBeGreaterThan(0)
     expect(JSON.stringify(updates)).not.toContain("secret prompt")
+  })
+
+  it("P0-1: settles after session.idle/session.wait when the idle message appears on the third context read", async () => {
+    const running = [user("prompt", "hello", 1), assistant("answer", "world", 2)]
+    const completed = [...running, idle("done", 3)]
+    const snapshots = [running, running, completed]
+
+    const { ctx, stats } = makeContext({
+      wait: async () => {
+        await delay(5)
+      },
+      events: eventStream([{ type: "session.idle", data: { sessionID: "ses_1" } }], 5),
+      context: (call) => snapshots[Math.min(call - 1, snapshots.length - 1)],
+    })
+
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      promptMessageID: "prompt",
+      timeoutMs: 300,
+      requireAnchor: true,
+      pollIntervalMs: 50,
+      permissionPollMs: 1_000,
+    })
+
+    expect(result.state).toBe("idle")
+    expect(result.idle?.id).toBe("done")
+    expect(stats.contextCalls).toBeLessThanOrEqual(4)
+  })
+
+  it("P0-2: ignores a previous turn's idle that appears after a queued or steered user message", async () => {
+    const withForeignIdle = [
+      user("old-user", "old prompt", 1),
+      assistant("old-assistant", "old answer", 2),
+      user("queued-user", "queued prompt", 10),
+      idle("old-idle", 11),
+    ]
+    const withQueuedTurnDone = [
+      ...withForeignIdle,
+      assistant("queued-assistant", "queued answer", 12),
+      idle("queued-idle", 13),
+    ]
+    const snapshots = [withForeignIdle, withQueuedTurnDone]
+
+    const { ctx } = makeContext({
+      context: (call) => snapshots[Math.min(call - 1, snapshots.length - 1)],
+    })
+
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "queued-user",
+      promptText: "queued prompt",
+      admittedAt: 10,
+      timeoutMs: 300,
+      requireAnchor: true,
+      pollIntervalMs: 20,
+      permissionPollMs: 1_000,
+    })
+
+    expect(result.state).toBe("idle")
+    expect(result.idle?.id).toBe("queued-idle")
+    expect(summarizeTurn(result.messages, result.startIndex).text).toBe("queued answer")
+  })
+
+  it("P0-2: ignores an interrupted prior turn idle in steer delivery until the steered turn finishes", async () => {
+    const withInterruptedOldIdle = [
+      user("old-user", "old prompt", 1),
+      assistant("old-assistant", "old answer", 2),
+      user("steered-user", "steered prompt", 10),
+      { id: "old-idle", type: "idle", outcome: "interrupted", time: { created: 11 } },
+    ]
+    const withSteeredTurnDone = [
+      ...withInterruptedOldIdle,
+      assistant("steered-assistant", "steered answer", 12),
+      idle("steered-idle", 13),
+    ]
+    const snapshots = [withInterruptedOldIdle, withSteeredTurnDone]
+
+    const { ctx } = makeContext({
+      context: (call) => snapshots[Math.min(call - 1, snapshots.length - 1)],
+    })
+
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "steered-user",
+      promptText: "steered prompt",
+      admittedAt: 10,
+      timeoutMs: 300,
+      requireAnchor: true,
+      pollIntervalMs: 20,
+      permissionPollMs: 1_000,
+    })
+
+    expect(result.state).toBe("idle")
+    expect(result.idle?.id).toBe("steered-idle")
+    expect(summarizeTurn(result.messages, result.startIndex).text).toBe("steered answer")
+  })
+
+  it("P0-2: completes when a turn fails without an assistant message", async () => {
+    const failedTurn = [
+      user("u1", "prompt", 1),
+      {
+        id: "i_failed",
+        type: "idle",
+        outcome: "failed",
+        error: { message: "provider rejected request" },
+        time: { created: 2 },
+      },
+    ]
+    const { ctx } = makeContext({
+      context: () => failedTurn,
+    })
+
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "u1",
+      timeoutMs: 300,
+      requireAnchor: true,
+      pollIntervalMs: 20,
+      permissionPollMs: 1_000,
+    })
+
+    expect(result.state).toBe("idle")
+    expect(result.idle?.outcome).toBe("failed")
+    expect(result.lastError).toBe("provider rejected request")
+  })
+
+  it("P0-5: re-arms session.wait after a foreign idle without falling back to full polling", async () => {
+    const old = [user("old", "old prompt", 1), assistant("old-answer", "old answer", 2), idle("old-idle", 3)]
+    const queued = [
+      ...old,
+      user("queued", "queued prompt", 10),
+      assistant("queued-answer", "queued answer", 11),
+    ]
+    const done = [...queued, idle("queued-idle", 12)]
+    const snapshots = [old, queued, done]
+    const { ctx, stats } = makeContext({
+      wait: async () => {
+        await delay(2)
+      },
+      context: (call) => snapshots[Math.min(call - 1, snapshots.length - 1)],
+    })
+
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "queued",
+      promptText: "queued prompt",
+      admittedAt: 10,
+      timeoutMs: 500,
+      requireAnchor: true,
+      pollIntervalMs: 20,
+      permissionPollMs: 1_000,
+    })
+
+    expect(result.state).toBe("idle")
+    expect(result.idle?.id).toBe("queued-idle")
+    expect(summarizeTurn(result.messages, result.startIndex).text).toBe("queued answer")
+    expect(stats.waitCalls).toBeGreaterThanOrEqual(2)
+    expect(stats.contextCalls).toBeLessThanOrEqual(4)
+  })
+
+  it("P0-5: re-subscribes to events after the stream closes before the anchored turn ends", async () => {
+    const old = [user("old", "old prompt", 1), assistant("old-answer", "old answer", 2), idle("old-idle", 3)]
+    const queued = [
+      ...old,
+      user("queued", "queued prompt", 10),
+      assistant("queued-answer", "queued answer", 11),
+    ]
+    const done = [...queued, idle("queued-idle", 12)]
+    const snapshots = [old, queued, done]
+    const { ctx, stats } = makeContext({
+      context: (call) => snapshots[Math.min(call - 1, snapshots.length - 1)],
+      events: finiteEventStream([{ type: "session.idle", data: { sessionID: "ses_1" } }]),
+    })
+
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "queued",
+      promptText: "queued prompt",
+      admittedAt: 10,
+      timeoutMs: 500,
+      requireAnchor: true,
+      pollIntervalMs: 20,
+      permissionPollMs: 1_000,
+    })
+
+    expect(result.state).toBe("idle")
+    expect(result.idle?.id).toBe("queued-idle")
+    expect(stats.subscribeCalls).toBeGreaterThanOrEqual(2)
+    expect(stats.contextCalls).toBeLessThanOrEqual(4)
+  })
+
+  it("P1-8: fallback uses session.get and reads the transcript at most three times", async () => {
+    const running = [user("prompt", "hello", 1), assistant("answer", "world", 2)]
+    const completed = [...running, idle("done", 3)]
+    let getCount = 0
+    const { ctx, stats } = makeContext({
+      get: () => {
+        getCount++
+        return getCount < 4 ? { time: { busy: 1 } } : { time: { idle: 2 } }
+      },
+      context: () => (getCount < 4 ? running : completed),
+    })
+
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      timeoutMs: 500,
+      requireAnchor: true,
+      pollIntervalMs: 20,
+      maxPollIntervalMs: 100,
+      permissionPollMs: 1_000,
+    })
+
+    expect(result.state).toBe("idle")
+    expect(result.idle?.id).toBe("done")
+    expect(stats.contextCalls).toBeLessThanOrEqual(3)
+    expect(stats.getCalls).toBeGreaterThan(1)
+  })
+
+  it("P1-8: timeout performs a final read and returns idle when the turn completed", async () => {
+    const started = Date.now()
+    const running = [user("prompt", "hello", 1), assistant("answer", "world", 2)]
+    const completed = [...running, idle("done", 3)]
+    const { ctx, stats } = makeContext({
+      context: () => (Date.now() - started < 45 ? running : completed),
+    })
+
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      timeoutMs: 60,
+      requireAnchor: true,
+      pollIntervalMs: 20,
+      permissionPollMs: 1_000,
+    })
+
+    expect(result.state).toBe("idle")
+    expect(result.idle?.id).toBe("done")
+    expect(stats.contextCalls).toBeLessThanOrEqual(3)
+  })
+
+  it("P1-8: a real timeout still returns timeout with partial messages", async () => {
+    const { ctx } = makeContext({
+      context: () => [user("prompt", "still running")],
+    })
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      timeoutMs: 40,
+      requireAnchor: true,
+      pollIntervalMs: 10,
+      permissionPollMs: 1_000,
+    })
+    expect(result.state).toBe("timeout")
+    expect(result.messages[0]?.id).toBe("prompt")
+  })
+
+  it("P1-1: session.status retry stays visible and does not fail the wait", async () => {
+    const { ctx } = makeContext({
+      context: () => [user("prompt", "hello", 1), assistant("answer", "world", 2), idle("done", 3)],
+      events: eventStream(
+        [
+          {
+            type: "session.status",
+            data: {
+              sessionID: "ses_1",
+              status: { type: "retry", attempt: 2, message: "rate limited", next: 5_000 },
+            },
+          },
+          { type: "session.idle", data: { sessionID: "ses_1" } },
+        ],
+        5,
+      ),
+    })
+
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      timeoutMs: 500,
+      requireAnchor: true,
+      pollIntervalMs: 20,
+      permissionPollMs: 1_000,
+      progressIntervalMs: 1,
+    })
+
+    expect(result.state).toBe("idle")
+    expect(result.retry).toEqual({ attempt: 2, message: "rate limited", next: 5_000 })
+    expect(result.lastError).toBeUndefined()
   })
 })
