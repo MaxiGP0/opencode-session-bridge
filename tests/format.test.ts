@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
+  assistantTextInfo,
   collectRecentTools,
   compact,
   fitBudget,
@@ -50,6 +51,24 @@ describe("isRunning", () => {
     expect(isRunning({ time: {} }, [{ type: "user" }, { type: "assistant" }])).toBe(true)
     expect(isRunning({ time: {} }, [{ type: "user" }, idle])).toBe(false)
   })
+
+  it("combines incomplete session timestamps with transcript timestamps", () => {
+    expect(isRunning({ time: { idle: 10 } }, [{ type: "user", time: { created: 20 } }])).toBe(
+      true,
+    )
+    expect(isRunning({ time: { idle: 10 } }, [{ type: "idle", time: { created: 20 } }])).toBe(
+      false,
+    )
+    expect(isRunning({ time: { busy: 10 } }, [{ type: "idle", time: { created: 20 } }])).toBe(
+      false,
+    )
+    expect(isRunning({ time: { busy: 10 } }, [{ type: "user", time: { created: 20 } }])).toBe(
+      true,
+    )
+    expect(
+      isRunning({ time: { busy: 10 } }, [{ type: "model-switched", time: { created: 20 } }]),
+    ).toBe(false)
+  })
 })
 
 describe("robust helpers", () => {
@@ -85,6 +104,20 @@ describe("robust helpers", () => {
     expect(clipped).toBe("😀…")
     expect(Array.from(titleFromPrompt("😀".repeat(100)))).toHaveLength(60)
     expect(Array.from(fitBudget("😀".repeat(50), 10))).toHaveLength(10)
+  })
+
+  it("P1-10: extracts bounded text and compacts huge strings without full allocation", () => {
+    const huge = "a".repeat(1_000_000)
+    const info = assistantTextInfo(
+      { type: "assistant", content: [{ type: "text", text: huge }] },
+      100,
+    )
+    expect(info.text).toHaveLength(100)
+    expect(info.length).toBe(1_000_000)
+    expect(info.truncated).toBe(true)
+    const compacted = compact("x".repeat(1_000_000), 100)
+    expect(compacted.length).toBeLessThanOrEqual(100)
+    expect(compacted.endsWith("…")).toBe(true)
   })
 })
 
@@ -177,6 +210,48 @@ describe("output budget", () => {
     expect(recent).toHaveLength(8)
     expect(recent[0]?.id).toBe("tool_92")
     expect(recent[7]?.id).toBe("tool_99")
+  })
+
+  it("P0-4: preserves critical metadata (lastMessageID, promptMessageID, permissions, error) under tight budgets", () => {
+    const manyTools = Array.from({ length: 40 }, (_, index) => tool(index))
+    const summary = summarizeTurn(
+      [
+        { id: "u1", type: "user", text: "run", time: { created: 1 } },
+        {
+          id: "a1",
+          type: "assistant",
+          content: [{ type: "text", text: "long ".repeat(1_000) }, ...manyTools],
+          error: { message: "provider exploded" },
+          time: { created: 2 },
+        },
+        { id: "msg_last_99", type: "idle", outcome: "failed", time: { created: 3 } },
+      ],
+      0,
+    )
+
+    for (const budget of [1_000, 2_000]) {
+      const report = formatSummary("Session: ses_1\nTitle: Budget test", summary, {
+        lang: "en",
+        maxOutputChars: budget,
+        maxTools: 40,
+        promptMessageID: "msg_prompt_42",
+        pendingPermissions: [
+          {
+            id: "per_crit_1",
+            sessionID: "ses_1",
+            action: "shell",
+            resources: ["npm test"],
+          },
+        ],
+      })
+      expect(report.length).toBeLessThanOrEqual(budget)
+      expect(report).toContain("Session: ses_1")
+      expect(report).toContain("State:")
+      expect(report).toContain("msg_last_99")
+      expect(report).toContain("msg_prompt_42")
+      expect(report).toContain("per_crit_1")
+      expect(report).toContain("provider exploded")
+    }
   })
 })
 
@@ -282,5 +357,57 @@ describe("renderTranscript", () => {
       maxToolLine: 500,
     })
     expect(content.length).toBeLessThanOrEqual(500)
+  })
+
+  it("P0-8: respects limit when afterMessageID is provided", () => {
+    const hundred = Array.from({ length: 100 }, (_, index) => ({
+      id: `m${index + 1}`,
+      type: "user",
+      text: `msg ${index + 1}`,
+      time: { created: index + 1 },
+    }))
+    const content = renderTranscript(hundred, {
+      lang: "en",
+      limit: 5,
+      afterMessageID: "m10",
+      includeTools: true,
+      includeToolOutput: false,
+      includeReasoning: false,
+      maxOutputChars: 20_000,
+      maxTextChars: 4_000,
+      maxToolLine: 500,
+    })
+    expect((content.match(/User:/g) ?? []).length).toBe(5)
+    expect(content).toContain("msg 11")
+    expect(content).toContain("msg 15")
+    expect(content).not.toContain("msg 16")
+  })
+
+  it("P1-10: bounds tools per assistant message and stays within the budget", () => {
+    const many = Array.from({ length: 10_000 }, (_, index) => tool(index))
+    const content = renderTranscript(
+      [
+        {
+          id: "a_many",
+          type: "assistant",
+          content: many,
+          time: { created: 1 },
+        },
+      ],
+      {
+        lang: "en",
+        limit: 30,
+        includeTools: true,
+        includeToolOutput: false,
+        includeReasoning: false,
+        maxOutputChars: 20_000,
+        maxTextChars: 4_000,
+        maxToolLine: 500,
+        maxToolsPerMessage: 40,
+      },
+    )
+    expect(content.length).toBeLessThanOrEqual(20_000)
+    expect(content).toContain("actions omitted")
+    expect((content.match(/  · /g) ?? []).length).toBeLessThanOrEqual(40)
   })
 })

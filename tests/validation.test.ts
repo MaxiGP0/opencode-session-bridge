@@ -6,6 +6,7 @@ import {
   parseReadInput,
   parseReplyInput,
   parseStatusInput,
+  parseUpdateInput,
   ValidationError,
 } from "../src/validation.ts"
 
@@ -72,5 +73,49 @@ describe("input validation", () => {
         DEFAULT_OPTIONS,
       ),
     ).toThrow(ValidationError)
+  })
+
+  it("P1-9: enforces prompt, title, search, rule, and metadata limits", () => {
+    expect(() =>
+      parseOpenInput(
+        { prompt: "x".repeat(DEFAULT_OPTIONS.maxPromptChars + 1) },
+        "en",
+        DEFAULT_OPTIONS,
+      ),
+    ).toThrow(/prompt/i)
+    expect(() =>
+      parseOpenInput(
+        { prompt: "hi", title: "x".repeat(DEFAULT_OPTIONS.maxTitleChars + 1) },
+        "en",
+        DEFAULT_OPTIONS,
+      ),
+    ).toThrow(/título|title/i)
+    expect(() =>
+      parseListInput(
+        { search: "x".repeat(DEFAULT_OPTIONS.maxSearchChars + 1) },
+        "en",
+        DEFAULT_OPTIONS,
+      ),
+    ).toThrow(/search/i)
+    const rules = Array.from(
+      { length: DEFAULT_OPTIONS.maxPermissionRules + 1 },
+      () => ({ action: "shell", resource: "*", effect: "ask" as const }),
+    )
+    expect(() =>
+      parseOpenInput({ prompt: "hi", permissions: rules }, "en", DEFAULT_OPTIONS),
+    ).toThrow(/reglas|rules/i)
+    expect(() =>
+      parseUpdateInput(
+        {
+          sessionID: "ses_1",
+          metadata: { big: "x".repeat(DEFAULT_OPTIONS.maxMetadataBytes) },
+        },
+        "en",
+        DEFAULT_OPTIONS,
+      ),
+    ).toThrow(/metadata/i)
+    expect(
+      parseOpenInput({ prompt: "ok" }, "en", DEFAULT_OPTIONS).prompt,
+    ).toBe("ok")
   })
 })

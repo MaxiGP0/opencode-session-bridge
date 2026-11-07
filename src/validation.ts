@@ -42,6 +42,18 @@ function optionalString(value: unknown, key: StringKey, lang: Lang): string | un
   return requireString(value, key, lang)
 }
 
+function optionalLimitedString(
+  value: unknown,
+  key: StringKey,
+  limitKey: StringKey,
+  max: number,
+  lang: Lang,
+): string | undefined {
+  const text = optionalString(value, key, lang)
+  if (text === undefined) return undefined
+  return assertMaxLength(text, 1, max, limitKey, lang)
+}
+
 function optionalModel(value: unknown, lang: Lang): string | undefined {
   const model = optionalString(value, "invalidModel", lang)
   if (model && !parseModel(model)) throw new ValidationError(t(lang, "invalidModel"))
@@ -62,21 +74,35 @@ function integerOption(
   max: number,
   fallback: number,
   zeroMeansDefault: boolean,
+  vars?: Record<string, string | number>,
 ): number {
   if (value === undefined || value === null) return fallback
   if (typeof value !== "number" || !Number.isInteger(value)) {
-    throw new ValidationError(t(lang, key))
+    throw new ValidationError(t(lang, key, vars))
   }
   if (value === 0 && zeroMeansDefault) return fallback
-  if (value < min || value > max) throw new ValidationError(t(lang, key))
+  if (value < min || value > max) throw new ValidationError(t(lang, key, vars))
   return value
 }
 
-function requirePrompt(value: unknown, lang: Lang): string {
+function assertMaxLength(
+  value: string,
+  min: number,
+  max: number,
+  key: StringKey,
+  lang: Lang,
+): string {
+  if (value.length < min || value.length > max) {
+    throw new ValidationError(t(lang, key, { min, max }))
+  }
+  return value
+}
+
+function requirePrompt(value: unknown, lang: Lang, maxChars: number): string {
   if (typeof value !== "string" || !value.trim()) {
     throw new ValidationError(t(lang, "promptEmpty"))
   }
-  return value
+  return assertMaxLength(value, 1, maxChars, "promptTooLong", lang)
 }
 
 function validateDecision(value: unknown, lang: Lang): "once" | "always" | "reject" {
@@ -104,9 +130,13 @@ export function validatePermissionRules(
   value: unknown,
   lang: Lang,
   allowAllowRules: boolean,
+  maxRules = 100,
 ): PermissionRuleInput[] | undefined {
   if (value === undefined || value === null) return undefined
   if (!Array.isArray(value)) throw new ValidationError(t(lang, "invalidPermissionRule"))
+  if (value.length > maxRules) {
+    throw new ValidationError(t(lang, "tooManyPermissionRules", { max: maxRules }))
+  }
 
   return value.map((item) => {
     if (!isRecord(item)) throw new ValidationError(t(lang, "invalidPermissionRule"))
@@ -122,9 +152,23 @@ export function validatePermissionRules(
   })
 }
 
-function validateMetadata(value: unknown, lang: Lang): Record<string, unknown> | undefined {
+function validateMetadata(
+  value: unknown,
+  lang: Lang,
+  maxBytes: number,
+): Record<string, unknown> | undefined {
   if (value === undefined || value === null) return undefined
   if (!isRecord(value)) throw new ValidationError(t(lang, "invalidMetadata"))
+  try {
+    const json = JSON.stringify(value)
+    if (json === undefined) throw new ValidationError(t(lang, "invalidMetadata"))
+    if (Buffer.byteLength(json, "utf8") > maxBytes) {
+      throw new ValidationError(t(lang, "metadataTooLarge", { max: maxBytes }))
+    }
+  } catch (error) {
+    if (error instanceof ValidationError) throw error
+    throw new ValidationError(t(lang, "invalidMetadata"))
+  }
   return value
 }
 
@@ -134,13 +178,15 @@ function maxOutput(value: unknown, lang: Lang, options: BridgeOptions): number {
     "invalidMaxOutput",
     lang,
     1_000,
-    200_000,
+    options.maxOutputChars,
     options.maxOutputChars,
     true,
+    { min: 1_000, max: options.maxOutputChars },
   )
 }
 
 export type OpenInput = {
+  sessionID?: string
   prompt: string
   title?: string
   agent?: string
@@ -156,8 +202,15 @@ export type OpenInput = {
 export function parseOpenInput(input: unknown, lang: Lang, options: BridgeOptions): OpenInput {
   const data = record(input, lang)
   return {
-    prompt: requirePrompt(data.prompt, lang),
-    title: optionalString(data.title, "invalidTitle", lang),
+    sessionID: optionalString(data.sessionID, "invalidSessionID", lang),
+    prompt: requirePrompt(data.prompt, lang, options.maxPromptChars),
+    title: optionalLimitedString(
+      data.title,
+      "invalidTitle",
+      "titleTooLong",
+      options.maxTitleChars,
+      lang,
+    ),
     agent: optionalString(data.agent, "invalidAgent", lang),
     model: optionalModel(data.model, lang),
     wait: optionalBoolean(data.wait, "invalidInput", lang, true),
@@ -170,7 +223,12 @@ export function parseOpenInput(input: unknown, lang: Lang, options: BridgeOption
       options.defaultTimeoutMs,
       false,
     ),
-    permissions: validatePermissionRules(data.permissions, lang, options.allowPermissionRules),
+    permissions: validatePermissionRules(
+      data.permissions,
+      lang,
+      options.allowPermissionRules,
+      options.maxPermissionRules,
+    ),
     delivery:
       data.delivery === undefined || data.delivery === null
         ? "steer"
@@ -196,7 +254,7 @@ export function parseSendInput(input: unknown, lang: Lang, options: BridgeOption
   const data = record(input, lang)
   return {
     sessionID: requireString(data.sessionID, "invalidSessionID", lang),
-    prompt: requirePrompt(data.prompt, lang),
+    prompt: requirePrompt(data.prompt, lang, options.maxPromptChars),
     agent: optionalString(data.agent, "invalidAgent", lang),
     model: optionalModel(data.model, lang),
     delivery:
@@ -220,6 +278,7 @@ export function parseSendInput(input: unknown, lang: Lang, options: BridgeOption
 
 export type WaitInput = {
   sessionID: string
+  messageID?: string
   timeoutMs: number
   maxOutputChars: number
 }
@@ -228,6 +287,7 @@ export function parseWaitInput(input: unknown, lang: Lang, options: BridgeOption
   const data = record(input, lang)
   return {
     sessionID: requireString(data.sessionID, "invalidSessionID", lang),
+    messageID: optionalString(data.messageID, "invalidMessageID", lang),
     timeoutMs: integerOption(
       data.timeoutMs,
       "invalidTimeout",
@@ -246,6 +306,7 @@ export type StatusInput = {
   recent: number
   verbose: boolean
   includeText: boolean
+  includeTools: boolean
   maxText: number
   maxOutputChars: number
 }
@@ -257,14 +318,16 @@ export function parseStatusInput(input: unknown, lang: Lang, options: BridgeOpti
     recent: integerOption(data.recent, "invalidRecent", lang, 1, 100, 8, true),
     verbose: optionalBoolean(data.verbose, "invalidInput", lang, false),
     includeText: optionalBoolean(data.includeText, "invalidInput", lang, true),
+    includeTools: optionalBoolean(data.includeTools, "invalidInput", lang, true),
     maxText: integerOption(
       data.maxText,
       "invalidMaxText",
       lang,
       100,
-      50_000,
+      options.maxTextChars,
       options.maxTextChars,
       true,
+      { min: 100, max: options.maxTextChars },
     ),
     maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
   }
@@ -326,7 +389,13 @@ export function parseReplyInput(input: unknown, lang: Lang, options: BridgeOptio
     sessionID: requireString(data.sessionID, "invalidSessionID", lang),
     requestID: requireString(data.requestID, "invalidRequestID", lang),
     decision: validateDecision(data.decision, lang),
-    message: optionalString(data.message, "invalidMessage", lang),
+    message: optionalLimitedString(
+      data.message,
+      "invalidMessage",
+      "messageTooLong",
+      options.maxPromptChars,
+      lang,
+    ),
     maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
   }
 }
@@ -363,7 +432,13 @@ export function parseListInput(input: unknown, lang: Lang, options: BridgeOption
   const data = record(input, lang)
   return {
     limit: integerOption(data.limit, "invalidListLimit", lang, 1, 100, 10, true),
-    search: optionalString(data.search, "invalidSearch", lang),
+    search: optionalLimitedString(
+      data.search,
+      "invalidSearch",
+      "searchTooLong",
+      options.maxSearchChars,
+      lang,
+    ),
     directory: optionalString(data.directory, "invalidDirectory", lang),
     cursor: optionalString(data.cursor, "invalidCursor", lang),
     order: validateOrder(data.order, lang),
@@ -404,13 +479,24 @@ export function parseUpdateInput(input: unknown, lang: Lang, options: BridgeOpti
   const data = record(input, lang)
   return {
     sessionID: requireString(data.sessionID, "invalidSessionID", lang),
-    title: optionalString(data.title, "invalidTitle", lang),
+    title: optionalLimitedString(
+      data.title,
+      "invalidTitle",
+      "titleTooLong",
+      options.maxTitleChars,
+      lang,
+    ),
     archived:
       data.archived === undefined || data.archived === null
         ? undefined
         : optionalBoolean(data.archived, "invalidInput", lang, false),
-    metadata: validateMetadata(data.metadata, lang),
-    permissions: validatePermissionRules(data.permissions, lang, options.allowPermissionRules),
+    metadata: validateMetadata(data.metadata, lang, options.maxMetadataBytes),
+    permissions: validatePermissionRules(
+      data.permissions,
+      lang,
+      options.allowPermissionRules,
+      options.maxPermissionRules,
+    ),
     maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
   }
 }

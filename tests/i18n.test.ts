@@ -49,4 +49,27 @@ describe("structured i18n", () => {
     expect(t("en", "afterNotFound", { id: "msg_x", limit: 30 })).toContain("msg_x")
     expect(t("en", "afterNotFound", { id: "msg_x", limit: 30 })).toContain("30")
   })
+
+  it("does not reinterpret placeholder-like text inside variable values", () => {
+    const message = t("en", "afterNotFound", { id: "{limit}", limit: 30 })
+    expect(message).toContain("{limit}")
+    expect(message).toContain("30")
+  })
+
+  it("P1-6: preserves multiline content and tool lines", () => {
+    const input =
+      "Sesión: ses_1\nEstado: inactiva\nTexto final:\nprimera linea\nEstado: en ejecución\nAcciones: (ninguna)"
+    const output = localize(input, "en")
+    expect(output).toContain("Session: ses_1")
+    expect(output).toContain("State: idle")
+    expect(output).toContain("primera linea\nEstado: en ejecución")
+    expect(output).toContain("Actions: (none)")
+    expect(output).not.toContain("State: running")
+
+    const toolLine = '  · read [completed] {"path":"a.txt"} | recordar: x'
+    expect(localize(toolLine, "en")).toBe(toolLine)
+
+    const permissionLine = "  · per_1 | shell | echo * | recordar: *"
+    expect(localize(permissionLine, "en")).toContain("remember:")
+  })
 })

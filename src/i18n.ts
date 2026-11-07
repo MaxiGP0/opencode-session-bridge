@@ -31,6 +31,17 @@ const es = {
   waitPermission: "esperando permiso",
   waitError: "error al esperar",
   queued: "en cola",
+  retrying: "reintentando",
+  retryAttempt: "intento {attempt}",
+  retryNext: "próximo en {seconds}s",
+  retryReason: "Motivo del reintento",
+  queuedMessages: "En cola ({count})",
+  foreignInterruptBlocked: "La sesión no fue creada por este plugin y no se puede interrumpir.",
+  foreignInterruptHint:
+    "Habilita allowInterruptForeignSessions: true o adopta la sesión con sessions.open({ sessionID }).",
+  foreignUpdateBlocked: "La sesión no fue creada por este plugin y no se puede actualizar.",
+  foreignUpdateHint:
+    "Habilita allowUpdateForeignSessions: true o adopta la sesión con sessions.open({ sessionID }).",
   promptMessageID: "ID del mensaje",
   noPendingTurns: "No hay turnos pendientes.",
   noSessions: "No hay sesiones.",
@@ -56,6 +67,7 @@ const es = {
   replyHint2: "Usa sessions.reply con el ID de la solicitud para responder.",
   replyHint3: "Usa sessions.reply con sessionID y requestID para responder.",
   created: "Sesión creada",
+  reused: "Sesión reutilizada",
   couldNotOpen: "No se pudo abrir la sesión",
   couldNotSend: "No se pudo enviar el mensaje",
   couldNotInspect: "No se pudo consultar la sesión",
@@ -90,6 +102,9 @@ const es = {
   cursorNext: "Cursor siguiente",
   noMoreResults: "No hay más resultados.",
   afterNotFound: "afterMessageID no encontrado: {id}; se muestran los últimos {limit} mensajes.",
+  noNewMessagesAfter: "No hay mensajes nuevos después de {id}.",
+  nextAfterMessage: "Siguiente afterMessageID",
+  hasMore: "Hay más mensajes",
   files: "Archivos",
   shell: "Shell",
   synthetic: "Sintético",
@@ -104,8 +119,14 @@ const es = {
   invalidLimit: "limit debe ser un entero entre 1 y 200.",
   invalidListLimit: "limit debe ser un entero entre 1 y 100.",
   invalidRecent: "recent debe ser un entero entre 1 y 100.",
-  invalidMaxOutput: "maxOutputChars debe ser un entero entre 1000 y 200000.",
-  invalidMaxText: "maxText debe ser un entero entre 100 y 50000.",
+  invalidMaxOutput: "maxOutputChars debe ser un entero entre {min} y {max}.",
+  invalidMaxText: "maxText debe ser un entero entre {min} y {max}.",
+  promptTooLong: "El prompt debe tener entre {min} y {max} caracteres.",
+  titleTooLong: "El título debe tener entre {min} y {max} caracteres.",
+  searchTooLong: "search debe tener entre {min} y {max} caracteres.",
+  messageTooLong: "message debe tener entre {min} y {max} caracteres.",
+  tooManyPermissionRules: "No se permiten más de {max} reglas de permiso.",
+  metadataTooLarge: "metadata supera el máximo de {max} bytes.",
   invalidLanguage: "El idioma debe ser es o en.",
   invalidSessionID: "sessionID debe ser una cadena no vacía.",
   invalidRequestID: "requestID debe ser una cadena no vacía.",
@@ -177,6 +198,17 @@ const en: Record<StringKey, string> = {
   waitPermission: "waiting for permission",
   waitError: "wait failed",
   queued: "queued",
+  retrying: "retrying",
+  retryAttempt: "attempt {attempt}",
+  retryNext: "next in {seconds}s",
+  retryReason: "Retry reason",
+  queuedMessages: "Queued ({count})",
+  foreignInterruptBlocked: "The session was not created by this plugin and cannot be interrupted.",
+  foreignInterruptHint:
+    "Enable allowInterruptForeignSessions: true or adopt the session with sessions.open({ sessionID }).",
+  foreignUpdateBlocked: "The session was not created by this plugin and cannot be updated.",
+  foreignUpdateHint:
+    "Enable allowUpdateForeignSessions: true or adopt the session with sessions.open({ sessionID }).",
   promptMessageID: "Message ID",
   noPendingTurns: "No pending turns.",
   noSessions: "No sessions.",
@@ -202,6 +234,7 @@ const en: Record<StringKey, string> = {
   replyHint2: "Use sessions.reply with the request ID to respond.",
   replyHint3: "Use sessions.reply with sessionID and requestID to respond.",
   created: "Session created",
+  reused: "Session reused",
   couldNotOpen: "Could not open the session",
   couldNotSend: "Could not send the message",
   couldNotInspect: "Could not inspect the session",
@@ -236,6 +269,9 @@ const en: Record<StringKey, string> = {
   cursorNext: "Next cursor",
   noMoreResults: "No more results.",
   afterNotFound: "afterMessageID not found: {id}; showing the last {limit} messages.",
+  noNewMessagesAfter: "No new messages after {id}.",
+  nextAfterMessage: "Next afterMessageID",
+  hasMore: "More messages",
   files: "Files",
   shell: "Shell",
   synthetic: "Synthetic",
@@ -250,8 +286,14 @@ const en: Record<StringKey, string> = {
   invalidLimit: "limit must be an integer between 1 and 200.",
   invalidListLimit: "limit must be an integer between 1 and 100.",
   invalidRecent: "recent must be an integer between 1 and 100.",
-  invalidMaxOutput: "maxOutputChars must be an integer between 1000 and 200000.",
-  invalidMaxText: "maxText must be an integer between 100 and 50000.",
+  invalidMaxOutput: "maxOutputChars must be an integer between {min} and {max}.",
+  invalidMaxText: "maxText must be an integer between {min} and {max}.",
+  promptTooLong: "Prompt must be between {min} and {max} characters.",
+  titleTooLong: "Title must be between {min} and {max} characters.",
+  searchTooLong: "search must be between {min} and {max} characters.",
+  messageTooLong: "message must be between {min} and {max} characters.",
+  tooManyPermissionRules: "No more than {max} permission rules are allowed.",
+  metadataTooLarge: "metadata exceeds the {max}-byte limit.",
   invalidLanguage: "Language must be es or en.",
   invalidSessionID: "sessionID must be a non-empty string.",
   invalidRequestID: "requestID must be a non-empty string.",
@@ -293,13 +335,11 @@ const en: Record<StringKey, string> = {
 export const STRINGS = { es, en } as const
 
 export function t(lang: Lang, key: StringKey, vars?: Record<string, string | number>): string {
-  let value: string = STRINGS[lang][key]
-  if (vars) {
-    for (const [name, replacement] of Object.entries(vars)) {
-      value = value.split(`{${name}}`).join(String(replacement))
-    }
-  }
-  return value
+  const value: string = STRINGS[lang][key]
+  if (!vars) return value
+  return value.replace(/\{(\w+)\}/g, (match, name: string) =>
+    Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : match,
+  )
 }
 
 const EXACT: Record<string, string> = {
@@ -345,6 +385,7 @@ type Prefix = {
 
 const PREFIXES: Prefix[] = [
   { spanish: "Sesión creada: ", english: `${t("en", "created")}: ` },
+  { spanish: "Sesión reutilizada: ", english: `${t("en", "reused")}: ` },
   { spanish: "Sesiones: ", english: `${t("en", "sessions")}: ` },
   { spanish: "Sesión: ", english: `${t("en", "session")}: ` },
   { spanish: "Título: ", english: `${t("en", "title")}: ` },
@@ -358,6 +399,9 @@ const PREFIXES: Prefix[] = [
   },
   { spanish: "Último texto: ", english: `${t("en", "lastText")}: `, value: translateStateValue },
   { spanish: "Último mensaje: ", english: `${t("en", "lastMessage")}: ` },
+  { spanish: "ID del mensaje: ", english: `${t("en", "promptMessageID")}: ` },
+  { spanish: "Siguiente afterMessageID: ", english: `${t("en", "nextAfterMessage")}: ` },
+  { spanish: "Hay más mensajes: ", english: `${t("en", "hasMore")}: ` },
   {
     spanish: "Texto final:",
     english: `${t("en", "finalText")}:`,
@@ -400,11 +444,38 @@ function localizePermissionLine(line: string): string {
     .join(t("en", "noResources"))
 }
 
+const CONTENT_LABEL = "Texto final:"
+const LAST_TEXT_PREFIX = `${t("es", "lastText")}: `
+
+/**
+ * Labels that formatSummary/status append after the optional text block. They
+ * let the legacy translator resume after multiline content without inspecting
+ * (and corrupting) every continuation line.
+ */
+function isStructuralAfterContent(line: string): boolean {
+  return (
+    line.startsWith("  · ") ||
+    /^Acciones( \(|: )/.test(line) ||
+    /^Acciones recientes( \(|: )/.test(line) ||
+    /^Permisos pendientes \(/.test(line) ||
+    line.startsWith(`${t("es", "lastMessage")}:`) ||
+    line.startsWith(`${t("es", "promptMessageID")}:`) ||
+    line.startsWith(`${t("es", "error")}:`) ||
+    line.startsWith(`${t("es", "nextAfterMessage")}:`) ||
+    line.startsWith(`${t("es", "hasMore")}:`)
+  )
+}
+
 function localizeLine(line: string): string {
   const exact = EXACT[line]
   if (exact) return exact
 
-  if (line.startsWith("  · ")) return localizePermissionLine(line)
+  if (line.startsWith("  · ")) {
+    // Tool lines also start with "  · ". Only permission lines carrying a
+    // permission ID are safe to rewrite; arbitrary tool content is never touched.
+    if (/^\s*·\s+per_[^\s|]+\s+\|/.test(line)) return localizePermissionLine(line)
+    return line
+  }
 
   const sessionMatch = /^Sesión (.+): (no hay solicitudes de permiso pendientes|interrumpida|no había un turno activo)\.$/.exec(
     line,
@@ -443,9 +514,35 @@ function localizeLine(line: string): string {
 /**
  * Legacy compatibility translator. New code uses `t()` to build labels and
  * inserts dynamic content verbatim; this function only rewrites structural
- * labels and known fixed phrases, never arbitrary assistant/tool content.
+ * labels and known fixed phrases. Lines that continue a multiline text block
+ * are copied verbatim until a known structural footer appears.
+ *
+ * @deprecated Prefer building output with `t()`. Kept for 2.x compatibility;
+ * removal is planned for 3.0.0.
  */
 export function localize(content: string, language: Lang): string {
   if (language !== "en") return content
-  return content.split("\n").map(localizeLine).join("\n")
+  let inContent = false
+  const lines = content.split("\n")
+  const translated: string[] = []
+  for (const line of lines) {
+    if (inContent) {
+      if (isStructuralAfterContent(line)) {
+        inContent = false
+      } else {
+        translated.push(line)
+        continue
+      }
+    }
+    translated.push(localizeLine(line))
+    if (line === CONTENT_LABEL) {
+      inContent = true
+    } else if (
+      line.startsWith(LAST_TEXT_PREFIX) &&
+      !line.endsWith(t("es", "noText"))
+    ) {
+      inContent = true
+    }
+  }
+  return translated.join("\n")
 }

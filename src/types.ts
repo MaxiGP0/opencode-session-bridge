@@ -88,12 +88,47 @@ export type PermissionLike = {
   message?: string
 }
 
+export type SessionStatusLike =
+  | { type: "idle" }
+  | {
+      type: "retry"
+      attempt: number
+      message: string
+      next: number
+      action?: {
+        reason?: string
+        provider?: string
+        title?: string
+        message?: string
+        label?: string
+        link?: string
+      }
+    }
+  | { type: "busy" }
+
+export type RetryInfo = {
+  attempt: number
+  message: string
+  next: number
+}
+
+export type QueuedPrompt = {
+  messageID: string
+  at: number
+  delivery: "steer" | "queue"
+}
+
+export type QueuedPrompts = Map<string, QueuedPrompt[]>
+
 export type TurnState = "idle" | "timeout" | "aborted" | "permission" | "error"
+
+export type TerminalSignal = "event" | "wait" | "poll" | "timeout" | "abort"
 
 export type TurnResult = {
   state: TurnState
   messages: MessageLike[]
   startIndex: number
+  endIndex?: number
   idle?: MessageLike
   lastError?: string
   pendingPermissions?: PermissionLike[]
@@ -101,6 +136,10 @@ export type TurnResult = {
   fetchCount: number
   promptMessageID?: string
   queued?: boolean
+  anchorMessage?: MessageLike
+  anchorCreatedAt?: number
+  terminalSignal?: TerminalSignal
+  retry?: RetryInfo
 }
 
 /**
@@ -113,6 +152,10 @@ export type SessionEventLike = {
     sessionID?: string
     error?: { message?: string; status?: number }
     reason?: string
+    status?: SessionStatusLike
+    inboxID?: string
+    delivery?: "steer" | "queue"
+    item?: { type?: string; delivery?: "steer" | "queue" }
   }
 }
 
@@ -120,6 +163,8 @@ export type ProgressInfo = {
   elapsedMs: number
   fetchCount: number
   lastEvent?: string
+  state?: "retrying"
+  retry?: RetryInfo
 }
 
 export type WaitContext = Pick<PluginContext, "session" | "permission" | "event">

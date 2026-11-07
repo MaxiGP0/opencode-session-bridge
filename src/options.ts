@@ -8,7 +8,15 @@ export type BridgeOptions = {
   maxTools: number
   maxToolLine: number
   maxTextChars: number
+  maxErrorChars: number
+  maxTitleChars: number
   maxPermissions: number
+  maxPromptChars: number
+  maxSearchChars: number
+  maxPermissionRules: number
+  maxMetadataBytes: number
+  queueTtlMs: number
+  maxQueuedPrompts: number
   pollIntervalMs: number
   maxPollIntervalMs: number
   permissionPollMs: number
@@ -18,6 +26,8 @@ export type BridgeOptions = {
   allowPersistentPermissions: boolean
   allowReplyToForeignSessions: boolean
   allowSessionRemoval: boolean
+  allowInterruptForeignSessions: boolean
+  allowUpdateForeignSessions: boolean
   debug: boolean
 }
 
@@ -28,7 +38,15 @@ export const DEFAULT_OPTIONS: BridgeOptions = {
   maxTools: 40,
   maxToolLine: 500,
   maxTextChars: 4_000,
+  maxErrorChars: 1_000,
+  maxTitleChars: 500,
   maxPermissions: 20,
+  maxPromptChars: 100_000,
+  maxSearchChars: 500,
+  maxPermissionRules: 100,
+  maxMetadataBytes: 32_768,
+  queueTtlMs: 3_600_000,
+  maxQueuedPrompts: 100,
   pollIntervalMs: 500,
   maxPollIntervalMs: 2_000,
   permissionPollMs: 1_500,
@@ -38,6 +56,8 @@ export const DEFAULT_OPTIONS: BridgeOptions = {
   allowPersistentPermissions: false,
   allowReplyToForeignSessions: false,
   allowSessionRemoval: false,
+  allowInterruptForeignSessions: false,
+  allowUpdateForeignSessions: false,
   debug: false,
 }
 
@@ -83,8 +103,16 @@ export function parseOptions(raw: Record<string, unknown> | undefined): BridgeOp
     maxTools: readNumber(input, "maxTools", 1, 200),
     maxToolLine: readNumber(input, "maxToolLine", 50, 5_000),
     maxTextChars: readNumber(input, "maxTextChars", 100, 50_000),
+    maxErrorChars: readNumber(input, "maxErrorChars", 100, 10_000),
+    maxTitleChars: readNumber(input, "maxTitleChars", 20, 5_000),
     maxPermissions: readNumber(input, "maxPermissions", 1, 100),
-    pollIntervalMs: readNumber(input, "pollIntervalMs", 50, 10_000),
+    maxPromptChars: readNumber(input, "maxPromptChars", 1_000, 1_000_000),
+    maxSearchChars: readNumber(input, "maxSearchChars", 1, 10_000),
+    maxPermissionRules: readNumber(input, "maxPermissionRules", 1, 1_000),
+    maxMetadataBytes: readNumber(input, "maxMetadataBytes", 1_024, 1_048_576),
+    queueTtlMs: readNumber(input, "queueTtlMs", 1, 86_400_000),
+    maxQueuedPrompts: readNumber(input, "maxQueuedPrompts", 1, 1_000),
+    pollIntervalMs: readNumber(input, "pollIntervalMs", 10, 10_000),
     maxPollIntervalMs: readNumber(input, "maxPollIntervalMs", 100, 30_000),
     permissionPollMs: readNumber(input, "permissionPollMs", 100, 10_000),
     requestTimeoutMs: readNumber(input, "requestTimeoutMs", 1_000, 60_000),
@@ -93,6 +121,8 @@ export function parseOptions(raw: Record<string, unknown> | undefined): BridgeOp
     allowPersistentPermissions: readBoolean(input, "allowPersistentPermissions"),
     allowReplyToForeignSessions: readBoolean(input, "allowReplyToForeignSessions"),
     allowSessionRemoval: readBoolean(input, "allowSessionRemoval"),
+    allowInterruptForeignSessions: readBoolean(input, "allowInterruptForeignSessions"),
+    allowUpdateForeignSessions: readBoolean(input, "allowUpdateForeignSessions"),
     debug: readBoolean(input, "debug"),
   }
 }
