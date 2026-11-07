@@ -1,14 +1,46 @@
 import { Plugin } from "@opencode/plugin"
+import { createLiveState, type LiveState } from "./src/live.ts"
 import { parseOptions } from "./src/options.ts"
-import { loadOwnedSessions } from "./src/registry.ts"
-import { registerTools } from "./src/tools.ts"
-import type { Lang, PluginContext } from "./src/types.ts"
+import { loadOpenSessions, loadOwnedSessions } from "./src/registry.ts"
+import { registerTools, type ToolExecutionResult } from "./src/tools.ts"
+import type { Lang, PluginContext, SessionEventLike } from "./src/types.ts"
 
 const LANGUAGE_KEY = "language"
+const LIVE_EVENT_TYPES = [
+  "session.status",
+  "session.idle",
+  "session.inbox.enqueued",
+  "session.inbox.delivered",
+  "session.inbox.cancelled",
+  "session.inbox.delivery.changed",
+] as const
+
+type RegistrationLike = {
+  dispose: () => Promise<void> | void
+}
+
+async function consumeLiveEvents(
+  ctx: PluginContext,
+  signal: AbortSignal,
+  liveState: LiveState,
+): Promise<void> {
+  try {
+    const stream = ctx.event.subscribe({
+      types: [...LIVE_EVENT_TYPES],
+      signal,
+    })
+    for await (const event of stream) {
+      liveState.applyEvent(event as unknown as SessionEventLike)
+    }
+  } catch {
+    // Live events are an optional enhancement; status/wait keep working
+    // through session.wait, transcript timestamps, and polling.
+  }
+}
 
 /**
- * Orchestrator only: options, language, owned-session registry, and tool
- * registration. Pure formatting, i18n, validation, and waiting live in src/.
+ * Orchestrator only: options, language, owned-session registry, live state, and
+ * tool registration. Pure formatting, i18n, validation, and waiting live in src/.
  */
 export default Plugin.define({
   id: "session-bridge",
@@ -22,6 +54,32 @@ export default Plugin.define({
     }
     let language: Lang = stored === "es" || stored === "en" ? stored : options.language
     const ownedSessions = await loadOwnedSessions(ctx)
+    const openSessions = await loadOpenSessions(ctx)
+    const inFlightOpens = new Map<string, Promise<ToolExecutionResult>>()
+    const liveState = createLiveState({
+      ttlMs: options.queueTtlMs,
+      maxPerSession: options.maxQueuedPrompts,
+    })
+    const registrations: RegistrationLike[] = []
+    const liveController = new AbortController()
+
+    if (typeof ctx.session.hook === "function") {
+      try {
+        const registration = await ctx.session.hook("prompt", (input) => {
+          liveState.notePrompt({
+            sessionID: input.sessionID,
+            messageID: input.messageID,
+            delivery: input.delivery,
+          })
+        })
+        registrations.push(registration)
+      } catch {
+        // Prompt hooks are experimental and optional.
+      }
+    }
+    if (typeof ctx.event?.subscribe === "function") {
+      void consumeLiveEvents(ctx, liveController.signal, liveState)
+    }
 
     const setLanguage = async (lang: Lang) => {
       language = lang
@@ -43,16 +101,33 @@ export default Plugin.define({
         getLanguage: () => language,
         setLanguage,
         ownedSessions,
+        openSessions,
+        liveState,
+        inFlightOpens,
       })
     })
+
+    return async () => {
+      liveController.abort()
+      for (const registration of registrations) {
+        try {
+          await registration.dispose()
+        } catch {
+          // Unloading must not fail because a hook was already disposed.
+        }
+      }
+      liveState.clear()
+    }
   },
 })
 
 export {
   assistantText,
+  assistantTextInfo,
   capOutput,
   collectRecentTools,
   compact,
+  extractText,
   fitBudget,
   formatError,
   formatSummary,
@@ -63,7 +138,10 @@ export {
   modelRef,
   parseModel,
   permissionLine,
+  reasoningText,
   renderTranscript,
+  renderTranscriptDetailed,
+  sanitizeTitle,
   summarizeTurn,
   titleFromPrompt,
   toolLine,
@@ -75,6 +153,9 @@ export type {
   Lang,
   MessageLike,
   PermissionLike,
+  QueuedPrompt,
+  RetryInfo,
+  SessionStatusLike,
   ToolPartLike,
   TurnResult,
   TurnState,

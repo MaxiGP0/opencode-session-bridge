@@ -1,0 +1,102 @@
+import { describe, expect, it } from "vitest"
+import {
+  forgetOpenSessionsBySessionID,
+  forgetOwnedSession,
+  isOwnedSession,
+  loadOpenSessions,
+  loadOwnedSessions,
+  lookupOpenSession,
+  OWNED_TTL_MS,
+  rememberOpenSession,
+  rememberOwnedSession,
+  type OpenSessionMapping,
+  type OwnedSessions,
+} from "../src/registry.ts"
+import type { PluginContext } from "../src/types.ts"
+
+function makeContext(directory: string, storage = new Map<string, unknown>()) {
+  const ctx = {
+    location: { directory },
+    storage: {
+      get: async (key: string) => storage.get(key),
+      set: async (key: string, value: unknown) => {
+        storage.set(key, value)
+      },
+      remove: async (key: string) => {
+        storage.delete(key)
+      },
+      scan: async () => ({ entries: [] }),
+    },
+  }
+  return { ctx: ctx as unknown as PluginContext, storage }
+}
+
+describe("session registry", () => {
+  it("P1-5: keeps the most recently used owned session when pruning", async () => {
+    const { ctx } = makeContext("C:/repo")
+    const sessions: OwnedSessions = new Map()
+    for (let index = 0; index < 500; index++) {
+      await rememberOwnedSession(ctx, sessions, `ses_${index}`, "C:/repo")
+    }
+    await rememberOwnedSession(ctx, sessions, "ses_0", "C:/repo")
+    await rememberOwnedSession(ctx, sessions, "ses_500", "C:/repo")
+    expect(sessions.size).toBe(500)
+    expect(isOwnedSession(sessions, "ses_0", "C:/repo")).toBe(true)
+    expect(isOwnedSession(sessions, "ses_1", "C:/repo")).toBe(false)
+  })
+
+  it("P1-5: expires owned sessions by TTL and validates the directory", () => {
+    const sessions: OwnedSessions = new Map([
+      ["ses_old", { at: Date.now() - OWNED_TTL_MS - 1, directory: "C:/repo" }],
+      ["ses_recent", { at: Date.now(), directory: "C:/repo" }],
+    ])
+    expect(isOwnedSession(sessions, "ses_old", "C:/repo")).toBe(false)
+    expect(isOwnedSession(sessions, "ses_recent", "C:/repo")).toBe(true)
+    expect(isOwnedSession(sessions, "ses_recent", "C:/other")).toBe(false)
+  })
+
+  it("P1-5: isolates storage by directory and migrates the old array format", async () => {
+    const shared = new Map<string, unknown>()
+    const a = makeContext("C:/a", shared)
+    const b = makeContext("C:/b", shared)
+    const sessionsA: OwnedSessions = new Map()
+    await rememberOwnedSession(a.ctx, sessionsA, "ses_a", "C:/a")
+    const loadedB = await loadOwnedSessions(b.ctx)
+    expect(loadedB.has("ses_a")).toBe(false)
+    const loadedA = await loadOwnedSessions(a.ctx)
+    expect(loadedA.has("ses_a")).toBe(true)
+
+    const legacy = makeContext("C:/legacy", new Map([["session-bridge:owned-sessions", ["ses_legacy"]]]))
+    const loadedLegacy = await loadOwnedSessions(legacy.ctx)
+    expect(loadedLegacy.has("ses_legacy")).toBe(true)
+  })
+
+  it("P1-5: removes owned and open mappings", async () => {
+    const { ctx } = makeContext("C:/repo")
+    const sessions: OwnedSessions = new Map()
+    await rememberOwnedSession(ctx, sessions, "ses_1", "C:/repo")
+    await forgetOwnedSession(ctx, sessions, "ses_1")
+    expect(sessions.has("ses_1")).toBe(false)
+
+    const mapping: OpenSessionMapping = new Map()
+    await rememberOpenSession(ctx, mapping, "msg_1", "ses_1", "C:/repo")
+    await rememberOpenSession(ctx, mapping, "msg_2", "ses_1", "C:/repo")
+    await rememberOpenSession(ctx, mapping, "msg_3", "ses_2", "C:/repo")
+    await forgetOpenSessionsBySessionID(ctx, mapping, "ses_1")
+    expect(mapping.size).toBe(1)
+    expect(mapping.has("msg_3")).toBe(true)
+  })
+
+  it("P1-5: does not reuse an open mapping from another directory", async () => {
+    const { ctx } = makeContext("C:/repo")
+    const mapping: OpenSessionMapping = new Map()
+    await rememberOpenSession(ctx, mapping, "msg_same", "ses_same", "C:/repo")
+    expect(lookupOpenSession(mapping, "msg_same", "C:/repo")).toBe("ses_same")
+
+    await rememberOpenSession(ctx, mapping, "msg_other", "ses_other", "C:/other")
+    expect(lookupOpenSession(mapping, "msg_other", "C:/repo")).toBeUndefined()
+
+    const loaded = await loadOpenSessions(ctx)
+    expect(loaded.has("msg_other")).toBe(false)
+  })
+})
