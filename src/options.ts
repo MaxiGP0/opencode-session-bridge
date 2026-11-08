@@ -5,6 +5,7 @@ export type BridgeOptions = {
   language: Lang
   defaultTimeoutMs: number
   maxOutputChars: number
+  maxOutputTotalChars: number
   maxTools: number
   maxToolLine: number
   maxTextChars: number
@@ -15,7 +16,13 @@ export type BridgeOptions = {
   maxSearchChars: number
   maxPermissionRules: number
   maxMetadataBytes: number
+  maxIdChars: number
+  maxAgentChars: number
+  maxModelChars: number
+  maxPathChars: number
+  maxPermissionFieldChars: number
   queueTtlMs: number
+  livePendingTtlMs: number
   maxQueuedPrompts: number
   pollIntervalMs: number
   maxPollIntervalMs: number
@@ -26,8 +33,10 @@ export type BridgeOptions = {
   allowPersistentPermissions: boolean
   allowReplyToForeignSessions: boolean
   allowSessionRemoval: boolean
+  allowRemoveForeignSessions: boolean
   allowInterruptForeignSessions: boolean
   allowUpdateForeignSessions: boolean
+  allowCompact: boolean
   debug: boolean
 }
 
@@ -35,6 +44,7 @@ export const DEFAULT_OPTIONS: BridgeOptions = {
   language: "en",
   defaultTimeoutMs: 120_000,
   maxOutputChars: 20_000,
+  maxOutputTotalChars: 20_000,
   maxTools: 40,
   maxToolLine: 500,
   maxTextChars: 4_000,
@@ -45,7 +55,13 @@ export const DEFAULT_OPTIONS: BridgeOptions = {
   maxSearchChars: 500,
   maxPermissionRules: 100,
   maxMetadataBytes: 32_768,
+  maxIdChars: 256,
+  maxAgentChars: 128,
+  maxModelChars: 256,
+  maxPathChars: 4_096,
+  maxPermissionFieldChars: 512,
   queueTtlMs: 3_600_000,
+  livePendingTtlMs: 600_000,
   maxQueuedPrompts: 100,
   pollIntervalMs: 500,
   maxPollIntervalMs: 2_000,
@@ -56,8 +72,10 @@ export const DEFAULT_OPTIONS: BridgeOptions = {
   allowPersistentPermissions: false,
   allowReplyToForeignSessions: false,
   allowSessionRemoval: false,
+  allowRemoveForeignSessions: false,
   allowInterruptForeignSessions: false,
   allowUpdateForeignSessions: false,
+  allowCompact: false,
   debug: false,
 }
 
@@ -96,10 +114,19 @@ export function parseOptions(raw: Record<string, unknown> | undefined): BridgeOp
   const parsedLanguage: Lang = language === "es" || language === "en" ? language : DEFAULT_OPTIONS.language
   if (language !== undefined && parsedLanguage !== language) warn("language")
 
+  const maxOutputChars = readNumber(input, "maxOutputChars", 1_000, 200_000)
+  // Keep the global output budget aligned with maxOutputChars unless the user
+  // explicitly configures a separate total.
+  const maxOutputTotalChars =
+    input.maxOutputTotalChars === undefined
+      ? maxOutputChars
+      : readNumber(input, "maxOutputTotalChars", 1_000, 200_000)
+
   return {
     language: parsedLanguage,
     defaultTimeoutMs: readNumber(input, "defaultTimeoutMs", 1, 600_000),
-    maxOutputChars: readNumber(input, "maxOutputChars", 1_000, 200_000),
+    maxOutputChars,
+    maxOutputTotalChars,
     maxTools: readNumber(input, "maxTools", 1, 200),
     maxToolLine: readNumber(input, "maxToolLine", 50, 5_000),
     maxTextChars: readNumber(input, "maxTextChars", 100, 50_000),
@@ -110,7 +137,13 @@ export function parseOptions(raw: Record<string, unknown> | undefined): BridgeOp
     maxSearchChars: readNumber(input, "maxSearchChars", 1, 10_000),
     maxPermissionRules: readNumber(input, "maxPermissionRules", 1, 1_000),
     maxMetadataBytes: readNumber(input, "maxMetadataBytes", 1_024, 1_048_576),
+    maxIdChars: readNumber(input, "maxIdChars", 16, 4_096),
+    maxAgentChars: readNumber(input, "maxAgentChars", 16, 4_096),
+    maxModelChars: readNumber(input, "maxModelChars", 16, 4_096),
+    maxPathChars: readNumber(input, "maxPathChars", 64, 32_768),
+    maxPermissionFieldChars: readNumber(input, "maxPermissionFieldChars", 32, 16_384),
     queueTtlMs: readNumber(input, "queueTtlMs", 1, 86_400_000),
+    livePendingTtlMs: readNumber(input, "livePendingTtlMs", 1_000, 86_400_000),
     maxQueuedPrompts: readNumber(input, "maxQueuedPrompts", 1, 1_000),
     pollIntervalMs: readNumber(input, "pollIntervalMs", 10, 10_000),
     maxPollIntervalMs: readNumber(input, "maxPollIntervalMs", 100, 30_000),
@@ -121,8 +154,10 @@ export function parseOptions(raw: Record<string, unknown> | undefined): BridgeOp
     allowPersistentPermissions: readBoolean(input, "allowPersistentPermissions"),
     allowReplyToForeignSessions: readBoolean(input, "allowReplyToForeignSessions"),
     allowSessionRemoval: readBoolean(input, "allowSessionRemoval"),
+    allowRemoveForeignSessions: readBoolean(input, "allowRemoveForeignSessions"),
     allowInterruptForeignSessions: readBoolean(input, "allowInterruptForeignSessions"),
     allowUpdateForeignSessions: readBoolean(input, "allowUpdateForeignSessions"),
+    allowCompact: readBoolean(input, "allowCompact"),
     debug: readBoolean(input, "debug"),
   }
 }

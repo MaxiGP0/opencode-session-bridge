@@ -119,6 +119,31 @@ function stringifyBounded(value: unknown, limit: number): string {
   return state.parts.join("")
 }
 
+/**
+ * Removes CSI/OSC ANSI escape sequences. Output content is consumed by other
+ * models, so terminal control characters must never reach it.
+ */
+export function stripAnsi(value: string): string {
+  return value
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b[@-_]/g, "")
+}
+
+/**
+ * Sanitizes untrusted metadata that is inserted into a single line of
+ * `content`: removes ANSI, converts control characters and Unicode line
+ * separators to spaces, collapses whitespace, and optionally truncates.
+ * Assistant/user text and tool output must not use this helper.
+ */
+export function oneLine(value: string, max?: number): string {
+  const normalized = stripAnsi(value)
+    .replace(/[\r\n\t\u2028\u2029\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  return max !== undefined ? truncateCodePoints(normalized, max) : normalized
+}
+
 function compactString(value: string, max: number): string {
   const sourceLimit = Math.max(4_096, max * 8)
   const truncated = value.length > sourceLimit
@@ -284,7 +309,7 @@ export function modelRef(
 }
 
 export function sanitizeTitle(value: string): string {
-  return value.replace(/\r?\n/g, " ").trim()
+  return oneLine(value)
 }
 
 export function titleFromPrompt(
@@ -295,7 +320,7 @@ export function titleFromPrompt(
 ): string {
   if (title?.trim()) return truncateCodePoints(sanitizeTitle(title), maxTitleChars)
   const firstLine = prompt.trim().split(/\r?\n/)[0] || fallback
-  return truncateCodePoints(firstLine, 60, "...")
+  return truncateCodePoints(oneLine(firstLine), 60, "...")
 }
 
 function isContentPart(value: unknown): value is Record<string, unknown> {
@@ -474,12 +499,19 @@ export type ToolLineOptions = {
 
 export function toolLine(tool: ToolPartLike, includeOutput: boolean, options: ToolLineOptions = {}): string {
   const state = tool.state ?? {}
-  const status = state.status ?? "unknown"
-  const input = compact(state.input, options.maxInputChars ?? 220)
-  let line = `  · ${tool.name ?? "tool"} [${status}]`
+  const status = oneLine(state.status ?? "unknown", 80)
+  const name = oneLine(tool.name ?? "tool", 200)
+  const input = oneLine(
+    compact(state.input, options.maxInputChars ?? 220),
+    options.maxInputChars ?? 220,
+  )
+  let line = `  · ${name} [${status}]`
   if (input) line += ` ${input}`
   if (state.status === "error" && state.error?.message) {
-    line += ` → error: ${compact(state.error.message, options.maxErrorChars ?? 300)}`
+    line += ` → error: ${oneLine(
+      compact(state.error.message, options.maxErrorChars ?? 300),
+      options.maxErrorChars ?? 300,
+    )}`
   }
   if (includeOutput && Array.isArray(state.content)) {
     const budget = options.maxOutputChars ?? 400
@@ -586,7 +618,7 @@ export function formatSummary(title: string, summary: Summary, options: SummaryO
   const status =
     options.state ??
     (summary.outcome
-      ? `${t(lang, "idle")} (${summary.outcome})`
+      ? `${t(lang, "idle")} (${oneLine(summary.outcome, 120)})`
       : summary.idle
         ? t(lang, "idle")
         : summary.slice.some(isRelevantTurnMessage)
@@ -599,13 +631,19 @@ export function formatSummary(title: string, summary: Summary, options: SummaryO
   // Build mandatory bottom lines first so IDs, errors, and permissions never get cut off.
   const errorBudget = Math.min(1_000, Math.max(120, Math.floor(maxOutputChars * 0.2)))
   const bottomLines: string[] = []
-  if (summary.error) bottomLines.push(`${t(lang, "error")}: ${compact(summary.error, errorBudget)}`)
-  if (options.lastError && options.lastError !== summary.error) {
-    bottomLines.push(`${t(lang, "error")}: ${compact(options.lastError, errorBudget)}`)
+  if (summary.error) {
+    bottomLines.push(`${t(lang, "error")}: ${oneLine(compact(summary.error, errorBudget), errorBudget)}`)
   }
-  if (summary.lastMessageID) bottomLines.push(`${t(lang, "lastMessage")}: ${summary.lastMessageID}`)
+  if (options.lastError && options.lastError !== summary.error) {
+    bottomLines.push(
+      `${t(lang, "error")}: ${oneLine(compact(options.lastError, errorBudget), errorBudget)}`,
+    )
+  }
+  if (summary.lastMessageID) {
+    bottomLines.push(`${t(lang, "lastMessage")}: ${oneLine(summary.lastMessageID, 256)}`)
+  }
   if (options.promptMessageID) {
-    bottomLines.push(`${t(lang, "promptMessageID")}: ${options.promptMessageID}`)
+    bottomLines.push(`${t(lang, "promptMessageID")}: ${oneLine(options.promptMessageID, 256)}`)
   }
 
   if (options.pendingPermissions?.length) {
@@ -754,7 +792,7 @@ function boundedList(
   if (!Array.isArray(values) || values.length === 0) return undefined
   const shown = values
     .slice(0, Math.max(1, maxItems))
-    .map((value) => truncateCodePoints(String(value), maxChars))
+    .map((value) => oneLine(String(value), maxChars))
   const suffix = values.length > shown.length ? `, …` : ""
   return `${shown.join(separator)}${suffix}`
 }
@@ -771,13 +809,20 @@ export function permissionLine(
   const saveList = boundedList(request.save, maxResources, maxResourceChars)
   const save = saveList ? ` | ${t(lang, "remember")}: ${saveList}` : ""
   const metadata = request.metadata
-    ? ` | metadata: ${compact(request.metadata, options.maxMetadataChars ?? 160)}`
+    ? ` | metadata: ${oneLine(
+        compact(request.metadata, options.maxMetadataChars ?? 160),
+        options.maxMetadataChars ?? 160,
+      )}`
     : ""
   const message = request.message
-    ? ` | ${compact(request.message, options.maxMessageChars ?? 200)}`
+    ? ` | ${oneLine(
+        compact(request.message, options.maxMessageChars ?? 200),
+        options.maxMessageChars ?? 200,
+      )}`
     : ""
-  const action = compact(request.action, 120)
-  const line = `  · ${request.id} | ${action} | ${resources}${save}${metadata}${message}`
+  const action = oneLine(compact(request.action, 120), 120)
+  const id = oneLine(request.id, 256)
+  const line = `  · ${id} | ${action} | ${resources}${save}${metadata}${message}`
   return options.maxLine ? truncateCodePoints(line, options.maxLine) : line
 }
 
@@ -819,8 +864,9 @@ function fileLine(file: unknown, lang: Lang): string | undefined {
   const sourceURI = source && typeof source.uri === "string" ? source.uri : undefined
   const uri = directURI ?? sourceURI
   if (!name && !description && !uri) return undefined
-  const label = name ?? description ?? uri
-  return `${t(lang, "files")}: ${label}${uri && uri !== label ? ` (${uri})` : ""}`
+  const label = oneLine(name ?? description ?? uri ?? "", 512)
+  const shownURI = uri ? oneLine(uri, 1_024) : undefined
+  return `${t(lang, "files")}: ${label}${shownURI && shownURI !== label ? ` (${shownURI})` : ""}`
 }
 
 export type TranscriptRenderResult = {
@@ -830,6 +876,10 @@ export type TranscriptRenderResult = {
   nextAfterMessageID?: string
   truncated: boolean
   count: number
+  /** True when the selected window was cut before every block was complete. */
+  partial: boolean
+  /** Message whose block was cut; re-read it with a larger budget. */
+  partialMessageID?: string
 }
 
 /**
@@ -865,10 +915,15 @@ export function renderTranscriptDetailed(
       selected = afterAll.slice(0, effectiveLimit)
       hasMore = afterAll.length > selected.length
       if (selected.length === 0) {
-        emptyAfterNotice = t(lang, "noNewMessagesAfter", { id: afterMessageID })
+        emptyAfterNotice = t(lang, "noNewMessagesAfter", {
+          id: oneLine(afterMessageID, 256),
+        })
       }
     } else {
-      warning = t(lang, "afterNotFound", { id: afterMessageID, limit: effectiveLimit })
+      warning = t(lang, "afterNotFound", {
+        id: oneLine(afterMessageID, 256),
+        limit: effectiveLimit,
+      })
       selected = messages.slice(-effectiveLimit)
       hasMore = false
     }
@@ -877,10 +932,15 @@ export function renderTranscriptDetailed(
     hasMore = messages.length > selected.length
   }
 
-  const sampleLastLine = lastMessageID ? `\n\n${t(lang, "lastMessage")}: ${lastMessageID}` : ""
+  const sampleLastLine = lastMessageID
+    ? `\n\n${t(lang, "lastMessage")}: ${oneLine(lastMessageID, 256)}`
+    : ""
   const samplePaginationLine =
     afterMessageID || hasMore
-      ? `\n${t(lang, "nextAfterMessage")}: ${selected[selected.length - 1]?.id ?? afterMessageID ?? ""}\n${t(lang, "hasMore")}: true`
+      ? `\n${t(lang, "nextAfterMessage")}: ${oneLine(
+          selected[selected.length - 1]?.id ?? afterMessageID ?? "",
+          256,
+        )}\n${t(lang, "hasMore")}: true`
       : ""
   const sampleTruncatedLine = `\n\n${t(lang, "transcriptTruncated")}`
   const footerReserve = Math.min(
@@ -895,6 +955,8 @@ export function renderTranscriptDetailed(
   let content = ""
   let contentLength = 0
   let truncated = false
+  let partial = false
+  let partialMessageID: string | undefined
   let renderedCount = 0
   let lastRenderedID: string | undefined
 
@@ -949,24 +1011,40 @@ export function renderTranscriptDetailed(
         }
       }
       if (message.error?.message) {
-        parts.push(`${t(lang, "assistantError")}: ${compact(message.error.message, 1_000)}`)
+        parts.push(
+          `${t(lang, "assistantError")}: ${oneLine(
+            compact(message.error.message, 1_000),
+            1_000,
+          )}`,
+        )
       }
       block = parts.join("\n")
     } else if (message.type === "idle") {
-      const error = message.error?.message ? ` (${compact(message.error.message, 500)})` : ""
-      block = `${t(lang, "endOfTurn")}: ${message.outcome ?? ""}${error}`
+      const error = message.error?.message
+        ? ` (${oneLine(compact(message.error.message, 500), 500)})`
+        : ""
+      block = `${t(lang, "endOfTurn")}: ${oneLine(message.outcome ?? "", 120)}${error}`
     } else if (message.type === "shell") {
       const output = message.output?.output ? `\n${truncateCodePoints(message.output.output, maxTextChars)}` : ""
-      block = `${t(lang, "shell")}: ${message.command ?? ""} [${message.status ?? "unknown"}]${output}`
+      block = `${t(lang, "shell")}: ${oneLine(message.command ?? "", 1_000)} [${oneLine(
+        message.status ?? "unknown",
+        80,
+      )}]${output}`
     } else if (message.type === "synthetic") {
       block = `${t(lang, "synthetic")}: ${truncateCodePoints(message.text ?? "", maxTextChars)}`
     } else if (message.type === "compaction") {
       const detail = message.summary ?? message.error?.message ?? ""
-      block = `${t(lang, "compaction")} [${message.status ?? "unknown"}]: ${compact(detail, maxTextChars)}`
+      block = `${t(lang, "compaction")} [${oneLine(message.status ?? "unknown", 80)}]: ${oneLine(
+        compact(detail, maxTextChars),
+        maxTextChars,
+      )}`
     }
 
     if (!append(block)) {
-      if (renderedCount === 0 && message.id) lastRenderedID = message.id
+      // Do not advance the pagination anchor past a block that was not fully
+      // rendered. The caller must re-read it with a larger budget.
+      partial = true
+      partialMessageID = message.id
       break
     }
     renderedCount++
@@ -976,11 +1054,14 @@ export function renderTranscriptDetailed(
   if (renderedCount < selected.length && selected.length > 0) {
     hasMore = true
   }
+  if (partial) hasMore = true
 
   const nextAfterMessageID =
-    lastRenderedID ??
-    selected[selected.length - 1]?.id ??
-    (afterMessageID && !warning ? afterMessageID : lastMessageID)
+    partial && renderedCount === 0
+      ? afterMessageID
+      : lastRenderedID ??
+        selected[selected.length - 1]?.id ??
+        (afterMessageID && !warning ? afterMessageID : lastMessageID)
 
   if (!content && !warning && !emptyAfterNotice) {
     content = t(lang, "noMessages")
@@ -991,13 +1072,16 @@ export function renderTranscriptDetailed(
   if (truncated) {
     footerLines.push(t(lang, "transcriptTruncated"))
   }
+  if (partial) {
+    footerLines.push(t(lang, "transcriptPartial"))
+  }
   const metaLines: string[] = []
   if (lastMessageID) {
-    metaLines.push(`${t(lang, "lastMessage")}: ${lastMessageID}`)
+    metaLines.push(`${t(lang, "lastMessage")}: ${oneLine(lastMessageID, 256)}`)
   }
   if ((afterMessageID && !warning) || hasMore) {
     if (nextAfterMessageID) {
-      metaLines.push(`${t(lang, "nextAfterMessage")}: ${nextAfterMessageID}`)
+      metaLines.push(`${t(lang, "nextAfterMessage")}: ${oneLine(nextAfterMessageID, 256)}`)
     }
     metaLines.push(`${t(lang, "hasMore")}: ${hasMore ? "true" : "false"}`)
   }
@@ -1022,6 +1106,8 @@ export function renderTranscriptDetailed(
     nextAfterMessageID,
     truncated,
     count: renderedCount,
+    partial,
+    partialMessageID,
   }
 }
 

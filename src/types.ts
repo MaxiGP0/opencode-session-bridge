@@ -109,7 +109,14 @@ export type SessionStatusLike =
 export type RetryInfo = {
   attempt: number
   message: string
+  /** Absolute epoch milliseconds when the next attempt is scheduled. */
   next: number
+  /** Same value as `next`, kept explicit for consumers. */
+  at?: number
+  /** Milliseconds remaining, recomputed at render/progress time. */
+  inMs?: number
+  /** ISO representation of `next`. */
+  atISO?: string
 }
 
 export type QueuedPrompt = {
@@ -140,6 +147,8 @@ export type TurnResult = {
   anchorCreatedAt?: number
   terminalSignal?: TerminalSignal
   retry?: RetryInfo
+  /** Epoch ms of the last permission.list performed while waiting, if any. */
+  permissionCheckedAt?: number
 }
 
 /**
@@ -150,12 +159,18 @@ export type SessionEventLike = {
   type: string
   data?: {
     sessionID?: string
-    error?: { message?: string; status?: number }
+    error?: { message?: string; status?: number; retryAfterMs?: number }
     reason?: string
     status?: SessionStatusLike
     inboxID?: string
     delivery?: "steer" | "queue"
     item?: { type?: string; delivery?: "steer" | "queue" }
+    /** Present on `session.retry.scheduled`. */
+    attempt?: number
+    /** Absolute epoch ms present on `session.retry.scheduled`. */
+    at?: number
+    /** Assistant message that scheduled the retry. */
+    assistantMessageID?: string
   }
 }
 

@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest"
-import { DEFAULT_OPTIONS } from "../src/options.ts"
+import { DEFAULT_OPTIONS, parseOptions } from "../src/options.ts"
 import {
   parseListInput,
   parseOpenInput,
+  parsePermissionsInput,
   parseReadInput,
   parseReplyInput,
   parseStatusInput,
@@ -117,5 +118,86 @@ describe("input validation", () => {
     expect(
       parseOpenInput({ prompt: "ok" }, "en", DEFAULT_OPTIONS).prompt,
     ).toBe("ok")
+  })
+
+  it("P0-3: maxOutputTotalChars defaults to the configured maxOutputChars", () => {
+    expect(parseOptions({ maxOutputChars: 50_000 }).maxOutputTotalChars).toBe(50_000)
+    expect(
+      parseOptions({ maxOutputChars: 50_000, maxOutputTotalChars: 30_000 })
+        .maxOutputTotalChars,
+    ).toBe(30_000)
+  })
+
+  it("accepts an omitted argument object for tools without required fields", () => {
+    expect(parseListInput(undefined, "en", DEFAULT_OPTIONS).limit).toBe(10)
+    expect(parseListInput(null, "en", DEFAULT_OPTIONS).limit).toBe(10)
+  })
+
+  it("P0-4: bounds IDs, agents, models, paths, and permission fields", () => {
+    expect(() =>
+      parseStatusInput(
+        { sessionID: "s".repeat(DEFAULT_OPTIONS.maxIdChars + 1) },
+        "en",
+        DEFAULT_OPTIONS,
+      ),
+    ).toThrow(/sessionID/i)
+    expect(() =>
+      parseOpenInput(
+        { prompt: "hi", agent: "a".repeat(DEFAULT_OPTIONS.maxAgentChars + 1) },
+        "en",
+        DEFAULT_OPTIONS,
+      ),
+    ).toThrow(/agent/i)
+    expect(() =>
+      parseOpenInput(
+        { prompt: "hi", model: `p/${"m".repeat(DEFAULT_OPTIONS.maxModelChars)}` },
+        "en",
+        DEFAULT_OPTIONS,
+      ),
+    ).toThrow(/model/i)
+    expect(() =>
+      parseListInput(
+        { directory: "d".repeat(DEFAULT_OPTIONS.maxPathChars + 1) },
+        "en",
+        DEFAULT_OPTIONS,
+      ),
+    ).toThrow(/directory/i)
+    expect(() =>
+      parsePermissionsInput(
+        { sessionID: "s".repeat(DEFAULT_OPTIONS.maxIdChars + 1) },
+        "en",
+        DEFAULT_OPTIONS,
+      ),
+    ).toThrow(/sessionID/i)
+    expect(() =>
+      parseOpenInput(
+        {
+          prompt: "hi",
+          permissions: [
+            {
+              action: "a".repeat(DEFAULT_OPTIONS.maxPermissionFieldChars + 1),
+              resource: "*",
+              effect: "ask",
+            },
+          ],
+        },
+        "en",
+        DEFAULT_OPTIONS,
+      ),
+    ).toThrow(/action\/resource/i)
+  })
+
+  it("P0-4: prompt limits count Unicode code points, not UTF-16 units", () => {
+    const emojis = "😀".repeat(60_000)
+    expect(emojis.length).toBe(120_000)
+    const parsed = parseOpenInput({ prompt: emojis }, "en", DEFAULT_OPTIONS)
+    expect(parsed.prompt).toBe(emojis)
+    expect(() =>
+      parseOpenInput(
+        { prompt: "😀".repeat(DEFAULT_OPTIONS.maxPromptChars + 1) },
+        "en",
+        DEFAULT_OPTIONS,
+      ),
+    ).toThrow(/prompt/i)
   })
 })

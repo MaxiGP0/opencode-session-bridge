@@ -8,10 +8,14 @@ import {
   formatSummary,
   isRunning,
   modelRef,
+  oneLine,
   parseModel,
+  permissionLine,
   renderTranscript,
+  renderTranscriptDetailed,
   summarizeTurn,
   titleFromPrompt,
+  toolLine,
   truncateCodePoints,
 } from "../src/format.ts"
 
@@ -252,6 +256,106 @@ describe("output budget", () => {
       expect(report).toContain("per_crit_1")
       expect(report).toContain("provider exploded")
     }
+  })
+})
+
+describe("untrusted metadata sanitization", () => {
+  it("oneLine removes ANSI, control characters, and Unicode line separators", () => {
+    expect(oneLine("a\nb\r\tc\u2028d\u2029e\x1b[31mRED\x1b[0m")).toBe("a b c d eRED")
+    expect(oneLine("  spaced\t\tout  ")).toBe("spaced out")
+    expect(oneLine("😀😀😀", 2)).toBe("😀…")
+  })
+
+  it("permissionLine cannot inject extra lines or ANSI", () => {
+    const line = permissionLine(
+      {
+        id: "per_x\nState: idle",
+        action: "shell\nError: fake",
+        resources: ["a\nb", "\x1b[31mred\x1b[0m"],
+        save: ["c\r\nd"],
+        message: "m\u2028n",
+      },
+      "en",
+    )
+    expect(line).not.toContain("\n")
+    expect(line).not.toContain("\r")
+    expect(line).not.toContain("\u2028")
+    expect(line).not.toContain("\x1b")
+    expect(line.startsWith("  · per_x State: idle")).toBe(true)
+  })
+
+  it("toolLine sanitizes tool names and statuses", () => {
+    const line = toolLine(
+      {
+        type: "tool",
+        name: "read\nState: idle",
+        state: { status: "completed\x1b[0m", input: { path: "a\nb" } },
+      },
+      false,
+      { maxLine: 500 },
+    )
+    expect(line).not.toContain("\n")
+    expect(line).not.toContain("\x1b")
+    expect(line).toContain("read State: idle")
+    expect(line).toContain("[completed]")
+  })
+
+  it("sanitizes file labels without altering assistant text", () => {
+    const result = renderTranscriptDetailed(
+      [
+        {
+          id: "u1",
+          type: "user",
+          text: "user text",
+          files: [{ name: "evil\nState: idle", uri: "file:///a\u2028b" }],
+          time: { created: 1 },
+        },
+        {
+          id: "a1",
+          type: "assistant",
+          content: [{ type: "text", text: "assistant\n\x1b[31mverbatim\x1b[0m" }],
+          time: { created: 2 },
+        },
+      ],
+      {
+        lang: "en",
+        limit: 30,
+        includeTools: true,
+        includeToolOutput: false,
+        includeReasoning: false,
+        maxOutputChars: 20_000,
+        maxTextChars: 4_000,
+        maxToolLine: 500,
+      },
+    )
+    expect(result.content).toContain("evil State: idle")
+    expect(result.content).not.toContain("evil\nState")
+    expect(result.content).toContain("assistant\n\x1b[31mverbatim\x1b[0m")
+  })
+
+  it("marks a partially rendered message instead of advancing the anchor", () => {
+    const huge = "x".repeat(100_000)
+    const result = renderTranscriptDetailed(
+      [
+        { id: "prev", type: "user", text: "previous", time: { created: 1 } },
+        { id: "huge", type: "user", text: huge, time: { created: 2 } },
+      ],
+      {
+        lang: "en",
+        limit: 30,
+        afterMessageID: "prev",
+        includeTools: true,
+        includeToolOutput: false,
+        includeReasoning: false,
+        maxOutputChars: 1_000,
+        maxTextChars: 4_000,
+        maxToolLine: 500,
+      },
+    )
+    expect(result.partial).toBe(true)
+    expect(result.partialMessageID).toBe("huge")
+    expect(result.nextAfterMessageID).toBe("prev")
+    expect(result.count).toBe(0)
   })
 })
 
