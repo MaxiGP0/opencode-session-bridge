@@ -709,6 +709,7 @@ describe("waitForTurn", () => {
   })
 
   it("P1-1: session.status retry stays visible and does not fail the wait", async () => {
+    const retryAt = Date.now() + 5_000
     const { ctx } = makeContext({
       context: () => [user("prompt", "hello", 1), assistant("answer", "world", 2), idle("done", 3)],
       events: eventStream(
@@ -717,7 +718,7 @@ describe("waitForTurn", () => {
             type: "session.status",
             data: {
               sessionID: "ses_1",
-              status: { type: "retry", attempt: 2, message: "rate limited", next: 5_000 },
+              status: { type: "retry", attempt: 2, message: "rate limited", next: retryAt },
             },
           },
           { type: "session.idle", data: { sessionID: "ses_1" } },
@@ -737,7 +738,122 @@ describe("waitForTurn", () => {
     })
 
     expect(result.state).toBe("idle")
-    expect(result.retry).toEqual({ attempt: 2, message: "rate limited", next: 5_000 })
+    expect(result.retry).toMatchObject({
+      attempt: 2,
+      message: "rate limited",
+      next: retryAt,
+      at: retryAt,
+      atISO: new Date(retryAt).toISOString(),
+    })
+    expect(result.retry?.inMs).toBeLessThanOrEqual(5_000)
+    expect(result.lastError).toBeUndefined()
+  })
+
+  it("P1-3: session.execution.succeeded completes a turn without an idle message", async () => {
+    const { ctx } = makeContext({
+      context: () => [user("prompt", "hello", 1), assistant("answer", "world", 2)],
+      events: finiteEventStream([
+        { type: "session.execution.succeeded", data: { sessionID: "ses_1" } },
+      ]),
+    })
+    const started = Date.now()
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      timeoutMs: 1_000,
+      requireAnchor: true,
+      pollIntervalMs: 20,
+      permissionPollMs: 1_000,
+    })
+    expect(result.state).toBe("idle")
+    expect(result.idle).toBeUndefined()
+    expect(Date.now() - started).toBeLessThan(800)
+  })
+
+  it("P1-3: session.execution.succeeded completes a user-only turn without an assistant", async () => {
+    const { ctx } = makeContext({
+      context: () => [user("prompt", "hello", 1)],
+      events: finiteEventStream([
+        { type: "session.execution.succeeded", data: { sessionID: "ses_1" } },
+      ]),
+    })
+    const started = Date.now()
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      timeoutMs: 1_000,
+      requireAnchor: true,
+      pollIntervalMs: 20,
+      permissionPollMs: 1_000,
+    })
+    expect(result.state).toBe("idle")
+    expect(Date.now() - started).toBeLessThan(800)
+  })
+
+  it("P1-3: session.retry.scheduled exposes the absolute retry timestamp", async () => {
+    const retryAt = Date.now() + 3_000
+    const { ctx } = makeContext({
+      context: () => [user("prompt", "hello", 1), assistant("answer", "world", 2), idle("done", 3)],
+      events: finiteEventStream([
+        {
+          type: "session.retry.scheduled",
+          data: {
+            sessionID: "ses_1",
+            attempt: 3,
+            at: retryAt,
+            error: { message: "provider overloaded" },
+          },
+        },
+        { type: "session.execution.succeeded", data: { sessionID: "ses_1" } },
+      ]),
+    })
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      timeoutMs: 1_000,
+      requireAnchor: true,
+      pollIntervalMs: 20,
+      permissionPollMs: 1_000,
+    })
+    expect(result.state).toBe("idle")
+    expect(result.retry).toMatchObject({
+      attempt: 3,
+      message: "provider overloaded",
+      next: retryAt,
+      at: retryAt,
+      atISO: new Date(retryAt).toISOString(),
+    })
+  })
+
+  it("P1-3: a foreign execution failure does not stick to a later successful turn", async () => {
+    const snapshots = [
+      [user("prompt", "hello", 1), assistant("answer", "world", 2)],
+      [
+        user("prompt", "hello", 1),
+        assistant("answer", "world", 2),
+        idle("done", 3),
+      ],
+    ]
+    const { ctx } = makeContext({
+      context: (call) => snapshots[Math.min(call - 1, snapshots.length - 1)],
+      events: finiteEventStream([
+        {
+          type: "session.execution.failed",
+          data: { sessionID: "ses_1", error: { message: "previous turn failed" } },
+        },
+        { type: "session.execution.succeeded", data: { sessionID: "ses_1" } },
+      ]),
+    })
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      anchorID: "prompt",
+      timeoutMs: 1_000,
+      requireAnchor: true,
+      pollIntervalMs: 20,
+      permissionPollMs: 1_000,
+    })
+    expect(result.state).toBe("idle")
+    expect(result.idle?.id).toBe("done")
     expect(result.lastError).toBeUndefined()
   })
 })

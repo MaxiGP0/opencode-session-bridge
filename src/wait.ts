@@ -1,4 +1,5 @@
 import { formatError, isRunning } from "./format.ts"
+import { retryInfo } from "./retry.ts"
 import type {
   MessageLike,
   PermissionLike,
@@ -15,8 +16,11 @@ import type {
 const EVENT_TYPES = [
   "session.idle",
   "session.status",
+  "session.execution.started",
+  "session.execution.succeeded",
   "session.execution.failed",
   "session.execution.interrupted",
+  "session.retry.scheduled",
   "permission.asked",
 ] as const
 
@@ -24,6 +28,7 @@ const MAX_CONSECUTIVE_ERRORS = 5
 const MAX_SETTLE_ATTEMPTS = 4
 const MAX_REARMS = 4
 const MAX_WAIT_ERRORS = 2
+const MAX_EVENT_QUEUE = 64
 const INITIAL_SETTLE_DELAY_MS = 25
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000
 const DEFAULT_POLL_MS = 500
@@ -31,8 +36,7 @@ const DEFAULT_MAX_POLL_MS = 2_000
 const DEFAULT_PERMISSION_POLL_MS = 1_500
 const DEFAULT_PROGRESS_INTERVAL_MS = 5_000
 const FALLBACK_CONTEXT_INTERVAL_MS = 5_000
-const FINAL_READ_TIMEOUT_MS = 500
-const FINAL_PERMISSION_TIMEOUT_MS = 250
+const FINAL_BUDGET_MS = 300
 
 export type WaitOptions = {
   sessionID: string
@@ -43,6 +47,10 @@ export type WaitOptions = {
   signal?: AbortSignal
   initialMessages?: MessageLike[]
   initialFetchCount?: number
+  /** Permissions already listed by the caller's preflight. */
+  initialPermissions?: PermissionLike[]
+  /** Epoch ms of the caller's preflight permission.list, if any. */
+  initialPermissionCheckAt?: number
   requireAnchor?: boolean
   promptMessageID?: string
   pollIntervalMs?: number
@@ -392,6 +400,18 @@ function startEventWatcher(
   let closed = false
   let iterator: AsyncIterator<SessionEventLike> | undefined
 
+  const enqueue = (event: SessionEventLike): void => {
+    // Coalesce the two high-frequency state events and bound the queue; a
+    // slow settle must not grow memory with duplicates.
+    if (event.type === "session.status" || event.type === "session.retry.scheduled") {
+      for (let index = queue.length - 1; index >= 0; index--) {
+        if (queue[index]?.type === event.type) queue.splice(index, 1)
+      }
+    }
+    if (queue.length >= MAX_EVENT_QUEUE) queue.shift()
+    queue.push(event)
+  }
+
   try {
     const stream = ctx.event.subscribe({
       types: [...EVENT_TYPES],
@@ -410,7 +430,7 @@ function startEventWatcher(
             pending = undefined
             resolve(event)
           } else {
-            queue.push(event)
+            enqueue(event)
           }
         }
       } catch {
@@ -444,6 +464,7 @@ function startEventWatcher(
         const type = event?.type
         if (
           type === "session.idle" ||
+          type === "session.execution.succeeded" ||
           type === "session.execution.failed" ||
           type === "session.execution.interrupted" ||
           (type === "session.status" && event?.data?.status?.type === "idle")
@@ -458,10 +479,16 @@ function startEventWatcher(
       return closed
     },
     async close() {
+      if (pending) {
+        const resolve = pending
+        pending = undefined
+        resolve(undefined)
+      }
       controller.abort()
       signal.removeEventListener("abort", onAbort)
       try {
-        void Promise.resolve(iterator?.return?.()).catch(() => undefined)
+        const returned = Promise.resolve(iterator?.return?.()).catch(() => undefined)
+        await Promise.race([returned, sleep(50)])
       } catch {
         // Ignore iterator cleanup errors.
       }
@@ -531,6 +558,7 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
   let lastContextAt = 0
   let errorEvent: string | undefined
   let retry: RetryInfo | undefined
+  let sawSuccessEvent = false
   let forcePoll = false
   let settleRemaining = 0
   let settleDelayMs = Math.min(pollInterval, INITIAL_SETTLE_DELAY_MS)
@@ -580,6 +608,7 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
       anchorCreatedAt,
       terminalSignal: resolvedSignal,
       retry,
+      permissionCheckedAt: lastPermissionCheck || undefined,
       ...extra,
     }
   }
@@ -593,50 +622,64 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
     finalizing = true
     const userSignal = options.signal
     if (!userSignal?.aborted) {
-      const readSignal = userSignal ?? new AbortController().signal
+      // A single shared budget keeps the final read within the end-to-end
+      // timeout instead of spending 250ms + 500ms sequentially.
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), FINAL_BUDGET_MS)
+      const onUserAbort = () => controller.abort(userSignal?.reason)
+      if (userSignal) {
+        if (userSignal.aborted) controller.abort(userSignal.reason)
+        else userSignal.addEventListener("abort", onUserAbort, { once: true })
+      }
       try {
-        const pending = await listPermissions(
-          ctx,
-          options.sessionID,
-          readSignal,
-          Math.min(requestTimeout, FINAL_PERMISSION_TIMEOUT_MS),
-        )
-        if (pending.length) {
-          pendingPermissions = pending
+        const [permissionResult, contextResult] = await Promise.allSettled([
+          listPermissions(ctx, options.sessionID, controller.signal, FINAL_BUDGET_MS),
+          fetchContext(ctx, options.sessionID, controller.signal, FINAL_BUDGET_MS),
+        ])
+        lastPermissionCheck = Date.now()
+        if (permissionResult.status === "fulfilled" && permissionResult.value.length) {
+          pendingPermissions = permissionResult.value
           return finish("permission", {
-            pendingPermissions: pending,
+            pendingPermissions: permissionResult.value,
             terminalSignal: "timeout",
           })
         }
-      } catch {
-        // Permission listing is best effort at the deadline.
-      }
-      try {
-        const lastMessages = await fetchContext(
-          ctx,
-          options.sessionID,
-          readSignal,
-          Math.min(requestTimeout, FINAL_READ_TIMEOUT_MS),
-        )
-        fetchCount++
-        messages = lastMessages
-        const evaluation = evaluateTurn(lastMessages, options)
-        startIndex = evaluation.startIndex
-        endIndex = evaluation.endIndex
-        anchorMessage = evaluation.anchorMessage
-        anchorCreatedAt = evaluation.anchorCreatedAt
-        queued = evaluation.queued
-        if (evaluation.done) {
-          queued = false
-          return finish("idle", {
-            idle: evaluation.idle,
-            endIndex: evaluation.endIndex,
-            lastError: evaluation.idle?.error?.message ?? lastError,
-            queued: false,
-          })
+        if (contextResult.status === "fulfilled") {
+          fetchCount++
+          messages = contextResult.value
+          const evaluation = evaluateTurn(messages, options)
+          startIndex = evaluation.startIndex
+          endIndex = evaluation.endIndex
+          anchorMessage = evaluation.anchorMessage
+          anchorCreatedAt = evaluation.anchorCreatedAt
+          queued = evaluation.queued
+          if (evaluation.done) {
+            queued = false
+            return finish("idle", {
+              idle: evaluation.idle,
+              endIndex: evaluation.endIndex,
+              lastError: evaluation.idle?.error?.message,
+              queued: false,
+            })
+          }
+          if (
+            sawSuccessEvent &&
+            (evaluation.hasTurnAssistant || evaluation.anchorMessage?.type === "user") &&
+            !evaluation.queued
+          ) {
+            queued = false
+            return finish("idle", {
+              endIndex: evaluation.endIndex,
+              lastError: evaluation.idle?.error?.message,
+              queued: false,
+            })
+          }
         }
       } catch {
-        // The turn may have completed, but the final read is best effort only.
+        // The final read is best effort only.
+      } finally {
+        clearTimeout(timer)
+        userSignal?.removeEventListener("abort", onUserAbort)
       }
     }
     return finish("timeout", { terminalSignal: "timeout" })
@@ -657,22 +700,32 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
         startIndex: evaluation.startIndex,
         endIndex: evaluation.endIndex,
         idle: evaluation.idle,
-        lastError: evaluation.idle?.error?.message ?? lastError,
+        lastError: evaluation.idle?.error?.message,
         queued: false,
       })
     }
   }
 
-  try {
-    const pending = await listPermissions(ctx, options.sessionID, controller.signal, requestTimeout)
-    lastPermissionCheck = Date.now()
-    if (pending.length) {
-      pendingPermissions = pending
-      return finish("permission", { pendingPermissions: pending })
+  if (options.initialPermissions?.length) {
+    pendingPermissions = options.initialPermissions
+    return finish("permission", { pendingPermissions: options.initialPermissions })
+  }
+  if (options.initialPermissions) pendingPermissions = options.initialPermissions
+  if (options.initialPermissionCheckAt) lastPermissionCheck = options.initialPermissionCheckAt
+  const permissionCheckIsFresh =
+    lastPermissionCheck > 0 && Date.now() - lastPermissionCheck < permissionPoll
+  if (!permissionCheckIsFresh) {
+    try {
+      const pending = await listPermissions(ctx, options.sessionID, controller.signal, requestTimeout)
+      lastPermissionCheck = Date.now()
+      if (pending.length) {
+        pendingPermissions = pending
+        return finish("permission", { pendingPermissions: pending })
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) lastError = formatError(error)
+      lastPermissionCheck = Date.now()
     }
-  } catch (error) {
-    if (!controller.signal.aborted) lastError = formatError(error)
-    lastPermissionCheck = Date.now()
   }
 
   let watcher = startEventWatcher(ctx, options.sessionID, controller.signal)
@@ -708,8 +761,11 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
       const waited = await sleep(Math.min(delayMs, remaining), controller.signal)
       if (!waited) return false
     }
-    settleRemaining = 0
-    settleDelayMs = Math.max(10, Math.min(pollInterval, INITIAL_SETTLE_DELAY_MS))
+    // Preserve an active settle window: re-arming the primary signals must not
+    // discard a terminal event that is still being persisted.
+    if (settleRemaining === 0) {
+      settleDelayMs = Math.max(10, Math.min(pollInterval, INITIAL_SETTLE_DELAY_MS))
+    }
     forcePoll = false
     armPrimarySignals()
     return true
@@ -834,11 +890,13 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
                 controller.signal,
                 requestTimeout,
               )
+              lastPermissionCheck = Date.now()
               if (pending.length) {
                 pendingPermissions = pending
                 return finish("permission", { pendingPermissions: pending })
               }
             } catch (error) {
+              lastPermissionCheck = Date.now()
               if (!controller.signal.aborted) lastError = formatError(error)
             }
             continue
@@ -846,11 +904,8 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
           if (event.type === "session.status") {
             const status: SessionStatusLike | undefined = event.data?.status
             if (status?.type === "retry") {
-              retry = {
-                attempt: status.attempt,
-                message: status.message,
-                next: status.next,
-              }
+              retry = retryInfo(status.attempt, status.message, status.next)
+              sawSuccessEvent = false
               if (!controller.signal.aborted) {
                 try {
                   options.onProgress?.({
@@ -872,12 +927,49 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
             }
             if (status?.type === "idle") {
               errorEvent = undefined
+              sawSuccessEvent = true
               terminalSignal = "event"
               receivedTerminalSignal = true
             }
+          } else if (event.type === "session.retry.scheduled") {
+            const attempt =
+              typeof event.data?.attempt === "number"
+                ? event.data.attempt
+                : (retry?.attempt ?? 0) + 1
+            const next =
+              typeof event.data?.at === "number" ? event.data.at : Date.now()
+            retry = retryInfo(
+              attempt,
+              event.data?.error?.message ?? "retry scheduled",
+              next,
+            )
+            sawSuccessEvent = false
+            if (!controller.signal.aborted) {
+              try {
+                options.onProgress?.({
+                  elapsedMs: Date.now() - started,
+                  fetchCount,
+                  lastEvent: "retry",
+                  state: "retrying",
+                  retry,
+                })
+              } catch {
+                // Progress reporting must never break the wait.
+              }
+            }
+            continue
+          } else if (event.type === "session.execution.started") {
+            sawSuccessEvent = false
+            continue
+          } else if (event.type === "session.execution.succeeded") {
+            errorEvent = undefined
+            sawSuccessEvent = true
+            terminalSignal = "event"
+            receivedTerminalSignal = true
           } else if (event.type === "session.execution.failed") {
             errorEvent = event.data?.error?.message ?? "session.execution.failed"
             lastError = errorEvent
+            sawSuccessEvent = false
             terminalSignal = "event"
             receivedTerminalSignal = true
           } else if (event.type === "session.execution.interrupted") {
@@ -885,10 +977,12 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
               ? `interrupted: ${event.data.reason}`
               : "session.execution.interrupted"
             lastError = errorEvent
+            sawSuccessEvent = false
             terminalSignal = "event"
             receivedTerminalSignal = true
           } else if (event.type === "session.idle") {
             errorEvent = undefined
+            sawSuccessEvent = true
             terminalSignal = "event"
             receivedTerminalSignal = true
           }
@@ -995,22 +1089,40 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
         return finish("idle", {
           idle: evaluation.idle,
           endIndex: evaluation.endIndex,
-          lastError: evaluation.idle?.error?.message ?? lastError,
+          lastError: evaluation.idle?.error?.message,
           queued: false,
         })
       }
 
       if (errorEvent && settleRemaining === 0) {
         // A failure for a queued turn that has not started yet is not the
-        // anchored turn's failure. Give the primary signals one more chance.
+        // anchored turn's failure. Clear it before re-arming so it cannot leak
+        // into the result of the anchored turn.
         if (evaluation.queued && rearmCount < MAX_REARMS) {
           const ok = await rearmSignals(Math.min(pollInterval, 250))
           if (ok) {
+            errorEvent = undefined
+            lastError = undefined
             pollMs = pollInterval
             continue
           }
         }
         return finish("error")
+      }
+
+      // Durable execution events can complete a turn even when the transcript
+      // never persists an `idle` message within the settle window.
+      if (
+        settleRemaining === 0 &&
+        sawSuccessEvent &&
+        (evaluation.hasTurnAssistant || evaluation.anchorMessage?.type === "user") &&
+        !evaluation.queued
+      ) {
+        return finish("idle", {
+          endIndex: evaluation.endIndex,
+          lastError: evaluation.idle?.error?.message,
+          queued: false,
+        })
       }
 
       if (settleRemaining === 0 && !receivedTerminalSignal) {
