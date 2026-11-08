@@ -21,13 +21,22 @@ export type LiveSnapshot = {
   pending: LivePending[]
   status?: SessionStatusLike
   statusAt?: number
+  lastOutcome?: string
+  lastError?: string
 }
 
 export type LiveStateOptions = {
   ttlMs?: number
+  pendingTtlMs?: number
   maxPerSession?: number
   maxSessions?: number
   now?: () => number
+}
+
+export type LiveStats = {
+  sessions: number
+  pending: number
+  lastEventAt?: number
 }
 
 export type LiveState = {
@@ -36,6 +45,7 @@ export type LiveState = {
   markDelivered: (sessionID: string, messageID: string) => void
   reconcile: (sessionID: string, messages: MessageLike[]) => void
   get: (sessionID: string) => LiveSnapshot
+  stats: () => LiveStats
   clearSession: (sessionID: string) => void
   clear: () => void
 }
@@ -44,6 +54,8 @@ type LiveSession = {
   pending: Map<string, LivePending>
   status?: SessionStatusLike
   statusAt?: number
+  lastOutcome?: string
+  lastError?: string
   at: number
 }
 
@@ -53,10 +65,12 @@ const DEFAULT_MAX_SESSIONS = 500
 
 export function createLiveState(options: LiveStateOptions = {}): LiveState {
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
+  const pendingTtlMs = options.pendingTtlMs ?? ttlMs
   const maxPerSession = Math.max(1, options.maxPerSession ?? DEFAULT_MAX_PER_SESSION)
   const maxSessions = Math.max(1, options.maxSessions ?? DEFAULT_MAX_SESSIONS)
   const now = options.now ?? Date.now
   const sessions = new Map<string, LiveSession>()
+  let lastEventAt: number | undefined
 
   const touch = (sessionID: string): LiveSession => {
     const current = sessions.get(sessionID)
@@ -78,7 +92,9 @@ export function createLiveState(options: LiveStateOptions = {}): LiveState {
 
   const pruneSession = (session: LiveSession): void => {
     for (const [messageID, entry] of session.pending) {
-      if (ttlMs > 0 && now() - entry.at > ttlMs) session.pending.delete(messageID)
+      if (pendingTtlMs > 0 && now() - entry.at > pendingTtlMs) {
+        session.pending.delete(messageID)
+      }
     }
     if (session.pending.size > maxPerSession) {
       const entries = [...session.pending.values()].sort((a, b) => a.at - b.at)
@@ -133,6 +149,7 @@ export function createLiveState(options: LiveStateOptions = {}): LiveState {
     applyEvent(event) {
       const sessionID = event.data?.sessionID
       if (!sessionID) return
+      lastEventAt = now()
       if (event.type === "session.status") {
         const status = event.data?.status
         if (!status || typeof status.type !== "string") return
@@ -145,6 +162,51 @@ export function createLiveState(options: LiveStateOptions = {}): LiveState {
       if (event.type === "session.idle") {
         const session = touch(sessionID)
         session.status = { type: "idle" }
+        session.statusAt = now()
+        return
+      }
+      if (event.type === "session.execution.started") {
+        const session = touch(sessionID)
+        session.status = { type: "busy" }
+        session.statusAt = now()
+        return
+      }
+      if (event.type === "session.execution.succeeded") {
+        const session = touch(sessionID)
+        session.status = { type: "idle" }
+        session.statusAt = now()
+        session.lastOutcome = "succeeded"
+        session.lastError = undefined
+        return
+      }
+      if (event.type === "session.execution.failed") {
+        const session = touch(sessionID)
+        session.status = { type: "idle" }
+        session.statusAt = now()
+        session.lastOutcome = "failed"
+        session.lastError = event.data?.error?.message ?? "session.execution.failed"
+        return
+      }
+      if (event.type === "session.execution.interrupted") {
+        const session = touch(sessionID)
+        session.status = { type: "idle" }
+        session.statusAt = now()
+        session.lastOutcome = "interrupted"
+        session.lastError = event.data?.reason
+          ? `interrupted: ${event.data.reason}`
+          : undefined
+        return
+      }
+      if (event.type === "session.retry.scheduled") {
+        const session = touch(sessionID)
+        const attempt =
+          typeof event.data?.attempt === "number" ? event.data.attempt : 1
+        session.status = {
+          type: "retry",
+          attempt,
+          message: event.data?.error?.message ?? "retry scheduled",
+          next: typeof event.data?.at === "number" ? event.data.at : now(),
+        }
         session.statusAt = now()
         return
       }
@@ -189,13 +251,27 @@ export function createLiveState(options: LiveStateOptions = {}): LiveState {
       pruneSession(session)
       const pending = [...session.pending.values()].sort((a, b) => a.at - b.at)
       if (pending.length === 0 && session.status === undefined) sessions.delete(sessionID)
-      return { pending, status: session.status, statusAt: session.statusAt }
+      return {
+        pending,
+        status: session.status,
+        statusAt: session.statusAt,
+        lastOutcome: session.lastOutcome,
+        lastError: session.lastError,
+      }
+    },
+    stats() {
+      let pending = 0
+      for (const session of sessions.values()) {
+        pending += session.pending.size
+      }
+      return { sessions: sessions.size, pending, lastEventAt }
     },
     clearSession(sessionID) {
       sessions.delete(sessionID)
     },
     clear() {
       sessions.clear()
+      lastEventAt = undefined
     },
   }
 }
