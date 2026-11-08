@@ -297,3 +297,149 @@ export async function forgetOpenSessionsBySessionID(
   }
   if (changed) await persistOpenSessions(ctx, mapping)
 }
+
+export type RegistryStats = {
+  owned: number
+  open: number
+  dirtyOwned: boolean
+  dirtyOpen: boolean
+  flushPending: boolean
+  lastFlushAt?: number
+}
+
+export type RegistryPersistence = {
+  rememberOpen: (messageID: string, sessionID: string, directory?: string) => void
+  rememberOwned: (sessionID: string, directory?: string) => void
+  forgetOwned: (sessionID: string) => void
+  forgetOpenBySessionID: (sessionID: string) => void
+  flush: () => Promise<void>
+  stats: () => RegistryStats
+  dispose: () => Promise<void>
+}
+
+type RegistryPersistenceOptions = {
+  /** Debounce window for coalesced writes. */
+  flushDelayMs?: number
+}
+
+/**
+ * Coalesces registry writes so `open` does not block the prompt on two full
+ * map serializations. In-memory state is authoritative for the current
+ * process; `flush()` is called by cleanup and destructive operations.
+ */
+export function createRegistryPersistence(
+  ctx: PluginContext,
+  owned: OwnedSessions,
+  open: OpenSessionMapping,
+  options: RegistryPersistenceOptions = {},
+): RegistryPersistence {
+  const directory = directoryOf(ctx)
+  const flushDelayMs = Math.max(1, options.flushDelayMs ?? 250)
+  let dirtyOwned = false
+  let dirtyOpen = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let flushing: Promise<void> | undefined
+  let lastFlushAt: number | undefined
+
+  async function flush(): Promise<void> {
+    // If a coalesced flush is already running, wait for it and then flush any
+    // state that became dirty while it was in flight.
+    while (flushing) {
+      try {
+        await flushing
+      } catch {
+        // persistOwnedSessions/persistOpenSessions already swallow errors.
+      }
+    }
+    const writeOwned = dirtyOwned
+    const writeOpen = dirtyOpen
+    if (!writeOwned && !writeOpen) return
+    dirtyOwned = false
+    dirtyOpen = false
+    const current = (async () => {
+      const jobs: Promise<void>[] = []
+      if (writeOwned) jobs.push(persistOwnedSessions(ctx, owned))
+      if (writeOpen) jobs.push(persistOpenSessions(ctx, open))
+      await Promise.all(jobs)
+    })()
+    flushing = current
+    try {
+      await current
+      lastFlushAt = Date.now()
+    } finally {
+      if (flushing === current) flushing = undefined
+      if (dirtyOwned || dirtyOpen) schedule()
+    }
+  }
+
+  function schedule(): void {
+    if (timer !== undefined) return
+    timer = setTimeout(() => {
+      timer = undefined
+      void flush()
+    }, flushDelayMs)
+    const handle = timer as unknown as { unref?: () => void }
+    if (typeof handle.unref === "function") handle.unref()
+  }
+
+  return {
+    rememberOpen(messageID, sessionID, targetDirectory = directory) {
+      open.delete(messageID)
+      open.set(messageID, {
+        sessionID,
+        at: Date.now(),
+        ...(targetDirectory ? { directory: targetDirectory } : {}),
+      })
+      pruneOpenSessions(open, Date.now(), directory)
+      dirtyOpen = true
+      schedule()
+    },
+    rememberOwned(sessionID, targetDirectory = directory) {
+      owned.delete(sessionID)
+      owned.set(sessionID, {
+        at: Date.now(),
+        ...(targetDirectory ? { directory: targetDirectory } : {}),
+      })
+      pruneOwnedSessions(owned)
+      dirtyOwned = true
+      schedule()
+    },
+    forgetOwned(sessionID) {
+      if (owned.delete(sessionID)) {
+        dirtyOwned = true
+        schedule()
+      }
+    },
+    forgetOpenBySessionID(sessionID) {
+      let changed = false
+      for (const [messageID, entry] of open) {
+        if (entry.sessionID === sessionID) {
+          open.delete(messageID)
+          changed = true
+        }
+      }
+      if (changed) {
+        dirtyOpen = true
+        schedule()
+      }
+    },
+    flush,
+    stats() {
+      return {
+        owned: owned.size,
+        open: open.size,
+        dirtyOwned,
+        dirtyOpen,
+        flushPending: flushing !== undefined,
+        lastFlushAt,
+      }
+    },
+    async dispose() {
+      if (timer !== undefined) {
+        clearTimeout(timer)
+        timer = undefined
+      }
+      await flush()
+    },
+  }
+}

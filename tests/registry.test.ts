@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
+  createRegistryPersistence,
   forgetOpenSessionsBySessionID,
   forgetOwnedSession,
   isOwnedSession,
@@ -98,5 +99,45 @@ describe("session registry", () => {
 
     const loaded = await loadOpenSessions(ctx)
     expect(loaded.has("msg_other")).toBe(false)
+  })
+
+  it("P1-7: coalesces registry writes and flushes the final state", async () => {
+    const stored = new Map<string, unknown>()
+    let writes = 0
+    const ctx = {
+      location: { directory: "C:/repo" },
+      storage: {
+        get: async (key: string) => stored.get(key),
+        set: async (key: string, value: unknown) => {
+          writes++
+          stored.set(key, value)
+        },
+        remove: async (key: string) => {
+          stored.delete(key)
+        },
+        scan: async () => ({ entries: [] }),
+      },
+    } as unknown as PluginContext
+    const owned: OwnedSessions = new Map()
+    const open: OpenSessionMapping = new Map()
+    const store = createRegistryPersistence(ctx, owned, open, { flushDelayMs: 60_000 })
+
+    for (let index = 0; index < 10; index++) {
+      store.rememberOwned(`ses_${index}`, "C:/repo")
+      store.rememberOpen(`msg_${index}`, `ses_${index}`, "C:/repo")
+    }
+    expect(writes).toBe(0)
+    expect(store.stats()).toMatchObject({ owned: 10, open: 10, dirtyOwned: true, dirtyOpen: true })
+
+    await store.flush()
+    expect(writes).toBe(2)
+    expect(store.stats()).toMatchObject({ dirtyOwned: false, dirtyOpen: false })
+    expect((await loadOwnedSessions(ctx)).size).toBe(10)
+    expect((await loadOpenSessions(ctx)).size).toBe(10)
+
+    store.forgetOwned("ses_0")
+    await store.flush()
+    expect((await loadOwnedSessions(ctx)).has("ses_0")).toBe(false)
+    await store.dispose()
   })
 })
