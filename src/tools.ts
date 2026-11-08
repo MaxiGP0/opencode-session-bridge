@@ -11,6 +11,7 @@ import {
   lastIdle,
   lastUser,
   modelRef,
+  oneLine,
   parseModel,
   permissionLine,
   renderTranscriptDetailed,
@@ -24,6 +25,7 @@ import { type LiveState, type LiveSnapshot } from "./live.ts"
 import type { BridgeOptions } from "./options.ts"
 import {
   boundError,
+  boundOutputTotal,
   boundPendingPermissions,
   boundTitle,
   boundedPermissionLine,
@@ -31,7 +33,6 @@ import {
   errorOutput,
   outputBudget,
   stringField,
-  type OutputBudget,
 } from "./output.ts"
 import {
   clearQueuedPrompts,
@@ -50,7 +51,9 @@ import {
   rememberOwnedSession,
   type OpenSessionMapping,
   type OwnedSessions,
+  type RegistryPersistence,
 } from "./registry.ts"
+import { refreshRetry, retryInfo, retryRemainingMs } from "./retry.ts"
 import type {
   Lang,
   PluginContext,
@@ -64,6 +67,8 @@ import type {
   TurnResult,
 } from "./types.ts"
 import {
+  parseCompactInput,
+  parseDiagnosticsInput,
   parseInterruptInput,
   parseLanguageInput,
   parseListInput,
@@ -77,8 +82,65 @@ import {
   parseUpdateInput,
   parseWaitInput,
   ValidationError,
+  type OpenInput,
 } from "./validation.ts"
 import { evaluateTurn, requestSignal, waitForTurn } from "./wait.ts"
+
+export type OpenAdmission =
+  | {
+      ok: true
+      session: SessionInfo
+      admitted: Awaited<ReturnType<PluginContext["session"]["prompt"]>>
+      reused: boolean
+      title: string
+    }
+  | {
+      ok: false
+      error: unknown
+      sessionID?: string
+      title: string
+      messageID?: string
+    }
+
+export type OpenInflight = {
+  signature: string
+  controller: AbortController
+  promise: Promise<OpenAdmission>
+  waiters: number
+  settled: boolean
+}
+
+export type SentMessageEntry = {
+  signature: string
+  at: number
+  admittedID?: string
+  admittedAt?: number
+}
+
+export type SentMessages = Map<string, SentMessageEntry>
+
+export type SendAdmission =
+  | {
+      ok: true
+      session: SessionInfo
+      admittedID: string
+      admittedAt: number
+      applied: string[]
+      alreadySent: boolean
+    }
+  | {
+      ok: false
+      error: unknown
+      applied: string[]
+    }
+
+export type SendInflight = {
+  signature: string
+  controller: AbortController
+  promise: Promise<SendAdmission>
+  waiters: number
+  settled: boolean
+}
 
 export type ToolDeps = {
   ctx: PluginContext
@@ -89,7 +151,10 @@ export type ToolDeps = {
   openSessions?: OpenSessionMapping
   queuedPrompts?: QueuedPrompts
   liveState?: LiveState
-  inFlightOpens?: Map<string, Promise<ToolExecutionResult>>
+  inFlightOpens?: Map<string, OpenInflight>
+  inFlightSends?: Map<string, SendInflight>
+  sentMessages?: SentMessages
+  registry?: RegistryPersistence
 }
 
 type ToolDefinition = Omit<RegisteredTool, "execute">
@@ -126,19 +191,31 @@ const schema = (value: Record<string, unknown>): ToolDefinition["input"] =>
 const outputSchema = (value: Record<string, unknown>): ToolDefinition["output"] =>
   value as ToolDefinition["output"]
 
-const permissionRuleSchema = {
-  type: "object",
-  properties: {
-    action: { type: "string", description: "Action to match, for example edit, shell, or webfetch." },
-    resource: { type: "string", description: "Resource or glob pattern to match." },
-    effect: {
-      type: "string",
-      enum: ["allow", "deny", "ask"],
-      description: "Whether to allow, deny, or ask for matching actions.",
+const PLUGIN_VERSION = "2.0.0"
+
+function permissionRuleSchemaFor(deps: ToolDeps) {
+  return {
+    type: "object",
+    properties: {
+      action: {
+        type: "string",
+        maxLength: deps.options.maxPermissionFieldChars,
+        description: "Action to match, for example edit, shell, or webfetch.",
+      },
+      resource: {
+        type: "string",
+        maxLength: deps.options.maxPermissionFieldChars,
+        description: "Resource or glob pattern to match.",
+      },
+      effect: {
+        type: "string",
+        enum: ["allow", "deny", "ask"],
+        description: "Whether to allow, deny, or ask for matching actions.",
+      },
     },
-  },
-  required: ["action", "resource", "effect"],
-  additionalProperties: false,
+    required: ["action", "resource", "effect"],
+    additionalProperties: false,
+  }
 }
 
 const timeoutSchema = {
@@ -184,7 +261,9 @@ const retrySchema = {
   properties: {
     attempt: { type: "number" },
     message: { type: "string" },
-    next: { type: "number" },
+    next: { type: "number", description: "Absolute epoch milliseconds." },
+    retryAt: { type: "string", description: "ISO timestamp of the next attempt." },
+    retryInMs: { type: "number", description: "Milliseconds remaining at read time." },
   },
   required: [],
   additionalProperties: true,
@@ -212,6 +291,8 @@ const turnOutput = outputSchema({
     error: { type: "string" },
     errorTruncated: { type: "boolean" },
     reused: { type: "boolean" },
+    alreadySent: { type: "boolean" },
+    permissionCheckedAt: { type: "number" },
   },
   additionalProperties: true,
 })
@@ -241,6 +322,15 @@ const statusOutput = outputSchema({
     retry: retrySchema,
     error: { type: "string" },
     errorTruncated: { type: "boolean" },
+    contextError: { type: "string" },
+    permissionError: { type: "string" },
+    transcriptAvailable: { type: "boolean" },
+    permissionsAvailable: { type: "boolean" },
+    liveStale: { type: "boolean" },
+    statusAt: { type: "number" },
+    lastError: { type: "string" },
+    toolsTruncated: { type: "boolean" },
+    queuedTruncated: { type: "boolean" },
     includeTools: { type: "boolean" },
     includeText: { type: "boolean" },
   },
@@ -256,6 +346,8 @@ const readOutput = outputSchema({
     hasMore: { type: "boolean" },
     truncated: { type: "boolean" },
     count: { type: "number" },
+    partial: { type: "boolean" },
+    partialMessageID: { type: "string" },
     state: outputStateSchema,
     error: { type: "string" },
   },
@@ -282,6 +374,7 @@ const listOutput = outputSchema({
     sessions: { type: "array", items: { type: "object", additionalProperties: true } },
     nextCursor: { type: "string" },
     count: { type: "number" },
+    sessionsTruncated: { type: "boolean" },
     state: outputStateSchema,
     error: { type: "string" },
   },
@@ -332,6 +425,9 @@ const interruptOutput = outputSchema({
   properties: {
     sessionID: { type: "string" },
     interrupted: { type: "boolean" },
+    queueCleared: { type: "boolean" },
+    queueResumed: { type: "number" },
+    queuedCount: { type: "number" },
     state: outputStateSchema,
     error: { type: "string" },
   },
@@ -343,6 +439,21 @@ const languageOutput = outputSchema({
   properties: {
     language: { type: "string", enum: ["es", "en"] },
     changed: { type: "boolean" },
+    state: outputStateSchema,
+    error: { type: "string" },
+  },
+  additionalProperties: true,
+})
+
+const diagnosticsOutput = outputSchema({
+  type: "object",
+  properties: {
+    version: { type: "string" },
+    capabilities: { type: "object", additionalProperties: true },
+    registry: { type: "object", additionalProperties: true },
+    live: { type: "object", additionalProperties: true },
+    queues: { type: "object", additionalProperties: true },
+    options: { type: "object", additionalProperties: true },
     state: outputStateSchema,
     error: { type: "string" },
   },
@@ -384,16 +495,116 @@ async function assertPermission(
   }
 }
 
+function abortError(signal: AbortSignal): unknown {
+  if (signal.reason instanceof Error) return signal.reason
+  return new DOMException("The operation was aborted", "AbortError")
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw abortError(signal)
+}
+
 async function withRequest<T>(
   signal: AbortSignal,
   timeoutMs: number,
   fn: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
+  throwIfAborted(signal)
   const request = requestSignal(signal, timeoutMs)
   try {
-    return await fn(request.signal)
+    const result = await fn(request.signal)
+    // A host abort must never be reported as a successful tool result, even
+    // if the underlying client ignored the signal.
+    throwIfAborted(signal)
+    // A per-request timeout is an ordinary structured error, not a host abort.
+    if (request.signal.aborted && !signal.aborted) {
+      throw request.signal.reason ?? new DOMException("Request timed out", "TimeoutError")
+    }
+    return result
   } finally {
     request.cleanup()
+  }
+}
+
+function awaitWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  throwIfAborted(signal)
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    const finish = (fn: () => void) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener("abort", onAbort)
+      fn()
+    }
+    const onAbort = () => finish(() => reject(abortError(signal)))
+    signal.addEventListener("abort", onAbort, { once: true })
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    )
+  })
+}
+
+function signatureOf(value: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+function openSignature(data: OpenInput, directory: string | undefined): string {
+  return signatureOf({
+    sessionID: data.sessionID,
+    prompt: data.prompt,
+    title: data.title,
+    agent: data.agent,
+    model: data.model,
+    delivery: data.delivery,
+    permissions: data.permissions,
+    directory,
+  })
+}
+
+function sendSignature(data: {
+  sessionID: string
+  prompt: string
+  agent?: string
+  model?: string
+  delivery: "steer" | "queue"
+}): string {
+  return signatureOf({
+    sessionID: data.sessionID,
+    prompt: data.prompt,
+    agent: data.agent,
+    model: data.model,
+    delivery: data.delivery,
+  })
+}
+
+function sameModel(
+  current: { providerID: string; id: string; variant?: string } | undefined,
+  target: { providerID: string; id: string; variant?: string } | undefined,
+): boolean {
+  if (!current || !target) return false
+  return (
+    current.providerID === target.providerID &&
+    current.id === target.id &&
+    (current.variant ?? undefined) === (target.variant ?? undefined)
+  )
+}
+
+function rememberSentMessage(
+  sentMessages: SentMessages,
+  key: string,
+  entry: SentMessageEntry,
+): void {
+  sentMessages.delete(key)
+  sentMessages.set(key, entry)
+  while (sentMessages.size > 500) {
+    const oldest = sentMessages.keys().next().value
+    if (typeof oldest !== "string") break
+    sentMessages.delete(oldest)
   }
 }
 
@@ -408,9 +619,12 @@ function progressFor(context: ToolExecuteContext, sessionID: string) {
     if (info.lastEvent) update.lastEvent = info.lastEvent
     if (info.state) update.state = info.state
     if (info.retry) {
-      update.retryAttempt = info.retry.attempt
-      update.retryNext = info.retry.next
-      update.retryMessage = truncateCodePoints(info.retry.message, 1_000)
+      const current = refreshRetry(info.retry)
+      update.retryAttempt = current.attempt
+      update.retryNext = current.next
+      update.retryAt = current.atISO ?? ""
+      update.retryInMs = current.inMs ?? 0
+      update.retryMessage = truncateCodePoints(current.message, 1_000)
     }
     void context.progress(update).catch(() => undefined)
   }
@@ -429,7 +643,7 @@ function waitConfig(deps: ToolDeps, context: ToolExecuteContext, sessionID: stri
 
 function sessionHeader(lang: Lang, session: SessionInfo): string {
   const title = session.title ? sanitizeTitle(session.title) : t(lang, "noTitle")
-  return `${t(lang, "session")}: ${session.id}\n${t(lang, "title")}: ${title}`
+  return `${t(lang, "session")}: ${oneLine(session.id, 256)}\n${t(lang, "title")}: ${title}`
 }
 
 function modelLabel(session: SessionInfo): string {
@@ -561,18 +775,22 @@ function retryOutput(
   maxChars = 1_000,
 ): Record<string, unknown> | undefined {
   if (!retry) return undefined
+  const current = refreshRetry(retry)
   return {
-    attempt: retry.attempt,
-    message: truncateCodePoints(retry.message, maxChars),
-    next: retry.next,
+    attempt: current.attempt,
+    message: oneLine(current.message, maxChars),
+    next: current.next,
+    retryAt: current.atISO,
+    retryInMs: current.inMs,
   }
 }
 
 function retryLabel(lang: Lang, retry: RetryInfo): string {
+  const seconds = Math.ceil(retryRemainingMs(retry) / 1_000)
   return `${t(lang, "retrying")} (${t(lang, "retryAttempt", {
     attempt: retry.attempt,
   })}; ${t(lang, "retryNext", {
-    seconds: Math.max(0, Math.ceil(retry.next / 1_000)),
+    seconds,
   })})`
 }
 
@@ -612,6 +830,7 @@ function turnOutputValue(
     fetchCount: turn.fetchCount,
     queued: Boolean(turn.queued),
     retry: retryOutput(turn.retry, budget.maxErrorChars),
+    permissionCheckedAt: turn.permissionCheckedAt,
     pendingPermissions: pending.pendingPermissions,
     pendingTotal: pending.pendingTotal,
     pendingTruncated: pending.pendingTruncated,
@@ -644,27 +863,38 @@ function errorFor(
 
 function maxOutputSchemaFor(deps: ToolDeps) {
   return {
-    type: "integer",
-    minimum: 0,
-    maximum: deps.options.maxOutputChars,
-    description: `Maximum output characters. 0 uses the plugin default (${deps.options.maxOutputChars}).`,
+    anyOf: [
+      { const: 0 },
+      {
+        type: "integer",
+        minimum: 1_000,
+        maximum: deps.options.maxOutputChars,
+      },
+    ],
+    description: `Maximum output characters. 0 uses the plugin default (${deps.options.maxOutputChars}); otherwise the minimum is 1000.`,
   }
 }
 
 function maxTextSchemaFor(deps: ToolDeps) {
   return {
-    type: "integer",
-    minimum: 0,
-    maximum: deps.options.maxTextChars,
-    description: `Maximum characters for the last text. 0 uses the plugin default (${deps.options.maxTextChars}).`,
+    anyOf: [
+      { const: 0 },
+      {
+        type: "integer",
+        minimum: 100,
+        maximum: deps.options.maxTextChars,
+      },
+    ],
+    description: `Maximum characters for the last text. 0 uses the plugin default (${deps.options.maxTextChars}); otherwise the minimum is 100.`,
   }
 }
 
 export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
   const queuedPrompts: QueuedPrompts = deps.queuedPrompts ?? new Map()
   const openSessions: OpenSessionMapping = deps.openSessions ?? new Map()
-  const inFlightOpens: Map<string, Promise<ToolExecutionResult>> =
-    deps.inFlightOpens ?? new Map()
+  const inFlightOpens: Map<string, OpenInflight> = deps.inFlightOpens ?? new Map()
+  const inFlightSends: Map<string, SendInflight> = deps.inFlightSends ?? new Map()
+  const sentMessages: SentMessages = deps.sentMessages ?? new Map()
   const add = (
     definition: ToolDefinition,
     execute: ToolExecute,
@@ -677,21 +907,31 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         const lang = deps.getLanguage()
         try {
           const result = await execute(input, context, lang)
+          throwIfAborted(context.signal)
           return {
             content: capOutput(result.content, deps.options.maxOutputChars, lang),
-            ...(result.output !== undefined ? { output: result.output } : {}),
+            ...(result.output !== undefined
+              ? { output: boundOutputTotal(result.output, deps.options.maxOutputTotalChars) }
+              : {}),
             ...(result.metadata !== undefined ? { metadata: result.metadata } : {}),
           }
         } catch (error) {
           // A denied permission is a Tool.Error, not a successful report.
           if (error instanceof PermissionDenied) throw error.cause
+          // Host cancellation is not a normal tool result; let the host mark
+          // the call as aborted. Internal request timeouts still become errors.
+          throwIfAborted(context.signal)
           const prefix = errorKey ? `${t(lang, errorKey)}: ` : ""
           const output = buildErrorOutput
             ? buildErrorOutput(error, input)
             : errorFor(deps, error, input)
           return {
-            content: capOutput(`${prefix}${formatError(error)}`, deps.options.maxOutputChars, lang),
-            output,
+            content: capOutput(
+              `${prefix}${oneLine(formatError(error), deps.options.maxErrorChars)}`,
+              deps.options.maxOutputChars,
+              lang,
+            ),
+            output: boundOutputTotal(output, deps.options.maxOutputTotalChars),
           }
         }
       },
@@ -709,13 +949,14 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         properties: {
           sessionID: {
             type: "string",
+            maxLength: deps.options.maxIdChars,
             description:
               "Optional session ID to create or reuse. Retries with the same ID do not create a second session.",
           },
           prompt: { type: "string", minLength: 1, maxLength: deps.options.maxPromptChars, description: "Initial message to send to the new session." },
           title: { type: "string", maxLength: deps.options.maxTitleChars, description: "Session title. If omitted, it is derived from the message." },
-          agent: { type: "string", description: "Agent ID. Defaults to build." },
-          model: { type: "string", description: "Model in provider/model format. Defaults to this session's model." },
+          agent: { type: "string", maxLength: deps.options.maxAgentChars, description: "Agent ID. Defaults to build." },
+          model: { type: "string", maxLength: deps.options.maxModelChars, description: "Model in provider/model format. Defaults to this session's model." },
           delivery: {
             type: "string",
             enum: ["steer", "queue"],
@@ -729,6 +970,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           timeoutMs: timeoutSchema,
           messageID: {
             type: "string",
+            maxLength: deps.options.maxIdChars,
             description:
               "Optional idempotency key for the message and for the session mapping. Reusing it does not create a second message or session.",
           },
@@ -737,7 +979,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
             maxItems: deps.options.maxPermissionRules,
             description:
               "Optional permission rules for the new session. allow rules require allowPermissionRules: true.",
-            items: permissionRuleSchema,
+            items: permissionRuleSchemaFor(deps),
           },
           maxOutputChars: maxOutputSchemaFor(deps),
         },
@@ -749,246 +991,337 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
     },
     async (input, context, lang) => {
       const data = parseOpenInput(input, lang, deps.options)
+      const signal = signalOf(context)
+      const directory = deps.ctx.location?.directory
+      const explicitModel = parseModel(data.model)
+
+      // Permission policy is evaluated for every caller, even when the
+      // admission itself is deduplicated and shared.
+      await assertPermission(
+        deps,
+        context,
+        "session_bridge.open",
+        [data.sessionID ?? data.messageID ?? "new-session"],
+        {
+          delivery: data.delivery,
+          wait: data.wait,
+          hasSessionID: Boolean(data.sessionID),
+          hasMessageID: Boolean(data.messageID),
+          ...(data.agent ? { agent: data.agent } : {}),
+          ...(explicitModel ? { model: data.model } : {}),
+        },
+      )
+
       const openKey = data.messageID
-        ? `message:${data.messageID}`
+        ? `message:${data.messageID}@${directory ?? ""}`
         : data.sessionID
-          ? `session:${data.sessionID}`
+          ? `session:${data.sessionID}@${directory ?? ""}`
           : undefined
-      if (openKey) {
-        const existing = inFlightOpens.get(openKey)
-        if (existing) return existing
-      }
-
-      const operation = (async (): Promise<ToolExecutionResult> => {
-        const explicitModel = parseModel(data.model)
-        await assertPermission(
-          deps,
-          context,
-          "session_bridge.open",
-          [data.sessionID ?? data.messageID ?? "new-session"],
-          {
-            delivery: data.delivery,
-            wait: data.wait,
-            hasSessionID: Boolean(data.sessionID),
-            hasMessageID: Boolean(data.messageID),
-            ...(data.agent ? { agent: data.agent } : {}),
-            ...(explicitModel ? { model: data.model } : {}),
-          },
-        )
-
-        let created: SessionInfo | undefined
-        let reused = false
-        const directory = deps.ctx.location?.directory
-        let targetSessionID =
-          data.sessionID ?? lookupOpenSession(openSessions, data.messageID, directory)
+      const signature = openSignature(data, directory)
+      let inflight: OpenInflight
+      const existing = openKey ? inFlightOpens.get(openKey) : undefined
+      if (existing) {
+        if (existing.signature !== signature) {
+          throw new ValidationError(t(lang, "openConflict"))
+        }
+        existing.waiters++
+        inflight = existing
+      } else {
+        const controller = new AbortController()
         const title = titleFromPrompt(
           data.prompt,
           data.title,
           t(lang, "newSession"),
           deps.options.maxTitleChars,
         )
-        try {
-          if (targetSessionID) {
-            try {
-              created = await withRequest(
-                signalOf(context),
-                deps.options.requestTimeoutMs,
-                (signal) => deps.ctx.session.get({ sessionID: targetSessionID as string }, { signal }),
-              )
-              reused = true
-            } catch (error) {
-              if (!isNotFoundError(error)) throw error
-            }
-          }
-
-          if (!created) {
-            let fallback: { providerID: string; id: string; variant?: string } | undefined
-            if (!explicitModel) {
-              if (context.sessionID) {
-                const callerSessionID = context.sessionID
-                const caller = await withRequest(
-                  signalOf(context),
-                  deps.options.requestTimeoutMs,
-                  (signal) => deps.ctx.session.get({ sessionID: callerSessionID }, { signal }),
-                ).catch(() => undefined)
-                fallback = modelRef(caller?.model)
-              }
-              if (!fallback) {
-                const preferred = await withRequest(
-                  signalOf(context),
-                  deps.options.requestTimeoutMs,
-                  (signal) => deps.ctx.model.default(undefined, { signal }),
-                ).catch(() => undefined)
-                // `model.default` returns `{ location, data: ModelInfo | null }`.
-                fallback = modelRef(preferred?.data)
-              }
-            }
-
-            try {
-              created = await withRequest(signalOf(context), deps.options.requestTimeoutMs, (signal) =>
-                deps.ctx.session.create(
-                  {
-                    id: targetSessionID,
-                    title,
-                    agent: data.agent ?? "build",
-                    model: explicitModel ?? fallback,
-                    permissions: data.permissions,
-                  },
-                  { signal },
-                ),
-              )
-            } catch (error) {
-              // A concurrent creator may have won the race for an explicit ID.
-              if (targetSessionID && isAlreadyExistsError(error)) {
+        const operation: OpenInflight = {
+          signature,
+          controller,
+          waiters: 1,
+          settled: false,
+          promise: Promise.resolve({ ok: false, error: new Error("not started"), title }),
+        }
+        operation.promise = (async (): Promise<OpenAdmission> => {
+          let created: SessionInfo | undefined
+          let reused = false
+          let displayTitle = truncateCodePoints(title, deps.options.maxTitleChars)
+          let targetSessionID =
+            data.sessionID ?? lookupOpenSession(openSessions, data.messageID, directory)
+          const internalSignal = controller.signal
+          try {
+            if (targetSessionID) {
+              try {
                 created = await withRequest(
-                  signalOf(context),
+                  internalSignal,
                   deps.options.requestTimeoutMs,
-                  (signal) =>
-                    deps.ctx.session.get({ sessionID: targetSessionID as string }, { signal }),
+                  (request) =>
+                    deps.ctx.session.get(
+                      { sessionID: targetSessionID as string },
+                      { signal: request },
+                    ),
                 )
                 reused = true
-              } else {
-                throw error
+              } catch (error) {
+                if (!isNotFoundError(error)) throw error
               }
             }
-          }
 
-          const createdSessionID = created.id
-          targetSessionID = createdSessionID
-          if (data.messageID) {
-            await rememberOpenSession(
-              deps.ctx,
-              openSessions,
-              data.messageID,
-              createdSessionID,
-              directory,
+            if (!created) {
+              let fallback: { providerID: string; id: string; variant?: string } | undefined
+              if (!explicitModel) {
+                if (context.sessionID) {
+                  const callerSessionID = context.sessionID
+                  const caller = await withRequest(
+                    internalSignal,
+                    deps.options.requestTimeoutMs,
+                    (request) =>
+                      deps.ctx.session.get({ sessionID: callerSessionID }, { signal: request }),
+                  ).catch(() => undefined)
+                  fallback = modelRef(caller?.model)
+                }
+                if (!fallback) {
+                  const preferred = await withRequest(
+                    internalSignal,
+                    deps.options.requestTimeoutMs,
+                    (request) => deps.ctx.model.default(undefined, { signal: request }),
+                  ).catch(() => undefined)
+                  // `model.default` returns `{ location, data: ModelInfo | null }`.
+                  fallback = modelRef(preferred?.data)
+                }
+              }
+
+              try {
+                created = await withRequest(
+                  internalSignal,
+                  deps.options.requestTimeoutMs,
+                  (request) =>
+                    deps.ctx.session.create(
+                      {
+                        id: targetSessionID,
+                        title,
+                        agent: data.agent ?? "build",
+                        model: explicitModel ?? fallback,
+                        permissions: data.permissions,
+                      },
+                      { signal: request },
+                    ),
+                )
+              } catch (error) {
+                // A concurrent creator may have won the race for an explicit ID.
+                if (targetSessionID && isAlreadyExistsError(error)) {
+                  created = await withRequest(
+                    internalSignal,
+                    deps.options.requestTimeoutMs,
+                    (request) =>
+                      deps.ctx.session.get(
+                        { sessionID: targetSessionID as string },
+                        { signal: request },
+                      ),
+                  )
+                  reused = true
+                } else {
+                  throw error
+                }
+              }
+            }
+
+            const createdSessionID = created.id
+            targetSessionID = createdSessionID
+            displayTitle = truncateCodePoints(
+              sanitizeTitle(created.title ?? title),
+              deps.options.maxTitleChars,
             )
-          }
-          await rememberOwnedSession(
-            deps.ctx,
-            deps.ownedSessions,
-            createdSessionID,
-            directory,
-          )
-
-          const admitted = await withRequest(signalOf(context), deps.options.requestTimeoutMs, (signal) =>
-            deps.ctx.session.prompt(
-              {
-                sessionID: createdSessionID,
-                text: data.prompt,
-                delivery: data.delivery,
-                id: data.messageID,
-              },
-              { signal },
-            ),
-          )
-
-          const displayTitle = truncateCodePoints(
-            sanitizeTitle(created.title ?? title),
-            deps.options.maxTitleChars,
-          )
-          const header = `${t(lang, reused ? "reused" : "created")}: ${created.id}\n${t(
-            lang,
-            "title",
-          )}: ${displayTitle}`
-          if (!data.wait) {
-            if (data.delivery === "queue") {
-              enqueueQueuedPrompt(
-                queuedPrompts,
-                created.id,
-                admitted.id,
-                "queue",
-                queueOptions(deps.options),
+            if (data.messageID) {
+              if (deps.registry) {
+                deps.registry.rememberOpen(data.messageID, createdSessionID, directory)
+              } else {
+                await rememberOpenSession(
+                  deps.ctx,
+                  openSessions,
+                  data.messageID,
+                  createdSessionID,
+                  directory,
+                )
+              }
+            }
+            if (deps.registry) {
+              deps.registry.rememberOwned(createdSessionID, directory)
+            } else {
+              await rememberOwnedSession(
+                deps.ctx,
+                deps.ownedSessions,
+                createdSessionID,
+                directory,
               )
             }
-            const queued = data.delivery === "queue" ? `\n${t(lang, "messageQueued")}` : ""
+
+            const admitted = await withRequest(
+              internalSignal,
+              deps.options.requestTimeoutMs,
+              (request) =>
+                deps.ctx.session.prompt(
+                  {
+                    sessionID: createdSessionID,
+                    text: data.prompt,
+                    delivery: data.delivery,
+                    id: data.messageID,
+                  },
+                  { signal: request },
+                ),
+            )
             return {
-              content: `${header}\n\n${t(lang, "background")}\n${t(lang, "promptMessageID")}: ${
-                admitted.id
-              }${queued}`,
-              output: cleanOutput({
-                sessionID: created.id,
-                title: displayTitle,
-                messageID: admitted.id,
-                state: data.delivery === "queue" ? "queued" : "running",
-                queued: data.delivery === "queue",
-                pendingPermissions: [],
-                pendingTotal: 0,
-                pendingTruncated: false,
-                textLength: 0,
-                textTruncated: false,
-                reused,
-              }),
+              ok: true,
+              session: created,
+              admitted,
+              reused,
+              title: displayTitle,
+            }
+          } catch (error) {
+            return {
+              ok: false,
+              error,
+              sessionID: created?.id ?? targetSessionID,
+              title: displayTitle,
+              messageID: data.messageID,
             }
           }
+        })()
 
-          const turn = await waitForTurn(deps.ctx, {
-            sessionID: created.id,
-            anchorID: admitted.id,
-            promptText: data.prompt,
-            admittedAt: admitted.time?.created ?? Date.now(),
-            timeoutMs: data.timeoutMs,
-            signal: signalOf(context),
-            requireAnchor: true,
-            promptMessageID: admitted.id,
-            ...waitConfig(deps, context, created.id),
-          })
-          if (turn.state === "idle") {
-            removeQueuedPrompt(
-              queuedPrompts,
-              created.id,
-              admitted.id,
-              queueOptions(deps.options),
-            )
-            deps.liveState?.markDelivered(created.id, admitted.id)
-            deps.liveState?.reconcile(created.id, turn.messages)
+        if (openKey) {
+          inFlightOpens.set(openKey, operation)
+          const clear = () => {
+            operation.settled = true
+            if (inFlightOpens.get(openKey) === operation) inFlightOpens.delete(openKey)
           }
-          let content = renderTurn(lang, header, turn, data.maxOutputChars, deps.options)
-          if (turn.state !== "idle" && !turn.pendingPermissions?.length) {
-            content = await appendPermissionHint(
-              deps,
-              context,
-              lang,
-              created.id,
-              content,
-              data.maxOutputChars,
-            )
-          }
-          return {
-            content,
-            output: turnOutputValue(created.id, displayTitle, turn, deps.options, {
-              reused,
-            }),
-          }
-        } catch (error) {
-          if (error instanceof PermissionDenied) throw error
-          const errorID = created?.id ?? targetSessionID
-          const reason = formatError(error)
-          const suffix = errorID ? `\n${t(lang, "orphanSession", { id: errorID })}` : ""
-          return {
-            content: `${t(lang, "couldNotOpen")}: ${reason}${suffix}`,
-            output: errorOutput(error, deps.options.maxErrorChars, {
-              sessionID: errorID,
-              messageID: data.messageID,
-              title: boundTitle(data.title ?? title, deps.options.maxTitleChars),
-            }),
+          void operation.promise.then(clear, clear)
+          if (inFlightOpens.size > 100) {
+            for (const [key, value] of inFlightOpens) {
+              if (inFlightOpens.size <= 100) break
+              if (key !== openKey && value.settled) inFlightOpens.delete(key)
+            }
           }
         }
-      })()
+        inflight = operation
+      }
 
-      if (openKey) {
-        inFlightOpens.set(openKey, operation)
-        const clear = () => {
-          if (inFlightOpens.get(openKey) === operation) inFlightOpens.delete(openKey)
-        }
-        void operation.then(clear, clear)
-        while (inFlightOpens.size > 100) {
-          const oldest = inFlightOpens.keys().next().value
-          if (typeof oldest !== "string" || oldest === openKey) break
-          inFlightOpens.delete(oldest)
+      const release = () => {
+        inflight.waiters = Math.max(0, inflight.waiters - 1)
+        if (inflight.waiters === 0) inflight.controller.abort()
+      }
+      let admission: OpenAdmission
+      try {
+        admission = await awaitWithSignal(inflight.promise, signal)
+      } finally {
+        release()
+      }
+
+      const title = admission.title
+      if (!admission.ok) {
+        if (admission.error instanceof PermissionDenied) throw admission.error
+        const errorID = admission.sessionID
+        const suffix = errorID
+          ? `\n${t(lang, "orphanSession", { id: oneLine(errorID, 256) })}`
+          : ""
+        return {
+          content: `${t(lang, "couldNotOpen")}: ${oneLine(
+            formatError(admission.error),
+            deps.options.maxErrorChars,
+          )}${suffix}`,
+          output: errorOutput(admission.error, deps.options.maxErrorChars, {
+            sessionID: errorID,
+            messageID: admission.messageID ?? data.messageID,
+            title: boundTitle(data.title ?? title, deps.options.maxTitleChars),
+          }),
         }
       }
-      return operation
+
+      const created = admission.session
+      const admitted = admission.admitted
+      const reused = admission.reused
+      const displayTitle = title
+      const header = `${t(lang, reused ? "reused" : "created")}: ${oneLine(
+        created.id,
+        256,
+      )}\n${t(lang, "title")}: ${displayTitle}`
+      if (!data.wait) {
+        if (data.delivery === "queue") {
+          enqueueQueuedPrompt(
+            queuedPrompts,
+            created.id,
+            admitted.id,
+            "queue",
+            queueOptions(deps.options),
+          )
+        }
+        const queued = data.delivery === "queue" ? `\n${t(lang, "messageQueued")}` : ""
+        return {
+          content: `${header}\n\n${t(lang, "background")}\n${t(lang, "promptMessageID")}: ${oneLine(
+            admitted.id,
+            256,
+          )}${queued}`,
+          output: cleanOutput({
+            sessionID: created.id,
+            title: displayTitle,
+            messageID: admitted.id,
+            state: data.delivery === "queue" ? "queued" : "running",
+            queued: data.delivery === "queue",
+            pendingPermissions: [],
+            pendingTotal: 0,
+            pendingTruncated: false,
+            textLength: 0,
+            textTruncated: false,
+            reused,
+          }),
+        }
+      }
+
+      const turn = await waitForTurn(deps.ctx, {
+        sessionID: created.id,
+        anchorID: admitted.id,
+        promptText: data.prompt,
+        admittedAt: admitted.time?.created ?? Date.now(),
+        timeoutMs: data.timeoutMs,
+        signal,
+        requireAnchor: true,
+        promptMessageID: admitted.id,
+        ...waitConfig(deps, context, created.id),
+      })
+      if (turn.state === "aborted") throw abortError(signal)
+      throwIfAborted(signal)
+      if (turn.state === "idle") {
+        removeQueuedPrompt(
+          queuedPrompts,
+          created.id,
+          admitted.id,
+          queueOptions(deps.options),
+        )
+        deps.liveState?.markDelivered(created.id, admitted.id)
+        deps.liveState?.reconcile(created.id, turn.messages)
+      }
+      let content = renderTurn(lang, header, turn, data.maxOutputChars, deps.options)
+      if (
+        turn.state !== "idle" &&
+        !turn.pendingPermissions?.length &&
+        !(
+          turn.permissionCheckedAt &&
+          Date.now() - turn.permissionCheckedAt < deps.options.permissionPollMs
+        )
+      ) {
+        content = await appendPermissionHint(
+          deps,
+          context,
+          lang,
+          created.id,
+          content,
+          data.maxOutputChars,
+        )
+      }
+      return {
+        content,
+        output: turnOutputValue(created.id, displayTitle, turn, deps.options, {
+          reused,
+        }),
+      }
     },
     "couldNotOpen",
     (error, input) => errorFor(deps, error, input, ["sessionID", "messageID", "title"]),
@@ -1002,10 +1335,10 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       input: schema({
         type: "object",
         properties: {
-          sessionID: { type: "string", description: "Target session ID, for example ses_abc123." },
+          sessionID: { type: "string", maxLength: deps.options.maxIdChars, description: "Target session ID, for example ses_abc123." },
           prompt: { type: "string", minLength: 1, maxLength: deps.options.maxPromptChars, description: "Message to send to the session." },
-          agent: { type: "string", description: "Optional: switch the session's agent before sending." },
-          model: { type: "string", description: "Optional: switch the model (provider/model) before sending." },
+          agent: { type: "string", maxLength: deps.options.maxAgentChars, description: "Optional: switch the session's agent before sending." },
+          model: { type: "string", maxLength: deps.options.maxModelChars, description: "Optional: switch the model (provider/model) before sending." },
           delivery: {
             type: "string",
             enum: ["steer", "queue"],
@@ -1018,6 +1351,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           timeoutMs: timeoutSchema,
           messageID: {
             type: "string",
+            maxLength: deps.options.maxIdChars,
             description: "Optional idempotency key. Reusing it does not create a second message.",
           },
           maxOutputChars: maxOutputSchemaFor(deps),
@@ -1030,7 +1364,9 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
     },
     async (input, context, lang) => {
       const data = parseSendInput(input, lang, deps.options)
-      const applied: string[] = []
+      const signal = signalOf(context)
+      const signature = sendSignature(data)
+      const key = data.messageID ? `${data.sessionID}:${data.messageID}` : undefined
       await assertPermission(
         deps,
         context,
@@ -1045,117 +1381,255 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           ...(data.model ? { model: data.model } : {}),
         },
       )
-      try {
-        const session = await withRequest(signalOf(context), deps.options.requestTimeoutMs, (signal) =>
-          deps.ctx.session.get({ sessionID: data.sessionID }, { signal }),
-        )
-        const model = parseModel(data.model)
-        if (model) {
-          await withRequest(signalOf(context), deps.options.requestTimeoutMs, (signal) =>
-            deps.ctx.session.switchModel({ sessionID: data.sessionID, model }, { signal }),
-          )
-          applied.push(`${t(lang, "model")}: ${data.model}`)
-        }
-        if (data.agent) {
-          const agent = data.agent
-          await withRequest(signalOf(context), deps.options.requestTimeoutMs, (signal) =>
-            deps.ctx.session.switchAgent({ sessionID: data.sessionID, agent }, { signal }),
-          )
-          applied.push(`${t(lang, "agent")}: ${agent}`)
-        }
 
-        const admitted = await withRequest(signalOf(context), deps.options.requestTimeoutMs, (signal) =>
-          deps.ctx.session.prompt(
-            {
-              sessionID: data.sessionID,
-              text: data.prompt,
-              delivery: data.delivery,
-              id: data.messageID,
-            },
-            { signal },
-          ),
-        )
+      const recorded = key ? sentMessages.get(key) : undefined
+      if (recorded && Date.now() - recorded.at > deps.options.queueTtlMs) {
+        if (key) sentMessages.delete(key)
+      } else if (recorded) {
+        if (recorded.signature !== signature) {
+          throw new ValidationError(t(lang, "sendConflict"))
+        }
+      }
 
-        const header = sessionHeader(lang, session)
-        if (!data.wait) {
-          if (data.delivery === "queue") {
-            enqueueQueuedPrompt(
-              queuedPrompts,
-              data.sessionID,
-              admitted.id,
-              "queue",
-              queueOptions(deps.options),
-            )
+      let admission: SendAdmission
+      let applied: string[] = []
+      const existingRecord = key ? sentMessages.get(key) : undefined
+      if (existingRecord && existingRecord.signature === signature) {
+        try {
+          const session = await withRequest(signal, deps.options.requestTimeoutMs, (request) =>
+            deps.ctx.session.get({ sessionID: data.sessionID }, { signal: request }),
+          )
+          admission = {
+            ok: true,
+            session,
+            admittedID: existingRecord.admittedID ?? data.messageID ?? "",
+            admittedAt: existingRecord.admittedAt ?? existingRecord.at,
+            applied: [],
+            alreadySent: true,
           }
-          const queued = data.delivery === "queue" ? `\n${t(lang, "messageQueued")}` : ""
-          return {
-            content: `${header}\n\n${t(lang, "background")}\n${t(lang, "promptMessageID")}: ${
-              admitted.id
-            }${queued}`,
-            output: cleanOutput({
-              sessionID: data.sessionID,
-              title: boundTitle(session.title, deps.options.maxTitleChars),
-              messageID: admitted.id,
-              state: data.delivery === "queue" ? "queued" : "running",
-              queued: data.delivery === "queue",
-              pendingPermissions: [],
-              pendingTotal: 0,
-              pendingTruncated: false,
-              textLength: 0,
-              textTruncated: false,
-            }),
+        } catch (error) {
+          admission = { ok: false, error, applied: [] }
+        }
+      } else {
+        let inflight: SendInflight | undefined = key ? inFlightSends.get(key) : undefined
+        if (inflight) {
+          if (inflight.signature !== signature) {
+            throw new ValidationError(t(lang, "sendConflict"))
           }
+          inflight.waiters++
+        } else {
+          const controller = new AbortController()
+          const operation: SendInflight = {
+            signature,
+            controller,
+            waiters: 1,
+            settled: false,
+            promise: Promise.resolve({ ok: false, error: new Error("not started"), applied: [] }),
+          }
+          operation.promise = (async (): Promise<SendAdmission> => {
+            const internalSignal = controller.signal
+            const changes: string[] = []
+            try {
+              const session = await withRequest(
+                internalSignal,
+                deps.options.requestTimeoutMs,
+                (request) =>
+                  deps.ctx.session.get({ sessionID: data.sessionID }, { signal: request }),
+              )
+              const model = parseModel(data.model)
+              if (model && !sameModel(modelRef(session.model), model)) {
+                await withRequest(
+                  internalSignal,
+                  deps.options.requestTimeoutMs,
+                  (request) =>
+                    deps.ctx.session.switchModel(
+                      { sessionID: data.sessionID, model },
+                      { signal: request },
+                    ),
+                )
+                changes.push(`${t(lang, "model")}: ${data.model}`)
+              }
+              if (data.agent && session.agent !== data.agent) {
+                const agent = data.agent
+                await withRequest(
+                  internalSignal,
+                  deps.options.requestTimeoutMs,
+                  (request) =>
+                    deps.ctx.session.switchAgent(
+                      { sessionID: data.sessionID, agent },
+                      { signal: request },
+                    ),
+                )
+                changes.push(`${t(lang, "agent")}: ${agent}`)
+              }
+
+              const admitted = await withRequest(
+                internalSignal,
+                deps.options.requestTimeoutMs,
+                (request) =>
+                  deps.ctx.session.prompt(
+                    {
+                      sessionID: data.sessionID,
+                      text: data.prompt,
+                      delivery: data.delivery,
+                      id: data.messageID,
+                    },
+                    { signal: request },
+                  ),
+              )
+              const admittedAt = admitted.time?.created ?? Date.now()
+              if (key) {
+                rememberSentMessage(sentMessages, key, {
+                  signature,
+                  at: Date.now(),
+                  admittedID: admitted.id,
+                  admittedAt,
+                })
+              }
+              return {
+                ok: true,
+                session,
+                admittedID: admitted.id,
+                admittedAt,
+                applied: changes,
+                alreadySent: false,
+              }
+            } catch (error) {
+              return { ok: false, error, applied: changes }
+            }
+          })()
+
+          if (key) {
+            inFlightSends.set(key, operation)
+            const clear = () => {
+              operation.settled = true
+              if (inFlightSends.get(key) === operation) inFlightSends.delete(key)
+            }
+            void operation.promise.then(clear, clear)
+            if (inFlightSends.size > 100) {
+              for (const [sendKey, value] of inFlightSends) {
+                if (inFlightSends.size <= 100) break
+                if (sendKey !== key && value.settled) inFlightSends.delete(sendKey)
+              }
+            }
+          }
+          inflight = operation
         }
 
-        const turn = await waitForTurn(deps.ctx, {
-          sessionID: data.sessionID,
-          anchorID: admitted.id,
-          promptText: data.prompt,
-          admittedAt: admitted.time?.created ?? Date.now(),
-          timeoutMs: data.timeoutMs,
-          signal: signalOf(context),
-          requireAnchor: true,
-          promptMessageID: admitted.id,
-          ...waitConfig(deps, context, data.sessionID),
-        })
-        if (turn.state === "idle") {
-          removeQueuedPrompt(
-            queuedPrompts,
-            data.sessionID,
-            admitted.id,
-            queueOptions(deps.options),
-          )
-          deps.liveState?.markDelivered(data.sessionID, admitted.id)
-          deps.liveState?.reconcile(data.sessionID, turn.messages)
+        const release = () => {
+          if (!inflight) return
+          inflight.waiters = Math.max(0, inflight.waiters - 1)
+          if (inflight.waiters === 0) inflight.controller.abort()
         }
-        let content = renderTurn(lang, header, turn, data.maxOutputChars, deps.options)
-        if (turn.state !== "idle" && !turn.pendingPermissions?.length) {
-          content = await appendPermissionHint(
-            deps,
-            context,
-            lang,
-            data.sessionID,
-            content,
-            data.maxOutputChars,
-          )
+        try {
+          admission = await awaitWithSignal(inflight.promise, signal)
+        } finally {
+          release()
         }
-        return {
-          content,
-          output: turnOutputValue(data.sessionID, session.title, turn, deps.options),
-        }
-      } catch (error) {
-        if (error instanceof PermissionDenied) throw error
-        const reason = formatError(error)
+        applied = admission.applied
+      }
+
+      if (!admission.ok) {
+        if (admission.error instanceof PermissionDenied) throw admission.error
+        throwIfAborted(signal)
         const suffix = applied.length
           ? `\n${t(lang, "appliedChanges", { changes: applied.join(", ") })}`
           : ""
         return {
-          content: `${t(lang, "couldNotSend")}: ${reason}${suffix}`,
-          output: errorOutput(error, deps.options.maxErrorChars, {
+          content: `${t(lang, "couldNotSend")}: ${oneLine(
+            formatError(admission.error),
+            deps.options.maxErrorChars,
+          )}${suffix}`,
+          output: errorOutput(admission.error, deps.options.maxErrorChars, {
             sessionID: data.sessionID,
             messageID: data.messageID,
           }),
         }
+      }
+
+      const session = admission.session
+      const admittedID = admission.admittedID
+      const header = sessionHeader(lang, session)
+      if (!data.wait) {
+        if (data.delivery === "queue") {
+          enqueueQueuedPrompt(
+            queuedPrompts,
+            data.sessionID,
+            admittedID,
+            "queue",
+            queueOptions(deps.options),
+          )
+        }
+        const queued = data.delivery === "queue" ? `\n${t(lang, "messageQueued")}` : ""
+        return {
+          content: `${header}\n\n${t(lang, "background")}\n${t(lang, "promptMessageID")}: ${oneLine(
+            admittedID,
+            256,
+          )}${queued}`,
+          output: cleanOutput({
+            sessionID: data.sessionID,
+            title: boundTitle(session.title, deps.options.maxTitleChars),
+            messageID: admittedID,
+            state: data.delivery === "queue" ? "queued" : "running",
+            queued: data.delivery === "queue",
+            pendingPermissions: [],
+            pendingTotal: 0,
+            pendingTruncated: false,
+            textLength: 0,
+            textTruncated: false,
+            alreadySent: admission.alreadySent,
+            reused: admission.alreadySent,
+          }),
+        }
+      }
+
+      const turn = await waitForTurn(deps.ctx, {
+        sessionID: data.sessionID,
+        anchorID: admittedID,
+        promptText: admission.alreadySent ? undefined : data.prompt,
+        admittedAt: admission.alreadySent ? undefined : admission.admittedAt,
+        timeoutMs: data.timeoutMs,
+        signal,
+        requireAnchor: true,
+        promptMessageID: admittedID,
+        ...waitConfig(deps, context, data.sessionID),
+      })
+      if (turn.state === "aborted") throw abortError(signal)
+      throwIfAborted(signal)
+      if (turn.state === "idle") {
+        removeQueuedPrompt(
+          queuedPrompts,
+          data.sessionID,
+          admittedID,
+          queueOptions(deps.options),
+        )
+        deps.liveState?.markDelivered(data.sessionID, admittedID)
+        deps.liveState?.reconcile(data.sessionID, turn.messages)
+      }
+      let content = renderTurn(lang, header, turn, data.maxOutputChars, deps.options)
+      if (
+        turn.state !== "idle" &&
+        !turn.pendingPermissions?.length &&
+        !(
+          turn.permissionCheckedAt &&
+          Date.now() - turn.permissionCheckedAt < deps.options.permissionPollMs
+        )
+      ) {
+        content = await appendPermissionHint(
+          deps,
+          context,
+          lang,
+          data.sessionID,
+          content,
+          data.maxOutputChars,
+        )
+      }
+      return {
+        content,
+        output: turnOutputValue(data.sessionID, session.title, turn, deps.options, {
+          alreadySent: admission.alreadySent,
+          reused: admission.alreadySent,
+        }),
       }
     },
     "couldNotSend",
@@ -1170,7 +1644,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       input: schema({
         type: "object",
         properties: {
-          sessionID: { type: "string", description: "ID of the session to inspect." },
+          sessionID: { type: "string", maxLength: deps.options.maxIdChars, description: "ID of the session to inspect." },
           recent: recentSchema,
           verbose: {
             type: "boolean",
@@ -1223,7 +1697,9 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       const permissionError =
         pendingResult.status === "rejected" ? formatError(pendingResult.reason) : undefined
 
-      deps.liveState?.reconcile(data.sessionID, messages)
+      if (includeTranscript && messagesResult.status === "fulfilled") {
+        deps.liveState?.reconcile(data.sessionID, messages)
+      }
       const localQueue = listQueuedPrompts(
         queuedPrompts,
         data.sessionID,
@@ -1282,10 +1758,18 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       // The last admitted prompt is useful even when the turn is already idle.
       const promptMessageID = queueIDs[0] ?? latestUser?.id
 
-      const liveStatus = live.status
+      const now = Date.now()
+      const liveStatusAt = live.statusAt
+      const liveFresh =
+        Boolean(live.status) &&
+        typeof liveStatusAt === "number" &&
+        now - liveStatusAt <= 5_000 &&
+        (typeof session.time?.updated !== "number" || liveStatusAt >= session.time.updated - 1_000)
+      const liveStatus = liveFresh ? live.status : undefined
+      const liveStale = Boolean(live.status) && !liveFresh
       const liveRetry: RetryInfo | undefined =
         liveStatus?.type === "retry"
-          ? { attempt: liveStatus.attempt, message: liveStatus.message, next: liveStatus.next }
+          ? retryInfo(liveStatus.attempt, liveStatus.message, liveStatus.next, now)
           : undefined
       const liveRunning =
         liveStatus?.type === "busy" ? true : liveStatus?.type === "idle" ? false : undefined
@@ -1302,14 +1786,14 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       const stateValue: "permission" | "retrying" | "error" | "running" | "queued" | "idle" =
         pending.length
           ? "permission"
-          : contextError
-            ? "error"
-            : liveRetry
-              ? "retrying"
-              : running
-                ? "running"
-                : queued
-                  ? "queued"
+          : liveRetry
+            ? "retrying"
+            : running
+              ? "running"
+              : queued
+                ? "queued"
+                : contextError || permissionError
+                  ? "error"
                   : "idle"
       const retryLabelText = liveRetry ? retryLabel(lang, liveRetry) : undefined
       const stateLabel = pending.length
@@ -1324,12 +1808,15 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
                 ? t(lang, "running")
                 : t(lang, "idle")
 
-      const lastOutcome = idle?.outcome ?? session.outcome
+      const lastOutcome =
+        idle?.outcome ?? session.outcome ?? (liveFresh ? live.lastOutcome : undefined)
       const resultLabel = liveRetry
         ? t(lang, "retrying")
         : running
           ? t(lang, "running")
-          : (lastOutcome ?? t(lang, "unknown"))
+          : lastOutcome
+            ? oneLine(lastOutcome, 120)
+            : t(lang, "unknown")
 
       const headerBudget = Math.max(160, Math.floor(data.maxOutputChars * 0.2))
       const lines = [
@@ -1339,12 +1826,13 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         `${t(lang, "lastUpdate")}: ${formatTimestamp(session.time?.updated, lang)}`,
       ]
       if (promptMessageID) {
-        lines.push(`${t(lang, "promptMessageID")}: ${promptMessageID}`)
+        lines.push(`${t(lang, "promptMessageID")}: ${oneLine(promptMessageID, 256)}`)
       }
       if (queuedCount > 1) {
         lines.push(
           `${t(lang, "queuedMessages", { count: queuedCount })}: ${queueIDs
             .slice(0, 20)
+            .map((id) => oneLine(id, 256))
             .join(", ")}`,
         )
       }
@@ -1353,16 +1841,34 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         deps.options.maxErrorChars,
         Math.max(80, Math.floor(data.maxOutputChars * 0.1)),
       )
-      const error = assistant?.error?.message ?? idle?.error?.message
-      if (error) lines.push(`${t(lang, "error")}: ${compact(error, errorBudget)}`)
-      if (contextError) lines.push(`${t(lang, "error")}: ${compact(contextError, errorBudget)}`)
-      if (permissionError) lines.push(`${t(lang, "error")}: ${compact(permissionError, errorBudget)}`)
+      const error =
+        assistant?.error?.message ??
+        idle?.error?.message ??
+        (liveFresh ? live.lastError : undefined)
+      if (error) {
+        lines.push(`${t(lang, "error")}: ${oneLine(compact(error, errorBudget), errorBudget)}`)
+      }
+      if (contextError) {
+        lines.push(
+          `${t(lang, "error")}: ${oneLine(compact(contextError, errorBudget), errorBudget)}`,
+        )
+      }
+      if (permissionError) {
+        lines.push(
+          `${t(lang, "error")}: ${oneLine(compact(permissionError, errorBudget), errorBudget)}`,
+        )
+      }
       if (liveRetry) {
-        lines.push(`${t(lang, "retryReason")}: ${compact(liveRetry.message, errorBudget)}`)
+        lines.push(
+          `${t(lang, "retryReason")}: ${oneLine(
+            compact(liveRetry.message, errorBudget),
+            errorBudget,
+          )}`,
+        )
       }
       const lastMessageID = messages.length ? messages[messages.length - 1]?.id : undefined
       if (lastMessageID) {
-        lines.push(`${t(lang, "lastMessage")}: ${lastMessageID}`)
+        lines.push(`${t(lang, "lastMessage")}: ${oneLine(lastMessageID, 256)}`)
       }
 
       if (pending.length) {
@@ -1394,8 +1900,12 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       // Everything above is required to resume or answer the session. Text and
       // tools are optional and go last so a tight budget cannot hide the IDs.
       if (data.verbose) {
-        lines.push(`${t(lang, "agent")}: ${session.agent ?? t(lang, "unknown")}`)
-        lines.push(`${t(lang, "model")}: ${modelLabel(session) || t(lang, "unknown")}`)
+        lines.push(
+          `${t(lang, "agent")}: ${oneLine(session.agent ?? t(lang, "unknown"), 256)}`,
+        )
+        lines.push(
+          `${t(lang, "model")}: ${oneLine(modelLabel(session) || t(lang, "unknown"), 512)}`,
+        )
         lines.push(`${t(lang, "cost")}: ${compact(session.cost, 100) || t(lang, "unknown")}`)
         lines.push(`${t(lang, "tokens")}: ${compact(session.tokens, 200) || t(lang, "unknown")}`)
       }
@@ -1444,6 +1954,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           queued,
           queuedCount,
           queuedMessageIDs: queueIDs.slice(0, 20),
+          queuedTruncated: queueIDs.length > 20,
           nextQueuedMessageID: queueIDs[0],
           outcome: running || liveRetry ? undefined : lastOutcome,
           lastOutcome,
@@ -1455,10 +1966,23 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           tools: data.includeTools
             ? tools.map((tool) => toolLine(tool, false, { maxLine: deps.options.maxToolLine }))
             : undefined,
+          toolsTruncated: omittedTools > 0,
           pendingPermissions: pendingOutput.pendingPermissions,
           pendingTotal: pendingOutput.pendingTotal,
           pendingTruncated: pendingOutput.pendingTruncated,
           retry: retryOutput(liveRetry, budget.maxErrorChars),
+          contextError: contextError ? oneLine(contextError, budget.maxErrorChars) : undefined,
+          permissionError: permissionError
+            ? oneLine(permissionError, budget.maxErrorChars)
+            : undefined,
+          transcriptAvailable: !contextError,
+          permissionsAvailable: !permissionError,
+          liveStale,
+          statusAt: liveStatusAt,
+          lastError:
+            liveFresh && live.lastError
+              ? oneLine(live.lastError, budget.maxErrorChars)
+              : undefined,
           ...boundedError,
           includeTools: data.includeTools,
           includeText: data.includeText,
@@ -1477,7 +2001,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       input: schema({
         type: "object",
         properties: {
-          sessionID: { type: "string", description: "ID of the session whose pending permissions should be listed." },
+          sessionID: { type: "string", maxLength: deps.options.maxIdChars, description: "ID of the session whose pending permissions should be listed." },
           limit: {
             type: "integer",
             minimum: 0,
@@ -1499,13 +2023,17 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       )
       if (!pending.length) {
         return {
-          content: `${t(lang, "session")} ${data.sessionID}: ${t(lang, "noPendingPermissions")}`,
+          content: `${t(lang, "session")} ${oneLine(
+            data.sessionID,
+            256,
+          )}: ${t(lang, "noPendingPermissions")}`,
           output: {
             sessionID: data.sessionID,
             pending: [],
             pendingTotal: 0,
             pendingTruncated: false,
             hasMore: false,
+            state: "ok",
           },
         }
       }
@@ -1527,6 +2055,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           pendingTotal: pending.length,
           pendingTruncated: pending.length > shown.length,
           hasMore: pending.length > shown.length,
+          state: "ok",
         },
       }
     },
@@ -1542,8 +2071,8 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       input: schema({
         type: "object",
         properties: {
-          sessionID: { type: "string", description: "ID of the session that owns the request." },
-          requestID: { type: "string", description: "Permission request ID, for example per_abc123." },
+          sessionID: { type: "string", maxLength: deps.options.maxIdChars, description: "ID of the session that owns the request." },
+          requestID: { type: "string", maxLength: deps.options.maxIdChars, description: "Permission request ID, for example per_abc123." },
           decision: {
             type: "string",
             enum: ["once", "always", "reject"],
@@ -1609,10 +2138,10 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
             ? t(lang, "approvedSaved")
             : t(lang, "rejected")
       return {
-        content: `${t(lang, "requestApproved", { id: data.requestID, label })}\n${t(
-          lang,
-          "session",
-        )}: ${data.sessionID}`,
+        content: `${t(lang, "requestApproved", {
+          id: oneLine(data.requestID, 256),
+          label,
+        })}\n${t(lang, "session")}: ${oneLine(data.sessionID, 256)}`,
         output: {
           sessionID: data.sessionID,
           requestID: data.requestID,
@@ -1634,10 +2163,11 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       input: schema({
         type: "object",
         properties: {
-          sessionID: { type: "string", description: "ID of the session to read." },
+          sessionID: { type: "string", maxLength: deps.options.maxIdChars, description: "ID of the session to read." },
           limit: limitSchema,
           afterMessageID: {
             type: "string",
+            maxLength: deps.options.maxIdChars,
             description:
               "Optional: return only messages after this ID. If it does not exist, the result says so and shows the last N messages.",
           },
@@ -1684,6 +2214,9 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           hasMore: result.hasMore,
           truncated: result.truncated,
           count: result.count,
+          partial: result.partial,
+          partialMessageID: result.partialMessageID,
+          state: "ok",
         }),
       }
     },
@@ -1699,9 +2232,10 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       input: schema({
         type: "object",
         properties: {
-          sessionID: { type: "string", description: "ID of the session to wait for." },
+          sessionID: { type: "string", maxLength: deps.options.maxIdChars, description: "ID of the session to wait for." },
           messageID: {
             type: "string",
+            maxLength: deps.options.maxIdChars,
             description:
               "Optional prompt message ID (for example from send with wait: false) to wait for that specific turn.",
           },
@@ -1717,23 +2251,68 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
     async (input, context, lang) => {
       const data = parseWaitInput(input, lang, deps.options)
       const signal = signalOf(context)
+      const deadline = Date.now() + data.timeoutMs
+      const remainingMs = () => Math.max(1, deadline - Date.now())
+      const preflightTimeout = () =>
+        Math.max(1, Math.min(deps.options.requestTimeoutMs, remainingMs()))
       const [sessionResult, messagesResult, pendingResult] = await Promise.allSettled([
-        withRequest(signal, deps.options.requestTimeoutMs, (requestSignalValue) =>
+        withRequest(signal, preflightTimeout(), (requestSignalValue) =>
           deps.ctx.session.get({ sessionID: data.sessionID }, { signal: requestSignalValue }),
         ),
-        withRequest(signal, deps.options.requestTimeoutMs, (requestSignalValue) =>
+        withRequest(signal, preflightTimeout(), (requestSignalValue) =>
           deps.ctx.session.context({ sessionID: data.sessionID }, { signal: requestSignalValue }),
         ),
-        withRequest(signal, deps.options.requestTimeoutMs, (requestSignalValue) =>
+        withRequest(signal, preflightTimeout(), (requestSignalValue) =>
           deps.ctx.permission.list({ sessionID: data.sessionID }, { signal: requestSignalValue }),
         ),
       ])
 
-      if (sessionResult.status === "rejected") throw sessionResult.reason
-      const session = sessionResult.value
       const contextFailed = messagesResult.status === "rejected"
       const messages = messagesResult.status === "fulfilled" ? messagesResult.value : []
       const pending = pendingResult.status === "fulfilled" ? pendingResult.value : []
+      // The preflight always attempted the list; reuse that timestamp so
+      // waitForTurn does not immediately list again (failed lists are retried
+      // by the normal permission poll or the final read).
+      const permissionCheckedAt = Date.now()
+
+      if (sessionResult.status === "rejected") {
+        // If the session lookup itself consumed the whole budget, report a
+        // timeout (with whatever the other preflight calls already learned)
+        // instead of turning the deadline into an opaque request error.
+        if (!signal.aborted && Date.now() >= deadline) {
+          const fallbackHeader = `${t(lang, "session")}: ${oneLine(data.sessionID, 256)}`
+          const fetchCount = messagesResult.status === "fulfilled" ? 1 : 0
+          if (pending.length) {
+            const turn: TurnResult = {
+              state: "permission",
+              messages,
+              startIndex: messages.length,
+              pendingPermissions: pending,
+              elapsedMs: data.timeoutMs,
+              fetchCount,
+              permissionCheckedAt,
+            }
+            return {
+              content: renderTurn(lang, fallbackHeader, turn, data.maxOutputChars, deps.options),
+              output: turnOutputValue(data.sessionID, undefined, turn, deps.options),
+            }
+          }
+          const turn: TurnResult = {
+            state: "timeout",
+            messages,
+            startIndex: 0,
+            elapsedMs: data.timeoutMs,
+            fetchCount,
+            permissionCheckedAt,
+          }
+          return {
+            content: renderTurn(lang, fallbackHeader, turn, data.maxOutputChars, deps.options),
+            output: turnOutputValue(data.sessionID, undefined, turn, deps.options),
+          }
+        }
+        throw sessionResult.reason
+      }
+      const session = sessionResult.value
       const header = sessionHeader(lang, session)
       deps.liveState?.reconcile(data.sessionID, messages)
       const localQueue = listQueuedPrompts(
@@ -1742,22 +2321,26 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         queueOptions(deps.options),
       )
       const live = liveQueue(deps, data.sessionID)
+      const now = Date.now()
+      const liveFresh =
+        Boolean(live.status) &&
+        typeof live.statusAt === "number" &&
+        now - live.statusAt <= 5_000 &&
+        (typeof session.time?.updated !== "number" || live.statusAt >= session.time.updated - 1_000)
       const targetMessageID =
         data.messageID ?? localQueue[0]?.messageID ?? live.pending[0]?.messageID
       const liveRetry: RetryInfo | undefined =
-        live.status?.type === "retry"
-          ? {
-              attempt: live.status.attempt,
-              message: live.status.message,
-              next: live.status.next,
-            }
+        liveFresh && live.status?.type === "retry"
+          ? retryInfo(live.status.attempt, live.status.message, live.status.next, now)
           : undefined
       const liveRunning =
-        live.status?.type === "busy"
-          ? true
-          : live.status?.type === "idle"
-            ? false
-            : undefined
+        !liveFresh
+          ? undefined
+          : live.status?.type === "busy"
+            ? true
+            : live.status?.type === "idle"
+              ? false
+              : undefined
 
       if (pending.length) {
         const turn: TurnResult = {
@@ -1900,14 +2483,18 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         anchorID,
         promptText: targetMessageID ? undefined : user?.text,
         admittedAt: targetMessageID ? undefined : user?.time?.created,
-        timeoutMs: data.timeoutMs,
+        timeoutMs: remainingMs(),
         signal,
         initialMessages: contextFailed ? undefined : messages,
         initialFetchCount: messagesResult.status === "fulfilled" ? 1 : 0,
+        initialPermissions: pending,
+        initialPermissionCheckAt: permissionCheckedAt,
         requireAnchor: Boolean(anchorID),
         promptMessageID: targetMessageID ?? user?.id,
         ...waitConfig(deps, context, data.sessionID),
       })
+      if (turn.state === "aborted") throw abortError(signal)
+      throwIfAborted(signal)
       if (turn.state === "idle") {
         const completedID = turn.promptMessageID ?? targetMessageID
         removeQueuedPrompt(
@@ -1929,7 +2516,14 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           lang,
         )
       }
-      if (turn.state !== "idle" && !turn.pendingPermissions?.length) {
+      if (
+        turn.state !== "idle" &&
+        !turn.pendingPermissions?.length &&
+        !(
+          turn.permissionCheckedAt &&
+          Date.now() - turn.permissionCheckedAt < deps.options.permissionPollMs
+        )
+      ) {
         content = await appendPermissionHint(
           deps,
           context,
@@ -1950,12 +2544,237 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
 
   add(
     {
+      name: "compact",
+      description:
+        "Compact a session's context. Requires allowCompact: true. Optionally waits for the compaction turn. Use messageID/id for an exact anchor.",
+      input: schema({
+        type: "object",
+        properties: {
+          sessionID: {
+            type: "string",
+            maxLength: deps.options.maxIdChars,
+            description: "ID of the session to compact.",
+          },
+          id: {
+            type: "string",
+            maxLength: deps.options.maxIdChars,
+            description: "Optional idempotency key for the compaction message.",
+          },
+          delivery: {
+            type: "string",
+            enum: ["steer", "queue"],
+            description: "steer (default) or queue behind the current turn.",
+          },
+          wait: {
+            type: "boolean",
+            description: "If true (default), wait for the compaction turn.",
+          },
+          timeoutMs: timeoutSchema,
+          maxOutputChars: maxOutputSchemaFor(deps),
+        },
+        required: ["sessionID"],
+        additionalProperties: false,
+      }),
+      output: turnOutput,
+      options: { namespace: "sessions", codemode: true },
+    },
+    async (input, context, lang) => {
+      const data = parseCompactInput(input, lang, deps.options)
+      if (!deps.options.allowCompact) {
+        throw new ValidationError(`${t(lang, "compactDisabled")} ${t(lang, "compactHint")}`)
+      }
+      if (
+        !isOwnedSession(
+          deps.ownedSessions,
+          data.sessionID,
+          deps.ctx.location?.directory,
+        ) &&
+        !deps.options.allowUpdateForeignSessions
+      ) {
+        throw new ValidationError(
+          `${t(lang, "foreignUpdateBlocked")} ${t(lang, "foreignUpdateHint")}`,
+        )
+      }
+      await assertPermission(
+        deps,
+        context,
+        "session_bridge.compact",
+        [data.sessionID, data.id ?? "new-compaction", data.delivery],
+        {
+          sessionID: data.sessionID,
+          delivery: data.delivery,
+          wait: data.wait,
+          hasMessageID: Boolean(data.id),
+        },
+      )
+      const signal = signalOf(context)
+      const session = await withRequest(signal, deps.options.requestTimeoutMs, (request) =>
+        deps.ctx.session.get({ sessionID: data.sessionID }, { signal: request }),
+      )
+      const result = await withRequest(signal, deps.options.requestTimeoutMs, (request) =>
+        deps.ctx.session.compact(
+          {
+            sessionID: data.sessionID,
+            id: data.id,
+            delivery: data.delivery,
+          },
+          { signal: request },
+        ),
+      )
+      const header = sessionHeader(lang, session)
+      if (!data.wait) {
+        if (data.delivery === "queue") {
+          enqueueQueuedPrompt(
+            queuedPrompts,
+            data.sessionID,
+            result.id,
+            "queue",
+            queueOptions(deps.options),
+          )
+        }
+        return {
+          content: `${header}\n\n${t(lang, "compacted")}\n${t(lang, "promptMessageID")}: ${oneLine(
+            result.id,
+            256,
+          )}`,
+          output: cleanOutput({
+            sessionID: data.sessionID,
+            title: boundTitle(session.title, deps.options.maxTitleChars),
+            messageID: result.id,
+            compactionID: result.id,
+            state: data.delivery === "queue" ? "queued" : "running",
+            queued: data.delivery === "queue",
+            pendingPermissions: [],
+            pendingTotal: 0,
+            pendingTruncated: false,
+            textLength: 0,
+            textTruncated: false,
+          }),
+        }
+      }
+
+      const turn = await waitForTurn(deps.ctx, {
+        sessionID: data.sessionID,
+        anchorID: result.id,
+        admittedAt: result.time?.created ?? Date.now(),
+        timeoutMs: data.timeoutMs,
+        signal,
+        requireAnchor: true,
+        promptMessageID: result.id,
+        ...waitConfig(deps, context, data.sessionID),
+      })
+      if (turn.state === "aborted") throw abortError(signal)
+      throwIfAborted(signal)
+      if (turn.state === "idle") {
+        removeQueuedPrompt(
+          queuedPrompts,
+          data.sessionID,
+          result.id,
+          queueOptions(deps.options),
+        )
+        deps.liveState?.markDelivered(data.sessionID, result.id)
+        deps.liveState?.reconcile(data.sessionID, turn.messages)
+      }
+      return {
+        content: renderTurn(lang, header, turn, data.maxOutputChars, deps.options),
+        output: turnOutputValue(data.sessionID, session.title, turn, deps.options, {
+          compactionID: result.id,
+        }),
+      }
+    },
+    "couldNotUpdate",
+    (error, input) => errorFor(deps, error, input, ["sessionID", "id"]),
+  )
+
+  add(
+    {
+      name: "diagnostics",
+      description:
+        "Report plugin capabilities, registry/live/queue sizes, redacted option values, and the last live event time. Read-only.",
+      input: schema({
+        type: "object",
+        properties: {
+          maxOutputChars: maxOutputSchemaFor(deps),
+        },
+        required: [],
+        additionalProperties: false,
+      }),
+      output: diagnosticsOutput,
+      options: { namespace: "sessions", codemode: true },
+    },
+    async (input, _context, lang) => {
+      const data = parseDiagnosticsInput(input, lang, deps.options)
+      const registry = deps.registry?.stats() ?? {
+        owned: deps.ownedSessions.size,
+        open: openSessions.size,
+        dirtyOwned: false,
+        dirtyOpen: false,
+        flushPending: false,
+      }
+      const live = deps.liveState?.stats() ?? { sessions: 0, pending: 0 }
+      let queueEntries = 0
+      for (const entries of queuedPrompts.values()) queueEntries += entries.length
+      const capabilities = {
+        eventSubscribe: typeof deps.ctx.event?.subscribe === "function",
+        sessionWait: typeof deps.ctx.session.wait === "function",
+        sessionHook: typeof deps.ctx.session.hook === "function",
+        storage: Boolean(deps.ctx.storage),
+        worktree: typeof deps.ctx.worktree?.create === "function",
+        vcs: typeof deps.ctx.vcs?.diff === "function",
+      }
+      const options = {
+        maxOutputChars: deps.options.maxOutputChars,
+        maxOutputTotalChars: deps.options.maxOutputTotalChars,
+        maxTextChars: deps.options.maxTextChars,
+        maxTools: deps.options.maxTools,
+        maxPermissions: deps.options.maxPermissions,
+        queueTtlMs: deps.options.queueTtlMs,
+        livePendingTtlMs: deps.options.livePendingTtlMs,
+        pollIntervalMs: deps.options.pollIntervalMs,
+        maxPollIntervalMs: deps.options.maxPollIntervalMs,
+        permissionPollMs: deps.options.permissionPollMs,
+        requestTimeoutMs: deps.options.requestTimeoutMs,
+        allowSessionRemoval: deps.options.allowSessionRemoval,
+        allowRemoveForeignSessions: deps.options.allowRemoveForeignSessions,
+        allowCompact: deps.options.allowCompact,
+      }
+      const lines = [
+        `${t(lang, "session")}: session-bridge ${PLUGIN_VERSION}`,
+        `${t(lang, "lastUpdate")}: ${formatTimestamp(live?.lastEventAt, lang)}`,
+        `registry: owned=${registry?.owned ?? 0} open=${registry?.open ?? 0} dirty=${
+          registry?.dirtyOwned || registry?.dirtyOpen ? "yes" : "no"
+        }`,
+        `live: sessions=${live?.sessions ?? 0} pending=${live?.pending ?? 0}`,
+        `queues: sessions=${queuedPrompts.size} entries=${queueEntries}`,
+        `capabilities: ${Object.entries(capabilities)
+          .map(([key, value]) => `${key}=${value ? "yes" : "no"}`)
+          .join(" ")}`,
+      ]
+      return {
+        content: capOutput(lines.join("\n"), data.maxOutputChars, lang),
+        output: cleanOutput({
+          version: PLUGIN_VERSION,
+          capabilities,
+          registry,
+          live,
+          queues: { sessions: queuedPrompts.size, entries: queueEntries },
+          options,
+          state: "ok",
+        }),
+      }
+    },
+    "couldNotInspect",
+    (error, input) => errorFor(deps, error, input, []),
+  )
+
+  add(
+    {
       name: "interrupt",
       description: "Interrupt a session's running turn.",
       input: schema({
         type: "object",
         properties: {
-          sessionID: { type: "string", description: "ID of the session to interrupt." },
+          sessionID: { type: "string", maxLength: deps.options.maxIdChars, description: "ID of the session to interrupt." },
           resume: {
             type: "boolean",
             description: "If true, resume pending messages. Defaults to false.",
@@ -1993,16 +2812,27 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           { signal },
         ),
       )
-      clearQueuedPrompts(queuedPrompts, data.sessionID)
-      deps.liveState?.clearSession(data.sessionID)
+      const queueCleared = data.resume !== true
+      if (queueCleared) {
+        clearQueuedPrompts(queuedPrompts, data.sessionID)
+        deps.liveState?.clearSession(data.sessionID)
+      }
+      const queuedCount = listQueuedPrompts(
+        queuedPrompts,
+        data.sessionID,
+        queueOptions(deps.options),
+      ).length
       return {
         content: t(lang, "sessionInterrupted", {
-          id: data.sessionID,
+          id: oneLine(data.sessionID, 256),
           label: result?.interrupted ? t(lang, "interrupted") : t(lang, "noActiveTurn"),
         }),
         output: {
           sessionID: data.sessionID,
           interrupted: Boolean(result?.interrupted),
+          queueCleared,
+          queueResumed: queueCleared ? 0 : queuedCount,
+          queuedCount,
           state: "ok",
         },
       }
@@ -2021,12 +2851,12 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         properties: {
           limit: listLimitSchema,
           search: { type: "string", maxLength: deps.options.maxSearchChars, description: "Text to filter by title." },
-          directory: { type: "string", description: "Directory whose sessions are listed. Defaults to the current one." },
-          cursor: { type: "string", description: "Cursor from a previous response." },
+          directory: { type: "string", maxLength: deps.options.maxPathChars, description: "Directory whose sessions are listed. Defaults to the current one." },
+          cursor: { type: "string", maxLength: deps.options.maxIdChars, description: "Cursor from a previous response." },
           order: { type: "string", enum: ["asc", "desc"], description: "Sort order." },
           archived: { type: "boolean", description: "List archived sessions instead of active ones." },
-          parentID: { type: "string", description: "Only list sessions with this parent ID." },
-          subpath: { type: "string", description: "Only list sessions for this subpath." },
+          parentID: { type: "string", maxLength: deps.options.maxIdChars, description: "Only list sessions with this parent ID." },
+          subpath: { type: "string", maxLength: deps.options.maxPathChars, description: "Only list sessions for this subpath." },
           verbose: {
             type: "boolean",
             description: "Include agent, model, cost, and token details. Defaults to false.",
@@ -2058,9 +2888,12 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       )
       const nextCursor = page.cursor?.next ?? undefined
       const shown = page.data.slice(0, data.limit)
-      const sessionsOutput = shown.map((session) => {
-        const running = isRunning(session, [])
-        return cleanOutput({
+      const entries = shown.map((session) => ({
+        session,
+        running: isRunning(session, []),
+      }))
+      const sessionsOutput = entries.map(({ session, running }) =>
+        cleanOutput({
           id: session.id,
           title: boundTitle(session.title, deps.options.maxTitleChars),
           parentID: session.parentID,
@@ -2076,44 +2909,51 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
                 tokens: session.tokens,
               }
             : {}),
-        })
-      })
+        }),
+      )
       if (!shown.length) {
         return {
           content: t(lang, "noSessions"),
-          output: cleanOutput({ sessions: [], nextCursor, count: 0 }),
+          output: cleanOutput({ sessions: [], nextCursor, count: 0, state: "ok" }),
         }
       }
 
-      const lines = shown.map((session) => {
-        const state = isRunning(session, []) ? t(lang, "running") : t(lang, "idle")
-        const outcome = session.outcome ? ` (${session.outcome})` : ""
-        const parent = session.parentID ? ` | ${t(lang, "parent")}: ${session.parentID}` : ""
+      const lines = entries.map(({ session, running }) => {
+        const state = running ? t(lang, "running") : t(lang, "idle")
+        const outcome = session.outcome ? ` (${oneLine(session.outcome, 120)})` : ""
+        const parent = session.parentID
+          ? ` | ${t(lang, "parent")}: ${oneLine(session.parentID, 256)}`
+          : ""
         const title = truncateCodePoints(
           sanitizeTitle(session.title ?? t(lang, "noTitle")),
           deps.options.maxTitleChars,
         )
-        const base = `- ${session.id} | ${title} | ${state}${outcome} | ${formatTimestamp(
+        const base = `- ${oneLine(session.id, 256)} | ${title} | ${state}${outcome} | ${formatTimestamp(
           session.time?.updated,
           lang,
         )}${parent}`
         if (!data.verbose) return base
-        return `${base} | ${t(lang, "agent")}: ${session.agent ?? t(lang, "unknown")} | ${t(
-          lang,
-          "model",
-        )}: ${modelLabel(session) || t(lang, "unknown")} | ${t(lang, "cost")}: ${
+        return `${base} | ${t(lang, "agent")}: ${oneLine(
+          session.agent ?? t(lang, "unknown"),
+          256,
+        )} | ${t(lang, "model")}: ${oneLine(
+          modelLabel(session) || t(lang, "unknown"),
+          512,
+        )} | ${t(lang, "cost")}: ${
           compact(session.cost, 100) || t(lang, "unknown")
         } | ${t(lang, "tokens")}: ${compact(session.tokens, 200) || t(lang, "unknown")}`
       })
 
       let content = `${t(lang, "sessions")}:\n${lines.join("\n")}\n\n${t(lang, "statusSnapshot")}`
-      if (nextCursor) content += `\n${t(lang, "cursorNext")}: ${nextCursor}`
+      if (nextCursor) content += `\n${t(lang, "cursorNext")}: ${oneLine(nextCursor, 256)}`
       return {
         content: capOutput(content, data.maxOutputChars, lang),
         output: cleanOutput({
           sessions: sessionsOutput,
           nextCursor,
           count: sessionsOutput.length,
+          sessionsTruncated: page.data.length > shown.length,
+          state: "ok",
         }),
       }
     },
@@ -2168,7 +3008,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       input: schema({
         type: "object",
         properties: {
-          sessionID: { type: "string", description: "ID of the session to update." },
+          sessionID: { type: "string", maxLength: deps.options.maxIdChars, description: "ID of the session to update." },
           title: { type: "string", maxLength: deps.options.maxTitleChars, description: "New session title." },
           archived: { type: "boolean", description: "Archive or unarchive the session." },
           metadata: { type: "object", description: "Session metadata object." },
@@ -2176,7 +3016,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
             type: "array",
             maxItems: deps.options.maxPermissionRules,
             description: "New permission rules. allow rules require allowPermissionRules: true.",
-            items: permissionRuleSchema,
+            items: permissionRuleSchemaFor(deps),
           },
           maxOutputChars: maxOutputSchemaFor(deps),
         },
@@ -2220,9 +3060,10 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         },
       )
       type UpdateInput = Parameters<PluginContext["session"]["update"]>[0]
+      const cleanTitle = data.title !== undefined ? sanitizeTitle(data.title) : undefined
       const update: UpdateInput = {
         sessionID: data.sessionID,
-        title: data.title,
+        title: cleanTitle,
         archived: data.archived,
         metadata: data.metadata as UpdateInput["metadata"],
         permissions: data.permissions,
@@ -2231,14 +3072,9 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         deps.ctx.session.update(update, { signal }),
       )
 
-      const lines = [`${t(lang, "updated")}: ${data.sessionID}`]
+      const lines = [`${t(lang, "updated")}: ${oneLine(data.sessionID, 256)}`]
       if (data.title !== undefined) {
-        lines.push(
-          `${t(lang, "title")}: ${truncateCodePoints(
-            sanitizeTitle(data.title),
-            deps.options.maxTitleChars,
-          )}`,
-        )
+        lines.push(`${t(lang, "title")}: ${boundTitle(data.title, deps.options.maxTitleChars)}`)
       }
       if (data.archived !== undefined) {
         lines.push(
@@ -2273,7 +3109,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       input: schema({
         type: "object",
         properties: {
-          sessionID: { type: "string", description: "ID of the session to delete." },
+          sessionID: { type: "string", maxLength: deps.options.maxIdChars, description: "ID of the session to delete." },
           confirm: {
             type: "boolean",
             description: "Must be true. Confirms the destructive deletion.",
@@ -2292,6 +3128,18 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         throw new ValidationError(`${t(lang, "removeDisabled")} ${t(lang, "removeHint")}`)
       }
       if (!data.confirm) throw new ValidationError(t(lang, "confirmRequired"))
+      if (
+        !isOwnedSession(
+          deps.ownedSessions,
+          data.sessionID,
+          deps.ctx.location?.directory,
+        ) &&
+        !deps.options.allowRemoveForeignSessions
+      ) {
+        throw new ValidationError(
+          `${t(lang, "removeForeignBlocked")} ${t(lang, "removeForeignHint")}`,
+        )
+      }
       await assertPermission(
         deps,
         context,
@@ -2302,12 +3150,18 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       await withRequest(signalOf(context), deps.options.requestTimeoutMs, (signal) =>
         deps.ctx.session.remove({ sessionID: data.sessionID }, { signal }),
       )
-      await forgetOwnedSession(deps.ctx, deps.ownedSessions, data.sessionID)
-      await forgetOpenSessionsBySessionID(deps.ctx, openSessions, data.sessionID)
+      if (deps.registry) {
+        deps.registry.forgetOwned(data.sessionID)
+        deps.registry.forgetOpenBySessionID(data.sessionID)
+        await deps.registry.flush()
+      } else {
+        await forgetOwnedSession(deps.ctx, deps.ownedSessions, data.sessionID)
+        await forgetOpenSessionsBySessionID(deps.ctx, openSessions, data.sessionID)
+      }
       clearQueuedPrompts(queuedPrompts, data.sessionID)
       deps.liveState?.clearSession(data.sessionID)
       return {
-        content: `${t(lang, "removed")}: ${data.sessionID}`,
+        content: `${t(lang, "removed")}: ${oneLine(data.sessionID, 256)}`,
         output: { sessionID: data.sessionID, removed: true, state: "ok" },
       }
     },

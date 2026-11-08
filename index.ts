@@ -1,19 +1,36 @@
 import { Plugin } from "@opencode/plugin"
 import { createLiveState, type LiveState } from "./src/live.ts"
 import { parseOptions } from "./src/options.ts"
-import { loadOpenSessions, loadOwnedSessions } from "./src/registry.ts"
-import { registerTools, type ToolExecutionResult } from "./src/tools.ts"
+import {
+  createRegistryPersistence,
+  loadOpenSessions,
+  loadOwnedSessions,
+} from "./src/registry.ts"
+import {
+  registerTools,
+  type OpenInflight,
+  type SendInflight,
+  type SentMessages,
+} from "./src/tools.ts"
 import type { Lang, PluginContext, SessionEventLike } from "./src/types.ts"
+import { sleep } from "./src/wait.ts"
 
 const LANGUAGE_KEY = "language"
 const LIVE_EVENT_TYPES = [
   "session.status",
   "session.idle",
+  "session.execution.started",
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
+  "session.retry.scheduled",
   "session.inbox.enqueued",
   "session.inbox.delivered",
   "session.inbox.cancelled",
   "session.inbox.delivery.changed",
 ] as const
+const LIVE_RECONNECT_MIN_MS = 1_000
+const LIVE_RECONNECT_MAX_MS = 30_000
 
 type RegistrationLike = {
   dispose: () => Promise<void> | void
@@ -24,17 +41,27 @@ async function consumeLiveEvents(
   signal: AbortSignal,
   liveState: LiveState,
 ): Promise<void> {
-  try {
-    const stream = ctx.event.subscribe({
-      types: [...LIVE_EVENT_TYPES],
-      signal,
-    })
-    for await (const event of stream) {
-      liveState.applyEvent(event as unknown as SessionEventLike)
+  let backoff = LIVE_RECONNECT_MIN_MS
+  while (!signal.aborted) {
+    let received = false
+    try {
+      const stream = ctx.event.subscribe({
+        types: [...LIVE_EVENT_TYPES],
+        signal,
+      })
+      for await (const event of stream) {
+        received = true
+        liveState.applyEvent(event as unknown as SessionEventLike)
+      }
+    } catch {
+      // Live events are an optional enhancement; status/wait keep working
+      // through session.wait, transcript timestamps, and polling.
     }
-  } catch {
-    // Live events are an optional enhancement; status/wait keep working
-    // through session.wait, transcript timestamps, and polling.
+    if (signal.aborted) break
+    if (received) backoff = LIVE_RECONNECT_MIN_MS
+    const waited = await sleep(backoff, signal)
+    if (!waited) break
+    backoff = Math.min(backoff * 2, LIVE_RECONNECT_MAX_MS)
   }
 }
 
@@ -55,9 +82,13 @@ export default Plugin.define({
     let language: Lang = stored === "es" || stored === "en" ? stored : options.language
     const ownedSessions = await loadOwnedSessions(ctx)
     const openSessions = await loadOpenSessions(ctx)
-    const inFlightOpens = new Map<string, Promise<ToolExecutionResult>>()
+    const registry = createRegistryPersistence(ctx, ownedSessions, openSessions)
+    const inFlightOpens = new Map<string, OpenInflight>()
+    const inFlightSends = new Map<string, SendInflight>()
+    const sentMessages: SentMessages = new Map()
     const liveState = createLiveState({
       ttlMs: options.queueTtlMs,
+      pendingTtlMs: options.livePendingTtlMs,
       maxPerSession: options.maxQueuedPrompts,
     })
     const registrations: RegistrationLike[] = []
@@ -104,6 +135,9 @@ export default Plugin.define({
         openSessions,
         liveState,
         inFlightOpens,
+        inFlightSends,
+        sentMessages,
+        registry,
       })
     })
 
@@ -116,6 +150,7 @@ export default Plugin.define({
           // Unloading must not fail because a hook was already disposed.
         }
       }
+      await registry.dispose()
       liveState.clear()
     }
   },
@@ -136,12 +171,14 @@ export {
   lastIdle,
   lastUser,
   modelRef,
+  oneLine,
   parseModel,
   permissionLine,
   reasoningText,
   renderTranscript,
   renderTranscriptDetailed,
   sanitizeTitle,
+  stripAnsi,
   summarizeTurn,
   titleFromPrompt,
   toolLine,

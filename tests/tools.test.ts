@@ -11,6 +11,24 @@ import type {
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
+function delayWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"))
+      return
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(signal?.reason ?? new DOMException("Aborted", "AbortError"))
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
 type FakeSession = {
   id: string
   title?: string
@@ -66,7 +84,11 @@ type HarnessOptions = {
   promptError?: Error
   failPromptOnce?: boolean
   contextError?: Error
+  contextDelayMs?: number
+  permissionListError?: Error
   assertError?: Error
+  /** Scripted per-call assert errors; undefined means allow. */
+  assertErrors?: Array<Error | undefined>
   cursorNext?: string | null
   modelDefault?: unknown
   createGate?: Promise<void>
@@ -154,6 +176,8 @@ function makeHarness(options: HarnessOptions = {}) {
   }
 
   const interruptCalls: Array<Record<string, unknown>> = []
+  const compactCalls: Array<Record<string, unknown>> = []
+  let permissionCalls = 0
   const ctx = {
     options: options.options ?? {},
     location: { directory: "C:/repo" },
@@ -267,8 +291,14 @@ function makeHarness(options: HarnessOptions = {}) {
         }
         return admission
       },
-      context: async (input: { sessionID: string }) => {
+      context: async (
+        input: { sessionID: string },
+        requestOptions?: { signal?: AbortSignal },
+      ) => {
         contextCalls++
+        if (options.contextDelayMs) {
+          await delayWithSignal(options.contextDelayMs, requestOptions?.signal)
+        }
         if (options.contextError) throw options.contextError
         if (options.contextSnapshots?.length) {
           return options.contextSnapshots[Math.min(contextCalls - 1, options.contextSnapshots.length - 1)]
@@ -292,6 +322,31 @@ function makeHarness(options: HarnessOptions = {}) {
         interruptCalls.push(input)
         return { interrupted: true }
       },
+      compact: async (input: Record<string, unknown>) => {
+        compactCalls.push(input)
+        const id = String(input.id ?? `cmp_${compactCalls.length}`)
+        const created = now++
+        const entry = {
+          id,
+          sessionID: String(input.sessionID),
+          time: { created },
+          type: "compaction" as const,
+          payload: {},
+          delivery: input.delivery ?? "steer",
+        }
+        const list = messages.get(String(input.sessionID)) ?? []
+        list.push({ id, type: "compaction", status: "completed", time: { created } })
+        if (options.autoComplete !== false) {
+          list.push({
+            id: `${id}_idle`,
+            type: "idle",
+            outcome: "succeeded",
+            time: { created: created + 1 },
+          })
+        }
+        messages.set(String(input.sessionID), list)
+        return entry
+      },
       list: async (input: Record<string, unknown>) => {
         listCalls.push(input)
         return { data: [...sessions.values()], cursor: { next: options.cursorNext ?? null } }
@@ -313,7 +368,11 @@ function makeHarness(options: HarnessOptions = {}) {
       },
     },
     permission: {
-      list: async (input: { sessionID: string }) => permissions.get(input.sessionID) ?? [],
+      list: async (input: { sessionID: string }) => {
+        permissionCalls++
+        if (options.permissionListError) throw options.permissionListError
+        return permissions.get(input.sessionID) ?? []
+      },
       reply: async (input: Record<string, unknown>) => {
         replyCalls.push(input)
         const list = permissions.get(String(input.sessionID)) ?? []
@@ -325,6 +384,8 @@ function makeHarness(options: HarnessOptions = {}) {
       assert: async (input: Record<string, unknown>) => {
         assertCalls.push(input)
         if (options.assertError) throw options.assertError
+        const scripted = options.assertErrors?.shift()
+        if (scripted) throw scripted
       },
     },
     tool: {
@@ -360,6 +421,7 @@ function makeHarness(options: HarnessOptions = {}) {
     listCalls,
     assertCalls,
     interruptCalls,
+    compactCalls,
     hooks,
     emit,
     async callHook(name: string, input: unknown) {
@@ -380,6 +442,9 @@ function makeHarness(options: HarnessOptions = {}) {
     },
     get modelDefaultCalls() {
       return modelDefaultCalls
+    },
+    get permissionCalls() {
+      return permissionCalls
     },
   }
 
@@ -434,7 +499,8 @@ function tool(index: number) {
   }
 }
 
-type NumericSchema = { minimum?: number; maximum?: number }
+type NumericBranch = { const?: number; minimum?: number; maximum?: number }
+type NumericSchema = NumericBranch & { anyOf?: NumericBranch[] }
 
 function numericSchema(tool: FakeTool | undefined, field: string): NumericSchema {
   const input = tool?.input as
@@ -443,10 +509,16 @@ function numericSchema(tool: FakeTool | undefined, field: string): NumericSchema
   return input?.properties?.[field] ?? {}
 }
 
-function schemaAccepts(schema: NumericSchema, value: number): boolean {
-  if (schema.minimum !== undefined && value < schema.minimum) return false
-  if (schema.maximum !== undefined && value > schema.maximum) return false
+function branchAccepts(branch: NumericBranch, value: number): boolean {
+  if (branch.const !== undefined) return value === branch.const
+  if (branch.minimum !== undefined && value < branch.minimum) return false
+  if (branch.maximum !== undefined && value > branch.maximum) return false
   return true
+}
+
+function schemaAccepts(schema: NumericSchema, value: number): boolean {
+  if (schema.anyOf) return schema.anyOf.some((branch) => branchAccepts(branch, value))
+  return branchAccepts(schema, value)
 }
 
 function permissionAt(index: number): PermissionLike {
@@ -536,7 +608,7 @@ describe("sessions tools", () => {
       (message) => message.id === "msg_same",
     )
     expect(users).toHaveLength(1)
-    expect(harness.state.promptCalls).toHaveLength(2)
+    expect(harness.state.promptCalls).toHaveLength(1)
   })
 
   it("status with recent: 0 uses the default and does not show every tool", async () => {
@@ -668,7 +740,9 @@ describe("sessions tools", () => {
       "confirm: true",
     )
 
-    const allowed = makeHarness({ options: { allowSessionRemoval: true } })
+    const allowed = makeHarness({
+      options: { allowSessionRemoval: true, allowRemoveForeignSessions: true },
+    })
     expect(await allowed.execute("remove", { sessionID: "ses_1", confirm: true })).toContain(
       "Session removed",
     )
@@ -797,6 +871,8 @@ describe("sessions tools", () => {
       "remove",
       "interrupt",
       "language",
+      "compact",
+      "diagnostics",
     ]) {
       expect(harness.tools.get(name)?.output, name).toBeTruthy()
     }
@@ -1116,9 +1192,6 @@ describe("sessions tools", () => {
       ["read", "limit"],
       ["status", "recent"],
       ["list", "limit"],
-      ["status", "maxOutputChars"],
-      ["status", "maxText"],
-      ["open", "maxOutputChars"],
       ["permissions", "limit"],
     ]
     for (const [toolName, field] of zeroCases) {
@@ -1126,6 +1199,19 @@ describe("sessions tools", () => {
       expect(schema.minimum, `${toolName}.${field}`).toBe(0)
       expect(schemaAccepts(schema, 0), `${toolName}.${field}`).toBe(true)
       expect(schemaAccepts(schema, -1), `${toolName}.${field}`).toBe(false)
+    }
+    for (const [toolName, field, minimum] of [
+      ["status", "maxOutputChars", 1_000],
+      ["open", "maxOutputChars", 1_000],
+      ["read", "maxOutputChars", 1_000],
+      ["status", "maxText", 100],
+    ] as const) {
+      const schema = numericSchema(harness.tools.get(toolName), field)
+      expect(schema.anyOf, `${toolName}.${field}`).toBeTruthy()
+      expect(schemaAccepts(schema, 0), `${toolName}.${field} 0`).toBe(true)
+      expect(schemaAccepts(schema, minimum), `${toolName}.${field} min`).toBe(true)
+      expect(schemaAccepts(schema, minimum - 1), `${toolName}.${field} below`).toBe(false)
+      expect(schemaAccepts(schema, -1), `${toolName}.${field} negative`).toBe(false)
     }
     const timeout = numericSchema(harness.tools.get("open"), "timeoutMs")
     expect(timeout.minimum).toBe(1)
@@ -1405,7 +1491,11 @@ describe("sessions tools", () => {
 
   it("P0-6: interrupt and remove clear the queue, and entries expire by TTL", async () => {
     const harness = makeHarness({
-      options: { allowInterruptForeignSessions: true, allowSessionRemoval: true },
+      options: {
+        allowInterruptForeignSessions: true,
+        allowSessionRemoval: true,
+        allowRemoveForeignSessions: true,
+      },
       autoComplete: false,
     })
     await harness.executeRaw("send", {
@@ -1477,11 +1567,12 @@ describe("sessions tools", () => {
     })
     await harness.ready
 
+    const retryAt = Date.now() + 5_000
     harness.emit({
       type: "session.status",
       data: {
         sessionID: "ses_1",
-        status: { type: "retry", attempt: 2, message: "rate limited", next: 5_000 },
+        status: { type: "retry", attempt: 2, message: "rate limited", next: retryAt },
       },
     })
     await delay(5)
@@ -1492,10 +1583,19 @@ describe("sessions tools", () => {
     })
     expect(status.output).toMatchObject({
       state: "retrying",
-      retry: { attempt: 2, message: "rate limited", next: 5_000 },
+      retry: {
+        attempt: 2,
+        message: "rate limited",
+        next: retryAt,
+        retryAt: new Date(retryAt).toISOString(),
+      },
     })
+    const retryOutput = (status.output as Record<string, unknown>).retry as Record<string, unknown>
+    expect(Number(retryOutput.retryInMs)).toBeLessThanOrEqual(5_000)
     expect(status.content).toContain("retrying")
     expect(status.content).toContain("rate limited")
+    expect(status.content).toMatch(/next in [45]s/)
+    expect(status.content).not.toMatch(/next in \d{6,}s/)
 
     harness.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
     await delay(5)
@@ -1574,5 +1674,625 @@ describe("sessions tools", () => {
     const allowed = makeHarness({ options: { allowInterruptForeignSessions: true } })
     await allowed.executeRaw("interrupt", { sessionID: "ses_1" })
     expect(allowed.state.interruptCalls).toHaveLength(1)
+  })
+
+  it("P0-1: retry renders remaining seconds and exposes retryAt/retryInMs", async () => {
+    const harness = makeHarness({ enableLive: true })
+    await harness.ready
+    const future = Date.now() + 5_000
+    harness.emit({
+      type: "session.status",
+      data: {
+        sessionID: "ses_1",
+        status: { type: "retry", attempt: 2, message: "rate limited", next: future },
+      },
+    })
+    await delay(5)
+    let result = await harness.executeRaw("status", {
+      sessionID: "ses_1",
+      includeText: false,
+      includeTools: false,
+    })
+    let retry = (result.output as Record<string, unknown>).retry as Record<string, unknown>
+    expect(result.content).toMatch(/next in [45]s/)
+    expect(result.content).not.toMatch(/next in \d{6,}s/)
+    expect(retry).toMatchObject({
+      attempt: 2,
+      message: "rate limited",
+      next: future,
+      retryAt: new Date(future).toISOString(),
+    })
+    expect(Number(retry.retryInMs)).toBeLessThanOrEqual(5_000)
+    expect(Number(retry.retryInMs)).toBeGreaterThan(0)
+
+    const past = Date.now() - 1_000
+    harness.emit({
+      type: "session.status",
+      data: {
+        sessionID: "ses_1",
+        status: { type: "retry", attempt: 3, message: "still limited", next: past },
+      },
+    })
+    await delay(5)
+    result = await harness.executeRaw("status", {
+      sessionID: "ses_1",
+      includeText: false,
+      includeTools: false,
+    })
+    retry = (result.output as Record<string, unknown>).retry as Record<string, unknown>
+    expect(result.content).toContain("next in 0s")
+    expect(retry.retryInMs).toBe(0)
+  })
+
+  it("P0-3: status output respects the global budget and preserves critical fields", async () => {
+    const resources = Array.from(
+      { length: 10 },
+      (_, index) => `resource-${index}-${"r".repeat(200)}`,
+    )
+    const save = Array.from(
+      { length: 10 },
+      (_, index) => `save-${index}-${"s".repeat(200)}`,
+    )
+    const pending = Array.from({ length: 20 }, (_, index) => ({
+      id: `per_${index}`,
+      sessionID: "ses_1",
+      action: "shell",
+      resources,
+      save,
+      message: "m".repeat(200),
+    }))
+    const manyTools = Array.from({ length: 40 }, (_, index) => ({
+      type: "tool",
+      id: `tool_${index}`,
+      name: "read",
+      state: {
+        status: "completed",
+        input: { path: `file-${index}-${"p".repeat(300)}` },
+        content: [{ type: "text", text: "t".repeat(300) }],
+      },
+    }))
+    const harness = makeHarness({
+      options: { maxOutputTotalChars: 20_000 },
+      messages: {
+        ses_1: [
+          { id: "u1", type: "user", text: "run", time: { created: 1 } },
+          {
+            id: "a1",
+            type: "assistant",
+            content: [{ type: "text", text: "x".repeat(100_000) }, ...manyTools],
+            time: { created: 2 },
+          },
+          { id: "i1", type: "idle", outcome: "succeeded", time: { created: 3 } },
+        ],
+      },
+      permissions: { ses_1: pending },
+    })
+    const result = await harness.executeRaw("status", {
+      sessionID: "ses_1",
+      maxOutputChars: 1_000,
+    })
+    const output = result.output as Record<string, unknown>
+    expect((result.content ?? "").length).toBeLessThanOrEqual(1_000)
+    expect(JSON.stringify(output).length).toBeLessThanOrEqual(20_000)
+    expect(output.sessionID).toBe("ses_1")
+    expect(output.state).toBe("permission")
+    expect(output.lastMessageID).toBe("i1")
+    expect(output.pendingTotal).toBe(20)
+    expect(output.pendingTruncated).toBe(true)
+    expect((output.pendingPermissions as Array<{ id: string }>)[0]?.id).toBe("per_0")
+    expect(output.textTruncated).toBe(true)
+    expect(output.toolsTruncated).toBe(true)
+    expect(Number(output.textLength)).toBeLessThanOrEqual(100_000)
+  })
+
+  it("P0-3: permissions with a large limit also respect the global budget", async () => {
+    const pending = Array.from({ length: 100 }, (_, index) => ({
+      id: `per_${index}`,
+      sessionID: "ses_1",
+      action: "shell",
+      resources: Array.from({ length: 10 }, () => "r".repeat(2_000)),
+      save: Array.from({ length: 10 }, () => "s".repeat(2_000)),
+      message: "m".repeat(2_000),
+    }))
+    const harness = makeHarness({
+      options: { maxOutputTotalChars: 20_000 },
+      permissions: { ses_1: pending },
+    })
+    const result = await harness.executeRaw("permissions", {
+      sessionID: "ses_1",
+      limit: 100,
+    })
+    const output = result.output as Record<string, unknown>
+    expect(JSON.stringify(output).length).toBeLessThanOrEqual(20_000)
+    expect(output.pendingTotal).toBe(100)
+    expect(output.pendingTruncated).toBe(true)
+    expect((output.pending as Array<{ id: string }>)[0]?.id).toBe("per_0")
+    expect((result.content ?? "").length).toBeLessThanOrEqual(20_000)
+  })
+
+  it("P0-3: read, list, and permissions report state ok", async () => {
+    const harness = makeHarness()
+    for (const [name, input] of [
+      ["read", { sessionID: "ses_1" }],
+      ["list", {}],
+      ["permissions", { sessionID: "ses_1" }],
+    ] as const) {
+      const result = await harness.executeRaw(name, input)
+      expect(result.output, name).toMatchObject({ state: "ok" })
+    }
+    const failed = await harness.executeRaw("read", { sessionID: "" })
+    expect(failed.output).toMatchObject({ state: "error" })
+  })
+
+  it("P0-2: concurrent open with a different signature is a conflict", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const harness = makeHarness({ createGate: gate })
+    const first = harness.executeRaw("open", {
+      prompt: "first prompt",
+      messageID: "msg_conflict",
+    })
+    await delay(10)
+    const second = await harness.executeRaw("open", {
+      prompt: "different prompt",
+      messageID: "msg_conflict",
+    })
+    expect(second.output).toMatchObject({ state: "error" })
+    expect(String((second.output as Record<string, unknown>).error)).toMatch(
+      /different signature/i,
+    )
+    release()
+    const one = await first
+    expect(one.output).toMatchObject({ state: "idle" })
+    expect(harness.state.createCalls).toBe(1)
+    expect(harness.state.promptCalls.filter((call) => call.id === "msg_conflict")).toHaveLength(1)
+  })
+
+  it("P0-2: a second caller cannot skip permission.assert via deduplication", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const harness = makeHarness({
+      createGate: gate,
+      assertErrors: [undefined, new Error("denied for second caller")],
+    })
+    const first = harness.executeRaw("open", {
+      prompt: "same prompt",
+      messageID: "msg_perm",
+    })
+    await delay(10)
+    await expect(
+      harness.executeRaw("open", { prompt: "same prompt", messageID: "msg_perm" }),
+    ).rejects.toThrow("denied for second caller")
+    release()
+    await first
+    expect(harness.state.createCalls).toBe(1)
+    expect(harness.state.promptCalls).toHaveLength(1)
+    expect(harness.state.assertCalls).toHaveLength(2)
+  })
+
+  it("P0-2: aborting one identical open caller does not cancel the other", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const harness = makeHarness({ createGate: gate })
+    const controller = new AbortController()
+    const first = harness.executeRaw(
+      "open",
+      { prompt: "shared prompt", messageID: "msg_abort" },
+      { signal: controller.signal },
+    )
+    await delay(10)
+    const second = harness.executeRaw("open", {
+      prompt: "shared prompt",
+      messageID: "msg_abort",
+    })
+    await delay(10)
+    controller.abort()
+    release()
+    const [firstResult, secondResult] = await Promise.allSettled([first, second])
+    expect(firstResult.status).toBe("rejected")
+    if (firstResult.status === "rejected") {
+      expect((firstResult.reason as Error).name).toBe("AbortError")
+    }
+    expect(secondResult.status).toBe("fulfilled")
+    if (secondResult.status === "fulfilled") {
+      expect(secondResult.value.output).toMatchObject({ state: "idle" })
+    }
+    expect(harness.state.createCalls).toBe(1)
+    expect(harness.state.promptCalls).toHaveLength(1)
+  })
+
+  it("P0-5: remove requires ownership or an explicit opt-in", async () => {
+    const foreign = makeHarness({ options: { allowSessionRemoval: true } })
+    const denied = await foreign.executeRaw("remove", { sessionID: "ses_1", confirm: true })
+    expect(denied.output).toMatchObject({ state: "error" })
+    expect(String((denied.output as Record<string, unknown>).error)).toContain(
+      "allowRemoveForeignSessions",
+    )
+    expect(foreign.state.removeCalls).toHaveLength(0)
+
+    const optedIn = makeHarness({
+      options: { allowSessionRemoval: true, allowRemoveForeignSessions: true },
+    })
+    const removed = await optedIn.executeRaw("remove", { sessionID: "ses_1", confirm: true })
+    expect(removed.output).toMatchObject({ state: "ok", removed: true })
+    expect(optedIn.state.removeCalls).toEqual(["ses_1"])
+
+    const adopted = makeHarness({ options: { allowSessionRemoval: true } })
+    await adopted.executeRaw("open", { sessionID: "ses_1", prompt: "adopt" })
+    const adoptedResult = await adopted.executeRaw("remove", {
+      sessionID: "ses_1",
+      confirm: true,
+    })
+    expect(adoptedResult.output).toMatchObject({ state: "ok", removed: true })
+    expect(adopted.state.removeCalls).toEqual(["ses_1"])
+  })
+
+  it("P0-6: send retries reuse the admission and do not reapply switches", async () => {
+    const harness = makeHarness()
+    const first = await harness.executeRaw("send", {
+      sessionID: "ses_1",
+      prompt: "hola",
+      messageID: "msg_x",
+      model: "p/other",
+      agent: "build",
+    })
+    expect(first.output).toMatchObject({ state: "idle", alreadySent: false })
+    const second = await harness.executeRaw("send", {
+      sessionID: "ses_1",
+      prompt: "hola",
+      messageID: "msg_x",
+      model: "p/other",
+      agent: "build",
+    })
+    expect(second.output).toMatchObject({ state: "idle", alreadySent: true, reused: true })
+    expect(harness.state.promptCalls.filter((call) => call.id === "msg_x")).toHaveLength(1)
+    expect(harness.state.switchModelCalls).toHaveLength(1)
+    expect(harness.state.switchAgentCalls).toHaveLength(1)
+
+    const conflict = await harness.executeRaw("send", {
+      sessionID: "ses_1",
+      prompt: "different",
+      messageID: "msg_x",
+      model: "p/other",
+      agent: "build",
+    })
+    expect(conflict.output).toMatchObject({ state: "error" })
+    expect(String((conflict.output as Record<string, unknown>).error)).toContain(
+      "different prompt",
+    )
+    expect(harness.state.promptCalls).toHaveLength(1)
+  })
+
+  it("P0-6: send skips a switch when the session already has the target model/agent", async () => {
+    const harness = makeHarness({
+      sessions: [
+        fakeSession("ses_1", {
+          model: { providerID: "p", id: "m" },
+          agent: "build",
+        }),
+      ],
+    })
+    await harness.executeRaw("send", {
+      sessionID: "ses_1",
+      prompt: "already",
+      model: "p/m",
+      agent: "build",
+    })
+    expect(harness.state.switchModelCalls).toHaveLength(0)
+    expect(harness.state.switchAgentCalls).toHaveLength(0)
+
+    await harness.executeRaw("send", {
+      sessionID: "ses_1",
+      prompt: "change",
+      model: "p/other",
+      agent: "plan",
+    })
+    expect(harness.state.switchModelCalls).toHaveLength(1)
+    expect(harness.state.switchAgentCalls).toHaveLength(1)
+  })
+
+  it("P0-6: concurrent send with the same messageID admits once", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const harness = makeHarness({ promptGate: gate })
+    const first = harness.executeRaw("send", {
+      sessionID: "ses_1",
+      prompt: "same",
+      messageID: "msg_conc",
+    })
+    const second = harness.executeRaw("send", {
+      sessionID: "ses_1",
+      prompt: "same",
+      messageID: "msg_conc",
+    })
+    await delay(10)
+    release()
+    const [one, two] = await Promise.all([first, second])
+    expect(one.output).toMatchObject({ state: "idle" })
+    expect(two.output).toMatchObject({ state: "idle", alreadySent: false })
+    expect(harness.state.promptCalls).toHaveLength(1)
+  })
+
+  it("P1-1: a host abort during create rejects instead of returning content", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const harness = makeHarness({ createGate: gate })
+    const controller = new AbortController()
+    const promise = harness.executeRaw(
+      "open",
+      { prompt: "abort me" },
+      { signal: controller.signal },
+    )
+    await delay(10)
+    controller.abort()
+    release()
+    await expect(promise).rejects.toMatchObject({ name: "AbortError" })
+    expect(harness.state.createCalls).toBe(1)
+  })
+
+  it("P1-1: aborting wait propagates the host cancellation", async () => {
+    const harness = makeHarness({
+      options: { waitMode: "missing" },
+      autoComplete: false,
+      messages: {
+        ses_1: [{ id: "u_run", type: "user", text: "running", time: { created: 1 } }],
+      },
+    })
+    const controller = new AbortController()
+    const promise = harness.executeRaw(
+      "wait",
+      { sessionID: "ses_1", timeoutMs: 5_000 },
+      { signal: controller.signal },
+    )
+    await delay(30)
+    controller.abort()
+    await expect(promise).rejects.toMatchObject({ name: "AbortError" })
+  })
+
+  it("P1-2: wait respects the end-to-end timeout and bounds permission.list", async () => {
+    const harness = makeHarness({
+      options: { waitMode: "missing", requestTimeoutMs: 5_000 },
+      contextDelayMs: 10_000,
+      autoComplete: false,
+    })
+    const started = Date.now()
+    const result = await harness.executeRaw("wait", {
+      sessionID: "ses_1",
+      timeoutMs: 1_000,
+    })
+    const elapsed = Date.now() - started
+    expect(elapsed).toBeLessThan(1_400)
+    expect(result.output).toMatchObject({ state: "timeout" })
+    expect(harness.state.permissionCalls).toBeLessThanOrEqual(2)
+  })
+
+  it("P1-4: execution failures surface lastOutcome/lastError and stale live status is ignored", async () => {
+    const failed = makeHarness({ enableLive: true })
+    await failed.ready
+    failed.emit({
+      type: "session.execution.failed",
+      data: { sessionID: "ses_1", error: { message: "execution boom" } },
+    })
+    await delay(5)
+    const failedStatus = await failed.executeRaw("status", {
+      sessionID: "ses_1",
+      includeText: false,
+      includeTools: false,
+    })
+    expect(failedStatus.output).toMatchObject({
+      state: "idle",
+      lastOutcome: "failed",
+      lastError: "execution boom",
+    })
+    expect(failedStatus.content).toContain("execution boom")
+
+    const updated = Date.now() + 100_000
+    const stale = makeHarness({
+      enableLive: true,
+      sessions: [
+        fakeSession("ses_1", {
+          time: { created: 1, updated, busy: 10, idle: 5 },
+        }),
+      ],
+    })
+    await stale.ready
+    stale.emit({
+      type: "session.status",
+      data: { sessionID: "ses_1", status: { type: "idle" } },
+    })
+    await delay(5)
+    const staleStatus = await stale.executeRaw("status", {
+      sessionID: "ses_1",
+      includeText: false,
+      includeTools: false,
+    })
+    expect(staleStatus.output).toMatchObject({
+      state: "running",
+      running: true,
+      liveStale: true,
+    })
+  })
+
+  it("P1-5: status keeps running when only the transcript fails", async () => {
+    const harness = makeHarness({
+      sessions: [
+        fakeSession("ses_busy", {
+          time: { created: 1, updated: 5, busy: 10, idle: 5 },
+        }),
+      ],
+      contextError: new Error("transcript down"),
+    })
+    const result = await harness.executeRaw("status", { sessionID: "ses_busy" })
+    expect(result.output).toMatchObject({
+      state: "running",
+      running: true,
+      transcriptAvailable: false,
+    })
+    expect(String((result.output as Record<string, unknown>).contextError)).toContain(
+      "transcript down",
+    )
+  })
+
+  it("P1-5: a permission.list failure is not reported as a clean idle", async () => {
+    const harness = makeHarness({ permissionListError: new Error("permissions down") })
+    const result = await harness.executeRaw("status", { sessionID: "ses_1" })
+    expect(result.output).toMatchObject({
+      state: "error",
+      permissionsAvailable: false,
+    })
+    expect(String((result.output as Record<string, unknown>).permissionError)).toContain(
+      "permissions down",
+    )
+  })
+
+  it("P1-6: interrupt resume true preserves the queue and false clears it", async () => {
+    const harness = makeHarness({
+      options: { allowInterruptForeignSessions: true },
+      autoComplete: false,
+    })
+    for (const [messageID, prompt] of [
+      ["msg_q1", "first"],
+      ["msg_q2", "second"],
+    ] as const) {
+      await harness.executeRaw("send", {
+        sessionID: "ses_1",
+        prompt,
+        delivery: "queue",
+        wait: false,
+        messageID,
+      })
+    }
+    const resumed = await harness.executeRaw("interrupt", {
+      sessionID: "ses_1",
+      resume: true,
+    })
+    expect(resumed.output).toMatchObject({
+      state: "ok",
+      queueCleared: false,
+      queueResumed: 2,
+      queuedCount: 2,
+    })
+    let status = await harness.executeRaw("status", {
+      sessionID: "ses_1",
+      includeText: false,
+      includeTools: false,
+    })
+    expect(status.output).toMatchObject({ queued: true, queuedCount: 2 })
+
+    const cleared = await harness.executeRaw("interrupt", {
+      sessionID: "ses_1",
+      resume: false,
+    })
+    expect(cleared.output).toMatchObject({
+      state: "ok",
+      queueCleared: true,
+      queueResumed: 0,
+    })
+    status = await harness.executeRaw("status", {
+      sessionID: "ses_1",
+      includeText: false,
+      includeTools: false,
+    })
+    expect(status.output).toMatchObject({ queued: false, queuedCount: 0 })
+  })
+
+  it("P1-8: read does not advance past a partially rendered message", async () => {
+    const harness = makeHarness({
+      messages: {
+        ses_1: [
+          { id: "prev", type: "user", text: "previous", time: { created: 1 } },
+          { id: "huge", type: "user", text: "x".repeat(100_000), time: { created: 2 } },
+        ],
+      },
+    })
+    const partial = await harness.executeRaw("read", {
+      sessionID: "ses_1",
+      afterMessageID: "prev",
+      maxOutputChars: 1_000,
+    })
+    expect(partial.output).toMatchObject({
+      partial: true,
+      partialMessageID: "huge",
+      nextAfterMessageID: "prev",
+      state: "ok",
+    })
+    expect((partial.content ?? "").length).toBeLessThanOrEqual(1_000)
+
+    const complete = await harness.executeRaw("read", {
+      sessionID: "ses_1",
+      afterMessageID: "prev",
+      maxOutputChars: 20_000,
+    })
+    expect(complete.output).toMatchObject({
+      partial: false,
+      nextAfterMessageID: "huge",
+    })
+    expect(complete.content).toContain("User: xxx")
+  })
+
+  it("P0-4: identifiers are bounded and prompts count code points", async () => {
+    const harness = makeHarness()
+    const tooLong = await harness.executeRaw("status", { sessionID: "s".repeat(10_000) })
+    expect(tooLong.output).toMatchObject({ state: "error" })
+    expect(String((tooLong.output as Record<string, unknown>).error)).toContain("sessionID")
+
+    const emojis = "😀".repeat(60_000)
+    const opened = await harness.executeRaw("open", { prompt: emojis })
+    expect(opened.output).toMatchObject({ state: "idle" })
+    expect(harness.state.createCalls).toBe(1)
+  })
+
+  it("P0-4: update sanitizes titles before persisting and rendering", async () => {
+    const harness = makeHarness({ options: { allowUpdateForeignSessions: true } })
+    const result = await harness.executeRaw("update", {
+      sessionID: "ses_1",
+      title: "a\nb\r\u2028c\u001b[31mRED\u001b[0m",
+    })
+    const title = harness.state.updateCalls[0]?.title
+    expect(title).toBe("a b cRED")
+    expect(String(title)).not.toMatch(/[\r\n\u2028\u2029\x1b]/)
+    expect(result.content).not.toMatch(/\u001b/)
+  })
+
+  it("P2: compact requires opt-in and waits for the compaction anchor", async () => {
+    const disabled = makeHarness()
+    const denied = await disabled.executeRaw("compact", { sessionID: "ses_1" })
+    expect(denied.output).toMatchObject({ state: "error" })
+    expect(disabled.state.compactCalls).toHaveLength(0)
+
+    const harness = makeHarness({
+      options: { allowCompact: true, allowUpdateForeignSessions: true },
+    })
+    const result = await harness.executeRaw("compact", {
+      sessionID: "ses_1",
+      wait: true,
+    })
+    expect(result.output).toMatchObject({ state: "idle", compactionID: "cmp_1" })
+    expect(harness.state.compactCalls).toHaveLength(1)
+  })
+
+  it("P2: diagnostics reports capabilities and bounded state", async () => {
+    const harness = makeHarness()
+    await harness.executeRaw("open", { prompt: "hi" })
+    const result = await harness.executeRaw("diagnostics", {})
+    expect(result.output).toMatchObject({
+      version: "2.0.0",
+      state: "ok",
+      capabilities: expect.any(Object),
+      registry: expect.any(Object),
+      live: expect.any(Object),
+      queues: expect.any(Object),
+    })
+    expect(JSON.stringify(result.output).length).toBeLessThanOrEqual(20_000)
   })
 })
