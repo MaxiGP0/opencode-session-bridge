@@ -28,6 +28,9 @@ All notable changes to this project are documented here. The format follows
 - `read` no longer advances `nextAfterMessageID` past a message that was only
   partially rendered. `partial` and `partialMessageID` tell the caller to
   re-read with a larger budget.
+- Tool `output` values are recursively JSON-safe: nested `undefined` fields
+  (for example `diagnostics.live.lastEventAt`) are omitted so Code Mode can
+  validate the result.
 - `interrupt({ resume: true })` preserves the local queue instead of clearing
   it; `resume: false` clears it. Output adds `queueCleared`, `queueResumed`, and
   `queuedCount`.

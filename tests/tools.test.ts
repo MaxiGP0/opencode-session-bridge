@@ -2293,6 +2293,8 @@ describe("sessions tools", () => {
       live: expect.any(Object),
       queues: expect.any(Object),
     })
+    // Code Mode requires a pure JSON value: no nested `undefined`.
+    expect(JSON.parse(JSON.stringify(result.output))).toEqual(result.output)
     expect(JSON.stringify(result.output).length).toBeLessThanOrEqual(20_000)
   })
 })

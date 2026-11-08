@@ -146,6 +146,37 @@ export function cleanOutput(output: Record<string, unknown>): Record<string, unk
   return cleaned
 }
 
+/**
+ * Recursively converts a tool output into a JSON value. Code Mode rejects
+ * outputs that contain `undefined` (even inside nested objects), so top-level
+ * `cleanOutput` is not enough for diagnostics/live/registry stats.
+ */
+export function jsonSafe(value: unknown, path = new WeakSet<object>()): unknown {
+  if (value === undefined) return undefined
+  if (value === null) return null
+  const type = typeof value
+  if (type === "string" || type === "number" || type === "boolean") return value
+  if (type === "bigint") return String(value)
+  if (type === "function" || type === "symbol") return undefined
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      const converted = jsonSafe(item, path)
+      return converted === undefined ? null : converted
+    })
+  }
+  if (type !== "object") return undefined
+  const object = value as Record<string, unknown>
+  if (path.has(object)) return "[Circular]"
+  path.add(object)
+  const result: Record<string, unknown> = {}
+  for (const [key, item] of Object.entries(object)) {
+    const converted = jsonSafe(item, path)
+    if (converted !== undefined) result[key] = converted
+  }
+  path.delete(object)
+  return result
+}
+
 export function boundedPermissionLine(
   request: PermissionLike,
   lang: Lang,

@@ -31,6 +31,7 @@ import {
   boundedPermissionLine,
   cleanOutput,
   errorOutput,
+  jsonSafe,
   outputBudget,
   stringField,
 } from "./output.ts"
@@ -911,7 +912,11 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           return {
             content: capOutput(result.content, deps.options.maxOutputChars, lang),
             ...(result.output !== undefined
-              ? { output: boundOutputTotal(result.output, deps.options.maxOutputTotalChars) }
+              ? {
+                  output: jsonSafe(
+                    boundOutputTotal(result.output, deps.options.maxOutputTotalChars),
+                  ),
+                }
               : {}),
             ...(result.metadata !== undefined ? { metadata: result.metadata } : {}),
           }
@@ -931,7 +936,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
               deps.options.maxOutputChars,
               lang,
             ),
-            output: boundOutputTotal(output, deps.options.maxOutputTotalChars),
+            output: jsonSafe(boundOutputTotal(output, deps.options.maxOutputTotalChars)),
           }
         }
       },
