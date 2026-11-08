@@ -20,17 +20,30 @@ session list and can be inspected or resumed later.
 - Wait for the **exact turn** admitted by `session.prompt`, anchored by the
   message ID returned by the server.
 - Wait for a specific queued or background turn with `wait({ messageID })`.
-- Event-driven waiting (`session.wait` + `session.idle` / `session.status`
-  events) with a bounded polling fallback, a short settle phase when the
-  transcript lags behind the terminal event, and automatic re-arming when an
-  event belongs to a previous turn.
+- Event-driven waiting (`session.wait`, `session.idle` / `session.status`, and
+  durable `session.execution.*` / `session.retry.scheduled` events) with a
+  bounded polling fallback, a short settle phase when the transcript lags
+  behind the terminal event, and automatic re-arming when an event belongs to a
+  previous turn.
 - Live provider retry state: `status` and `wait` report `retrying` with the
-  attempt, reason, and next retry instead of treating a backoff as an error.
+  attempt, reason, and the **absolute** next retry timestamp. Content shows the
+  remaining seconds; `output.retry` also exposes `retryAt` and `retryInMs`.
 - Background queue tracking: FIFO per session with `queuedCount`,
   `queuedMessageIDs`, a TTL, a size limit, and cleanup on `interrupt`/`remove`.
+  `interrupt({ resume: true })` preserves the local queue.
 - Idempotent retries with an optional `messageID` and `open({ sessionID })`;
   the plugin persists a per-directory `messageID -> sessionID` mapping and
-  serializes concurrent `open` calls with the same key.
+  serializes concurrent `open` calls with the same key. Each caller runs its
+  own `permission.assert`, and a different signature for the same key is a
+  conflict instead of a silent reuse.
+- Idempotent `send`: repeating the same `messageID` and signature does not
+  reapply model/agent switches or send a second prompt.
+- Output is bounded globally by `maxOutputTotalChars`, not only field by field.
+- Untrusted metadata (IDs, titles, permission fields, tool names, file labels,
+  and errors in `content`) is reduced to one line; ANSI and newline injection
+  cannot create fake status lines.
+- Compact a session (`sessions.compact`, opt-in) and inspect plugin
+  capabilities (`sessions.diagnostics`).
 - Check whether a session is running, queued, retrying, or idle using
   timestamps, relevant transcript messages, and the live session status.
 - Read the transcript: user messages, assistant text, tools, files, shell,
@@ -40,9 +53,10 @@ session list and can be inspected or resumed later.
 - Inspect and answer pending permission requests, with conservative defaults.
 - Route dangerous actions through the host's `permission.assert` rules.
 - Rename and archive sessions without deleting them.
-- Delete sessions only with an explicit opt-in and `confirm: true`.
-- Restrict `interrupt`/`update` to sessions created or adopted by this plugin
-  unless the corresponding foreign-session opt-in is enabled.
+- Delete sessions only with an explicit opt-in and `confirm: true`; foreign
+  sessions also require `allowRemoveForeignSessions: true`.
+- Restrict `interrupt`/`update`/`remove` to sessions created or adopted by this
+  plugin unless the corresponding foreign-session opt-in is enabled.
 - Structured `output` values for Code Mode, plus readable `content` that never
   translates assistant, user, or tool content.
 - Configurable output budgets that preserve session, state, message IDs,
@@ -94,10 +108,12 @@ All tools live in the `sessions` namespace.
 | `sessions.reply` | Approve or reject a pending permission request (`once`, `always`, or `reject`), subject to security opt-ins. |
 | `sessions.read` | Read a bounded transcript, including tools and optional tool output/reasoning. Supports incremental pagination. |
 | `sessions.wait` | Wait for the current, last started, or explicit `messageID` turn. Returns `state: "permission"` as soon as a request is pending. |
-| `sessions.interrupt` | Interrupt the running turn. |
+| `sessions.interrupt` | Interrupt the running turn. `resume: true` preserves the local queue. |
+| `sessions.compact` | Compact a session's context. Disabled by default (`allowCompact`). |
+| `sessions.diagnostics` | Read-only capabilities, registry/live/queue sizes, redacted options, and last live event time. |
 | `sessions.list` | List sessions with cursor pagination, filters, and a timestamp snapshot. |
 | `sessions.update` | Rename, archive/unarchive, change metadata, or adjust permission rules without deleting. |
-| `sessions.remove` | Delete a session. Destructive; requires opt-in and `confirm: true`. |
+| `sessions.remove` | Delete a session. Destructive; requires opt-in, `confirm: true`, and ownership (or `allowRemoveForeignSessions`). |
 | `sessions.language` | Get or set the output language (`en` by default, `es` available). |
 
 `open`, `send`, and `wait` return a compact report containing:
@@ -121,19 +137,23 @@ not changed. The chaining tools expose at least:
 
 | Tool | Useful output fields |
 | --- | --- |
-| `open`, `send`, `wait` | `sessionID`, `title`, `messageID`, `state`, `outcome`, `lastMessageID`, `text`, `textLength`, `textTruncated`, `elapsedMs`, `fetchCount`, `queued`, `retry`, `pendingPermissions`, `pendingTotal`, `pendingTruncated`, `error`, `errorTruncated` |
-| `status` | `sessionID`, `state`, `running`, `queued`, `queuedCount`, `queuedMessageIDs`, `nextQueuedMessageID`, `lastOutcome`, `retry`, `promptMessageID`, `lastMessageID`, `text`, `textLength`, `textTruncated`, `tools`, `pendingPermissions`, `pendingTotal`, `pendingTruncated` |
-| `read` | `sessionID`, `lastMessageID`, `hasMore`, `nextAfterMessageID`, `truncated`, `count` |
-| `list` | `sessions[]`, `nextCursor`, `count` |
-| `permissions` | `sessionID`, `pending[]`, `pendingTotal`, `pendingTruncated`, `hasMore` |
+| `open`, `send`, `wait` | `sessionID`, `title`, `messageID`, `state`, `outcome`, `lastMessageID`, `text`, `textLength`, `textTruncated`, `elapsedMs`, `fetchCount`, `queued`, `retry` (`next`, `retryAt`, `retryInMs`), `pendingPermissions`, `pendingTotal`, `pendingTruncated`, `permissionCheckedAt`, `error`, `errorTruncated`, `reused`, `alreadySent` |
+| `status` | `sessionID`, `state`, `running`, `queued`, `queuedCount`, `queuedMessageIDs`, `queuedTruncated`, `nextQueuedMessageID`, `lastOutcome`, `lastError`, `retry`, `promptMessageID`, `lastMessageID`, `text`, `textLength`, `textTruncated`, `tools`, `toolsTruncated`, `pendingPermissions`, `pendingTotal`, `pendingTruncated`, `contextError`, `permissionError`, `transcriptAvailable`, `permissionsAvailable`, `liveStale`, `statusAt` |
+| `read` | `sessionID`, `lastMessageID`, `hasMore`, `nextAfterMessageID`, `truncated`, `count`, `partial`, `partialMessageID`, `state` |
+| `list` | `sessions[]`, `nextCursor`, `count`, `sessionsTruncated`, `state` |
+| `permissions` | `sessionID`, `pending[]`, `pendingTotal`, `pendingTruncated`, `hasMore`, `state` |
 
 `output` is bounded independently of `content`: text is capped by
 `maxTextChars`, titles by `maxTitleChars`, errors by `maxErrorChars`, pending
 permission arrays by `maxPermissions` (or the tool's `limit`), and list results
-by `limit`. Critical fields (`sessionID`, `state`, message IDs, permission IDs,
-and error) are always kept. Every validation or API error returns
+by `limit`. In addition, `JSON.stringify(output)` is capped by
+`maxOutputTotalChars`; arrays are trimmed and set `toolsTruncated`,
+`queuedTruncated`, `sessionsTruncated`, or `pendingTruncated` as needed.
+Critical fields (`sessionID`, `state`, message IDs, permission IDs, totals, and
+error) are always kept. Every validation or API error returns
 `{ state: "error", error, sessionID? }`; host permission denials still surface
-as tool errors instead of successful output.
+as tool errors instead of successful output. Successful `read`, `list`, and
+`permissions` return `state: "ok"`.
 
 Use `created.sessionID`, not `created.id`:
 
@@ -215,7 +235,8 @@ message for compatibility.
 Background queue state is FIFO per session. `status` reports
 `queuedCount`, `queuedMessageIDs`, and `nextQueuedMessageID`; the queue entries
 expire after `queueTtlMs`, are capped by `maxQueuedPrompts`, and are cleared by
-`interrupt` and `remove`.
+`interrupt({ resume: false })` and `remove`. `interrupt({ resume: true })`
+keeps them because the server resumes the pending messages.
 
 `open` is idempotent in two ways:
 
@@ -230,6 +251,18 @@ expire after `queueTtlMs`, are capped by `maxQueuedPrompts`, and are cleared by
 
 If the prompt fails after the session was created, the error output includes the
 `sessionID` so a retry does not leave an orphan session behind.
+
+`send` is idempotent for side effects too: reusing the same `messageID` with the
+same signature skips the prompt and any model/agent switches, and returns
+`alreadySent: true` / `reused: true`. Reusing the key with a different prompt,
+agent, model, or delivery is a conflict. Switches are only applied when the
+session's current model/agent differs from the target.
+
+Concurrent `open` callers with the same `messageID`/`sessionID` and signature
+share the admission, but each caller still runs its own `permission.assert`,
+uses its own abort signal, and renders with its own `wait`/`maxOutputChars`. A
+caller that aborts does not cancel the others; a different signature is a
+conflict.
 
 ### Paginated reads
 
@@ -253,6 +286,10 @@ if (page.hasMore && page.nextAfterMessageID) {
 }
 ```
 
+If a single message does not fit in the budget, `read` returns `partial: true`
+and `partialMessageID`, and `nextAfterMessageID` does **not** advance past it.
+Re-read the same anchor with a larger `maxOutputChars`; no message is skipped.
+
 ### Rename, archive, and remove
 
 ```ts
@@ -270,7 +307,8 @@ await tools.sessions.remove({
 ```
 
 Prefer `archived: true` for normal cleanup. `remove` stops execution and is
-destructive.
+destructive. It also requires the session to be owned (created or adopted by
+this plugin) unless `allowRemoveForeignSessions: true` is enabled.
 
 ### Handling permissions
 
@@ -329,9 +367,10 @@ rules apply on top:
 | `session_bridge.update` | `update` |
 | `session_bridge.remove` | `remove` |
 | `session_bridge.interrupt` | `interrupt` |
+| `session_bridge.compact` | `compact` |
 
-Read-only tools (`status`, `read`, `wait`, `list`, `permissions`, `language`)
-do not ask for permission. A host denial is returned as a tool error and the
+Read-only tools (`status`, `read`, `wait`, `list`, `permissions`, `language`,
+`diagnostics`) do not ask for permission. A host denial is returned as a tool error and the
 action is not executed. Example conservative configuration:
 
 ```jsonc
@@ -353,8 +392,10 @@ await tools.sessions.language({ language: "en" })
 ```
 
 The setting is persisted in the plugin's storage. The language only affects
-plugin labels and fixed phrases. Assistant text, user prompts, tool names,
-tool input/output, and errors are always returned verbatim.
+plugin labels and fixed phrases. Assistant text, user prompts, and tool output
+are returned verbatim. Single-line metadata (titles, IDs, permission fields,
+tool names, file labels, and errors in `content`) is sanitized to prevent line
+or ANSI injection; `output.error` keeps the raw error text.
 
 ## Configuration
 
@@ -366,17 +407,24 @@ default.
 | `language` | `"en"` | Initial output language (`es` or `en`). |
 | `defaultTimeoutMs` | `120000` | Default wait timeout. |
 | `maxOutputChars` | `20000` | Hard ceiling for every tool `content`. |
+| `maxOutputTotalChars` | `maxOutputChars` (`20000`) | Hard ceiling for `JSON.stringify(output)`. Arrays are trimmed with truncation flags. |
 | `maxTools` | `40` | Tools shown in a summary; the rest are summarized. |
 | `maxToolLine` | `500` | Maximum characters per tool line. |
 | `maxTextChars` | `4000` | Maximum characters per assistant/user text block and `output.text`. |
 | `maxErrorChars` | `1000` | Maximum characters for `output.error` and retry reasons. |
-| `maxTitleChars` | `500` | Maximum title length in input and output (newlines are sanitized). |
+| `maxTitleChars` | `500` | Maximum title length in input and output (control characters are sanitized). |
 | `maxPermissions` | `20` | Maximum permission items in `status`/turn output. |
-| `maxPromptChars` | `100000` | Maximum characters for `prompt` and `reply.message`. |
-| `maxSearchChars` | `500` | Maximum characters for `list.search`. |
+| `maxPromptChars` | `100000` | Maximum **code points** for `prompt` and `reply.message`. |
+| `maxSearchChars` | `500` | Maximum code points for `list.search`. |
 | `maxPermissionRules` | `100` | Maximum permission rules in `open`/`update`. |
 | `maxMetadataBytes` | `32768` | Maximum serialized bytes for `update.metadata`. |
+| `maxIdChars` | `256` | Maximum code points for `sessionID`, `messageID`, `requestID`, `cursor`, `parentID`, and `afterMessageID`. |
+| `maxAgentChars` | `128` | Maximum code points for `agent`. |
+| `maxModelChars` | `256` | Maximum code points for `model`. |
+| `maxPathChars` | `4096` | Maximum code points for `directory` and `subpath`. |
+| `maxPermissionFieldChars` | `512` | Maximum code points for permission `action`/`resource` fields. |
 | `queueTtlMs` | `3600000` | Background queue entry TTL. |
+| `livePendingTtlMs` | `600000` | TTL for live inbox/prompt pending entries used as wait anchors. |
 | `maxQueuedPrompts` | `100` | Maximum tracked queued prompts per session. |
 | `pollIntervalMs` | `500` | Initial polling fallback interval. |
 | `maxPollIntervalMs` | `2000` | Maximum polling backoff. |
@@ -387,8 +435,10 @@ default.
 | `allowPersistentPermissions` | `false` | Allow `decision: "always"` in `reply`. |
 | `allowReplyToForeignSessions` | `false` | Allow replying to sessions not created by this plugin. |
 | `allowInterruptForeignSessions` | `false` | Allow interrupting sessions not created or adopted by this plugin. |
-| `allowUpdateForeignSessions` | `false` | Allow renaming/archiving/metadata changes on foreign sessions. |
+| `allowUpdateForeignSessions` | `false` | Allow renaming/archiving/metadata changes on foreign sessions (also required by `compact` for foreign sessions). |
 | `allowSessionRemoval` | `false` | Enable `sessions.remove`. |
+| `allowRemoveForeignSessions` | `false` | Allow `remove` on sessions not created or adopted by this plugin. Dangerous. |
+| `allowCompact` | `false` | Enable `sessions.compact`. |
 | `debug` | `false` | Reserved for diagnostic logging. |
 
 ```jsonc
@@ -413,8 +463,8 @@ default.
 2. `session.prompt` admits the message and returns its ID. That ID is the
    anchor for the turn.
 3. The plugin waits using `session.wait` and session events
-   (`session.idle`, `session.status`, `session.execution.failed`,
-   `session.execution.interrupted`, `permission.asked`).
+   (`session.idle`, `session.status`, `session.execution.started/succeeded/failed/interrupted`,
+   `session.retry.scheduled`, `permission.asked`).
 4. After a terminal signal, a bounded settle phase retries the transcript a few
    times (short delays, at most four retries) so an event that arrives before
    the `idle` message is persisted does not cause a false timeout. If the
@@ -424,9 +474,12 @@ default.
    an assistant/compaction message after the anchor. Idles from the previous
    turn are ignored, including after queued/steered prompts. A failed or
    interrupted idle can complete a turn without assistant text.
-6. A provider retry (`session.status` with `type: "retry"`) is reported as
-   `retrying` with the attempt, reason, and next retry; it is not an error and
-   does not stop the wait.
+6. A provider retry (`session.status` with `type: "retry"` or
+   `session.retry.scheduled`) is reported as `retrying` with the attempt,
+   reason, and next retry. `next`/`at` are absolute epoch milliseconds;
+   `content` shows the remaining seconds (clamped to 0) and `output.retry`
+   adds `retryAt` (ISO) and `retryInMs`. It is not an error and does not stop
+   the wait.
 7. If both event sources are unavailable or fail, the plugin falls back to
    `session.get` (cheap) plus polling with backoff (500 ms → 1 s → 2 s), and
    reads the transcript only when the session becomes idle or every five
@@ -441,12 +494,23 @@ default.
 10. Outputs are built with a budget that reserves session IDs, state, message
     IDs, pending permissions, and errors before optional text/tools. Truncation
     is safe for Unicode surrogate pairs and bounded by the requested limits.
-11. A live in-memory cache observes prompt hooks and `session.inbox.*` events
-    (IDs and delivery only, never prompt text) to report foreign queued work.
-    It is always backed by the transcript and the local queue when the
-    experimental APIs are unavailable.
+    A second, global pass enforces `maxOutputTotalChars` over the serialized
+    `output`, trimming arrays last-to-first and preserving critical fields.
+11. A live in-memory cache observes prompt hooks, `session.inbox.*` events, and
+    durable execution/retry events (IDs and delivery only, never prompt text)
+    to report foreign queued work and execution failures. The subscription
+    reconnects with bounded backoff (1 s → 30 s) after a stream failure, and
+    `status` only trusts a live status that is fresh relative to the session
+    timestamps. Pending anchors expire with `livePendingTtlMs`.
 12. Owned sessions and open mappings are stored per directory with a 30-day
-    TTL / 7-day TTL, LRU eviction, and cleanup on `remove`.
+    TTL / 7-day TTL, LRU eviction, and cleanup on `remove`. Writes are
+    coalesced with a short debounce; `remove` and plugin cleanup flush the
+    final state. `open` no longer waits for two full registry writes before
+    admitting the prompt.
+13. `wait` treats `timeoutMs` as end-to-end: it computes a deadline before the
+    preflight, bounds each preflight call by the remaining time, reuses the
+    preflight permission list, and gives the final idle/permission read a
+    single ~300 ms budget instead of sequential timeouts.
 
 New sessions inherit the **model of the calling session** by default and use the
 `build` agent. Both can be overridden with the `model` and `agent` options. An
@@ -473,8 +537,11 @@ variants use `provider/model#variant`.
   `allowInterruptForeignSessions` / `allowUpdateForeignSessions` explicitly.
   `send` does not adopt a session.
 - `sessions.remove` is disabled by default and requires `confirm: true`. It
-  stops execution and cannot be undone. Use `sessions.update` with
-  `archived: true` for normal cleanup.
+  also requires ownership (created or adopted by this plugin) unless
+  `allowRemoveForeignSessions: true`. It stops execution and cannot be undone.
+  Use `sessions.update` with `archived: true` for normal cleanup.
+- `sessions.compact` is disabled by default (`allowCompact`). For foreign
+  sessions it also requires `allowUpdateForeignSessions`.
 - Dangerous actions call `permission.assert` with separate
   `session_bridge.*` actions. A host `deny` or rejected `ask` aborts the action
   and surfaces as a tool error; it is never converted into a success report.
@@ -501,12 +568,19 @@ variants use `provider/model#variant`.
   appended as `#variant`.
 - `output.text`, `output.error`, titles, pending permissions, and list results
   are bounded; check `textTruncated`, `textLength`, `pendingTotal`,
-  `pendingTruncated`, and `errorTruncated`. Raise `maxTextChars`,
-  `maxTitleChars`, `maxPermissions`, or `maxOutputChars`, or lower
-  `recent`/`limit`.
+  `pendingTruncated`, `errorTruncated`, `toolsTruncated`, `queuedTruncated`,
+  and `sessionsTruncated`. The serialized output is also capped by
+  `maxOutputTotalChars`. Raise the relevant limit or lower `recent`/`limit`.
 - Input limits are configurable (`maxPromptChars`, `maxTitleChars`,
-  `maxSearchChars`, `maxPermissionRules`, `maxMetadataBytes`) and are enforced
-  both by JSON Schema and runtime validation.
+  `maxSearchChars`, `maxPermissionRules`, `maxMetadataBytes`, `maxIdChars`,
+  `maxAgentChars`, `maxModelChars`, `maxPathChars`,
+  `maxPermissionFieldChars`) and are enforced both by JSON Schema and runtime
+  validation. Lengths count Unicode code points.
+- A partial transcript read returns `partial: true`; re-read the same
+  `afterMessageID` with a larger `maxOutputChars` instead of advancing.
+- This release does **not** implement worktree orchestration,
+  `open({ directory })`, `waitAny`/`waitAll`, `race`/`bestOf`, or
+  `applyCandidate`. There is no automatic apply, commit, or push.
 - `localize` is a deprecated legacy helper. New code should use `t()`; the
   helper copies multiline assistant content and non-permission tool lines
   verbatim. Removal is planned for `3.0.0`.

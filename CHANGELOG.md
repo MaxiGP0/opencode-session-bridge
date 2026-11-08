@@ -6,6 +6,78 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### 2026-11-08 hardening
+
+#### Fixed
+
+- `retry.next` is an absolute epoch timestamp, not a duration. Content now
+  shows the remaining seconds (`next in 0s` when already past), and
+  `output.retry` adds `retryAt` (ISO) and `retryInMs`. The old tests using
+  `next: 5000` were replaced with real timestamps.
+- Concurrent `open` calls now run `permission.assert` for every caller before
+  deduplicating. The shared admission is keyed by a signature; a different
+  prompt/agent/model/delivery/permissions/sessionID is an actionable conflict.
+  Each caller keeps its own abort signal, `wait`, language, and budget; aborting
+  one caller does not cancel the others.
+- `send` is idempotent for side effects: the same `messageID` and signature
+  skips the prompt and model/agent switches and returns `alreadySent: true`.
+  Switches are only applied when the current model/agent differs. Different
+  signatures are a conflict.
+- `remove` requires ownership (created or adopted) unless the new
+  `allowRemoveForeignSessions: true` opt-in is enabled.
+- `read` no longer advances `nextAfterMessageID` past a message that was only
+  partially rendered. `partial` and `partialMessageID` tell the caller to
+  re-read with a larger budget.
+- `interrupt({ resume: true })` preserves the local queue instead of clearing
+  it; `resume: false` clears it. Output adds `queueCleared`, `queueResumed`, and
+  `queuedCount`.
+- `status` no longer turns a transcript failure into `state: "error"` while the
+  session is running/queued/retrying. A permission-list failure is not reported
+  as clean idle.
+- Durable execution success events and `retry.scheduled` are consumed by
+  `wait`; a queued-turn error no longer sticks to a later successful turn.
+- Live event consumption reconnects with bounded backoff (1 s → 30 s). Stale
+  live status is ignored in favor of fresh session timestamps.
+
+#### Added
+
+- Global output budget: `maxOutputTotalChars` (defaults to the configured
+  `maxOutputChars`, `20000` out of the box) caps `JSON.stringify(output)`, with
+  `toolsTruncated`, `queuedTruncated`, and `sessionsTruncated` flags in
+  addition to `pendingTruncated`.
+- `state: "ok"` in successful `read`, `list`, and `permissions`.
+- Input limits `maxIdChars`, `maxAgentChars`, `maxModelChars`, `maxPathChars`,
+  and `maxPermissionFieldChars`, enforced by schema and runtime.
+- `oneLine` sanitization for untrusted metadata in `content` (IDs, titles,
+  permission fields, tool names, file labels, and errors); assistant/user text
+  and tool output remain verbatim.
+- `wait` options `initialPermissions` / `initialPermissionCheckAt` and a single
+  ~300 ms final read budget.
+- `sessions.compact` (opt-in `allowCompact`) and `sessions.diagnostics`
+  (capabilities, registry/live/queue sizes, redacted options, last live event).
+- Live snapshots expose `statusAt`, `lastOutcome`, `lastError`; pending anchors
+  expire with `livePendingTtlMs`.
+
+#### Changed
+
+- `maxOutputChars` and `maxText` schemas use `anyOf` (`0` or a value at/above
+  the runtime minimum) so schema and runtime agree: `500` and `50` are now
+  rejected, while `0`, `1000`, and `100` are accepted.
+- Length checks count Unicode code points instead of UTF-16 code units.
+- Registry writes are coalesced with a debounce; `open` no longer waits for two
+  full writes before the prompt, and `remove`/cleanup flush the final state.
+- `wait.timeoutMs` is end-to-end: the preflight is bounded by the deadline, the
+  preflight permission list is reused, and at most two `permission.list` calls
+  are made in the timeout path.
+- `update.title` is sanitized before `session.update`, matching `open`.
+
+#### Security / no-goals
+
+- Foreign-session defaults are stricter for `remove`.
+- No worktree orchestration, `open({ directory })`, `waitAny`/`waitAll`,
+  `race`/`bestOf`, or `applyCandidate` in this release. There is no automatic
+  apply, commit, or push.
+
 This work is additive in tool names and fields, but it changes several
 security/behavior defaults. A strict SemVer reading requires a major release
 (`3.0.0`) because `interrupt`/`update` now reject foreign sessions by default
