@@ -115,6 +115,15 @@ All tools live in the `sessions` namespace.
 | `sessions.update` | Rename, archive/unarchive, change metadata, or adjust permission rules without deleting. |
 | `sessions.remove` | Delete a session. Destructive; requires opt-in, `confirm: true`, and ownership (or `allowRemoveForeignSessions`). |
 | `sessions.language` | Get or set the output language (`en` by default, `es` available). |
+| `sessions.worktrees` | `create`/`list`/`remove` project worktrees through `ctx.worktree`. Opt-in (`allowWorktreeManagement`); removal needs `confirm: true` and only touches worktrees created by this plugin. |
+| `sessions.waitAny` | Wait for one or all sessions (`mode: "any" \| "all"`). Returns partial results on timeout/abort, returns a pending permission quickly, and detects background work from the `experimental.idle` hook when available. |
+| `sessions.waitAll` | Alias of `waitAny` with `mode: "all"`. |
+| `sessions.race` | Run one prompt in 2–8 candidates (worktrees by default), snapshot commits/patches, optionally run setup/test/teardown serially, and return bounded diffs, tests, and verification flags. Never applies anything. |
+| `sessions.bestOf` | Same as `race` plus a heuristic `recommended` candidate and `rankingReasons`. Tests passed first, then smaller diff, then faster. |
+| `sessions.applyCandidate` | Apply a race candidate with `apply` (patch) or `cherry-pick`. Dry-run by default; requires `allowApplyCandidates`, `confirm: true`, a clean target, a backup branch, and optional integration verification. |
+| `sessions.raceStatus` | Inspect one race or all registered races (candidates, commits/patches, tests, worktrees, cleanup). Read-only. |
+| `sessions.raceList` | Compact list of registered races. Read-only. |
+| `sessions.raceCleanup` | Remove the worktrees created by a race. Requires `allowWorktreeManagement`, `confirm: true`, and `force: true` for dirty worktrees. Branches are kept. |
 
 `open`, `send`, and `wait` return a compact report containing:
 
@@ -164,6 +173,135 @@ if (created.state === "idle") {
   console.log(status.text)
 }
 ```
+
+## Orchestration: worktrees, races, and safe apply
+
+O-0 to O-5 add an opt-in orchestration layer. Nothing is applied, committed, or
+pushed automatically.
+
+### Ownership and workers
+
+- `open({ directory })` creates the session in an existing project directory or
+  a registered worktree. The directory is validated with `realpath`, rejects
+  `..`, symlink escapes, relative paths, and directories outside the project
+  (unless they are opt-in git worktrees), and is case-insensitive on Windows.
+- After `session.create`, the plugin reads `session.get()` again and aborts plus
+  removes the session if the host put it in another directory.
+- The plugin relies on the host to load the worktree's `.opencode`, agents,
+  skills, and instructions for `session.create({ location })`. It does not copy
+  or symlink configuration itself. If the host does not discover it for a
+  sibling worktree, use the host's worktree strategy or copy/symlink the config
+  explicitly.
+- `copy`/`clone` worktree strategies are host-controlled. The plugin records the
+  strategy and uses patch/fetch for apply, but it cannot enforce the host's
+  copy exclusions (`node_modules`, `dist`, secrets, etc.). Prefer the `worktree`
+  strategy when available.
+- The caller that opens a session becomes its owner (`ownerSessionID`). A
+  worker in a worktree can be managed from `main` with `status`, `read`, `wait`,
+  `reply`, `interrupt`, and `update`.
+- A session created with `runID` or in another directory is a worker. Workers
+  are denied every `sessions.*` orchestration tool by default. The worker
+  permission preset also denies `session_bridge.*`, `git push`, `git worktree`,
+  `git checkout`/`switch`, `--force`, and `external_directory`. Enable
+  `allowWorkerOrchestration: true` only for trusted workers.
+- `open({ messageID })` includes the target directory in the mapping and the
+  in-flight key. The same `messageID` in another directory is a conflict, not a
+  silent reuse.
+
+### Worktrees
+
+```ts
+const created = await tools.sessions.worktrees({
+  action: "create",
+  count: 3,
+  base: "HEAD",
+  runID: "run_auth",
+})
+const listed = await tools.sessions.worktrees({ action: "list" })
+```
+
+`create` uses `ctx.worktree.create` (never a shell fallback) when
+`allowWorktreeManagement: true` and handles partial creation with rollback.
+`list` reports directory, branch, base, strategy, dirty state, and associated
+sessions. `remove` only touches tracked worktrees, refuses the project root,
+keeps dirty or active worktrees unless `force: true` plus `confirm: true`, and
+archives associated sessions first by default. Branches are never deleted.
+
+### Race and bestOf
+
+```ts
+const run = await tools.sessions.bestOf({
+  prompt: "Implement and verify the auth fix.",
+  count: 3,
+  mode: "worktrees",        // requires ctx.worktree
+  base: "HEAD",
+  testCommand: "npm test",  // requires allowTestCommands
+  keepWorktrees: true,
+  timeoutMs: 600_000,
+})
+// run.candidates[]: sessionID, directory, commit/patch, diffStats, files,
+// tests, verification, applyStrategy; run.recommended is heuristic.
+```
+
+- `race`/`bestOf` create unique `messageID`s (`${raceID}:${i}`), snapshot the
+  candidate worktree (a local commit when safe, otherwise a patch that includes
+  untracked files), and never use the truncated display diff for apply.
+- Binaries, renames, mode changes, submodules, and LFS are detected. A candidate
+  whose patch cannot represent them is marked `unsupported` and is not applied
+  blindly.
+- Test/CI changes and disabled tests (`.skip`, `.only`, `xit`, `fit`,
+  `--passWithNoTests`, …) set `testFilesChanged`, `ciFilesChanged`,
+  `skippedTests`, and `verification: "flagged"`. With `allowTestChanges: false`
+  such a candidate is never recommended.
+- E2E commands use `execFile` without a shell, an allowlisted environment,
+  redacted output, timeouts, bounded buffers, and Windows process-tree kill.
+  Tests run serially per candidate. If a command needs secrets or services that
+  do not exist locally, the result is `tests: { skipped: true, reason }`; the
+  plugin never claims the E2E passed.
+- `same-directory` mode is for comparing answers, not for safe apply: the
+  candidates share one working tree, so snapshots are marked incomplete and
+  `applyStrategy` is `none`.
+- `waitAny`/`waitAll` detect background shells/subagents through the
+  experimental `experimental.idle` hook when the plugin instance that owns the
+  session receives it. For a worker in another location, the orchestrator may
+  not see that background hook (it still sees the model idle), so treat that
+  signal as best effort.
+- `bestOf` is a heuristic recommendation, not an absolute winner. If no
+  candidate has passing, trusted tests, `recommended` is `null`. Candidate
+  output also includes bounded `cost`/`tokens` when the host reports them.
+
+### Apply
+
+```ts
+await tools.sessions.applyCandidate({
+  raceID: run.raceID,
+  candidateID: run.recommended!,
+  strategy: "cherry-pick",  // or "apply" for a patch
+  verifyCommand: "npm test",
+  dryRun: false,            // dryRun defaults to true
+  commit: true,
+  confirm: true,            // + allowApplyCandidates + permission.assert
+})
+```
+
+`applyCandidate` requires a registered race, `allowApplyCandidates`, and
+`confirm: true`. It refuses a dirty target, an in-progress merge/rebase/
+cherry-pick, a base that is not an ancestor, an incomplete patch, or a
+cherry-pick without a commit. It verifies in an integration worktree first when
+`verifyCommand` or `dryRun` is used, creates a backup branch before touching the
+target, is idempotent (`alreadyApplied`), and rolls back on failure. `commit`
+and `push` are separate opt-ins. Push never uses force and requires
+`allowPushCandidates`; a rejected push is reported and left for a manual
+rebase/retest. The plugin does not rebase automatically.
+
+`raceStatus`, `raceList`, and `raceCleanup` recover and clean orphaned races.
+`diagnostics` reports the last race, worktree counts, stream health, storage
+availability, and the last cleanup.
+
+**No-goals:** no automatic candidate selection with an LLM, no automatic apply,
+no automatic commit or push, no shell fallback for worktrees, no guarantee that
+secret-like environment variables or services exist locally, and no attempt to
+delete branches with unmerged commits.
 
 ## Usage
 
@@ -439,6 +577,24 @@ default.
 | `allowSessionRemoval` | `false` | Enable `sessions.remove`. |
 | `allowRemoveForeignSessions` | `false` | Allow `remove` on sessions not created or adopted by this plugin. Dangerous. |
 | `allowCompact` | `false` | Enable `sessions.compact`. |
+| `allowCrossDirectoryManagement` | `true` | Allow an owner/run to manage its workers across directories. Set to `false` to require the same directory. |
+| `allowWorkerOrchestration` | `false` | Allow worker sessions to use `sessions.*` tools. Dangerous; keep it off. |
+| `allowWorktreeDirectories` | `false` | Accept explicit directories outside the project when they are git worktree roots. |
+| `allowWorktreeManagement` | `false` | Enable `worktrees create/remove` and `raceCleanup`. |
+| `allowTestCommands` | `false` | Enable `setupCommand`/`testCommand`/`teardownCommand` and `verifyCommand` execution. |
+| `allowTestChanges` | `false` | Allow a race candidate that modifies tests or CI to be considered trusted. |
+| `allowApplyCandidates` | `false` | Enable `applyCandidate`. |
+| `allowPushCandidates` | `false` | Enable the separate `push: true` opt-in. |
+| `allowSnapshotCommits` | `true` | Allow race snapshots to create local commits in candidate worktrees when no secret-like paths are present. |
+| `maxWorktrees` | `8` | Maximum worktrees per create call. |
+| `maxRaceCandidates` | `8` | Maximum candidates in a race. |
+| `maxWaitSessions` | `8` | Maximum sessions in `waitAny`/`waitAll`. |
+| `maxConcurrentSessions` | `4` | Concurrency cap for candidate waits/session creation. |
+| `maxDiffBytes` | `200000` | Maximum displayed diff bytes per candidate. Apply uses the commit or full patch, not this display cap. |
+| `maxTestOutputChars` | `20000` | Maximum stdout/stderr characters per test command. |
+| `maxRaceWallClockMs` | `600000` | Default race wall-clock timeout. |
+| `raceRetentionMs` | `604800000` | Race record retention. |
+| `gitTimeoutMs` | `120000` | Timeout for git/verification commands. |
 | `debug` | `false` | Reserved for diagnostic logging. |
 
 ```jsonc

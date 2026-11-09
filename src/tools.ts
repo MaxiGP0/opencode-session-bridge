@@ -21,6 +21,8 @@ import {
   toolLine,
   truncateCodePoints,
 } from "./format.ts"
+import { normalizeDirectory, sameDirectory, validateTargetDirectory } from "./directories.ts"
+import { runGit, type GitRunner } from "./git.ts"
 import { type LiveState, type LiveSnapshot } from "./live.ts"
 import type { BridgeOptions } from "./options.ts"
 import {
@@ -44,16 +46,54 @@ import {
   type QueueOptions,
 } from "./queue.ts"
 import {
+  applyCandidate,
+  raceCleanup,
+  raceList,
+  raceStatus,
+  runRace,
+  waitMany,
+  workerPermissionRules,
+  type DirectoryValidator,
+  type OrchestrationDeps,
+} from "./orchestration.ts"
+import { rankCandidates, shapeCandidate, shapeRace } from "./races.ts"
+import { createRaceID } from "./races.ts"
+import type { RaceRegistry } from "./races.ts"
+import {
   forgetOpenSessionsBySessionID,
   forgetOwnedSession,
+  forgetWorkerSession,
+  findOpenSession,
+  getProcessWorkerSessions,
   isOwnedSession,
+  isWorkerSession,
   lookupOpenSession,
   rememberOpenSession,
   rememberOwnedSession,
+  rememberWorkerSession,
   type OpenSessionMapping,
   type OwnedSessions,
   type RegistryPersistence,
+  type SessionRole,
+  type WorkerSessions,
 } from "./registry.ts"
+import {
+  PermissionDenied,
+  abortError,
+  assertPermission,
+  awaitWithSignal,
+  signalOf,
+  throwIfAborted,
+  withRequest,
+} from "./runtime.ts"
+import {
+  attachAndPersistSession,
+  canManageWorktrees,
+  createWorktrees,
+  listWorktrees,
+  removeWorktrees,
+  type WorktreeRegistry,
+} from "./worktrees.ts"
 import { refreshRetry, retryInfo, retryRemainingMs } from "./retry.ts"
 import type {
   Lang,
@@ -68,6 +108,7 @@ import type {
   TurnResult,
 } from "./types.ts"
 import {
+  parseApplyInput,
   parseCompactInput,
   parseDiagnosticsInput,
   parseInterruptInput,
@@ -75,6 +116,9 @@ import {
   parseListInput,
   parseOpenInput,
   parsePermissionsInput,
+  parseRaceCleanupInput,
+  parseRaceInput,
+  parseRaceStatusInput,
   parseReadInput,
   parseRemoveInput,
   parseReplyInput,
@@ -82,6 +126,8 @@ import {
   parseStatusInput,
   parseUpdateInput,
   parseWaitInput,
+  parseWaitManyInput,
+  parseWorktreesInput,
   ValidationError,
   type OpenInput,
 } from "./validation.ts"
@@ -94,6 +140,12 @@ export type OpenAdmission =
       admitted: Awaited<ReturnType<PluginContext["session"]["prompt"]>>
       reused: boolean
       title: string
+      directory: string
+      role: SessionRole
+      ownerSessionID?: string
+      runID?: string
+      permissionsApplied?: boolean
+      locationVerified?: boolean
     }
   | {
       ok: false
@@ -101,10 +153,13 @@ export type OpenAdmission =
       sessionID?: string
       title: string
       messageID?: string
+      directory: string
     }
 
 export type OpenInflight = {
   signature: string
+  messageID?: string
+  directory: string
   controller: AbortController
   promise: Promise<OpenAdmission>
   waiters: number
@@ -156,6 +211,43 @@ export type ToolDeps = {
   inFlightSends?: Map<string, SendInflight>
   sentMessages?: SentMessages
   registry?: RegistryPersistence
+  workerSessions?: WorkerSessions
+  worktrees?: WorktreeRegistry
+  races?: RaceRegistry
+  git?: GitRunner
+  validateDirectory?: DirectoryValidator
+  refreshWorkers?: () => Promise<void>
+}
+
+function orchestrationDeps(deps: ToolDeps): OrchestrationDeps {
+  return {
+    ctx: deps.ctx,
+    options: deps.options,
+    getLanguage: deps.getLanguage,
+    ownedSessions: deps.ownedSessions,
+    openSessions: deps.openSessions ?? new Map(),
+    workerSessions: deps.workerSessions ?? getProcessWorkerSessions(),
+    worktrees: deps.worktrees ?? new Map(),
+    races: deps.races ?? new Map(),
+    liveState: deps.liveState,
+    registry: deps.registry,
+    git: deps.git ?? runGit,
+    validateDirectory: deps.validateDirectory,
+  }
+}
+
+function callerOf(deps: ToolDeps, context: ToolExecuteContext) {
+  return {
+    sessionID: context.sessionID,
+    directory: deps.ctx.location?.directory,
+  }
+}
+
+function registeredWorktreeDirectories(deps: ToolDeps): string[] {
+  const projectID = deps.ctx.location?.project?.id
+  return [...(deps.worktrees?.values() ?? [])]
+    .filter((record) => !record.projectID || !projectID || record.projectID === String(projectID))
+    .map((record) => record.directory)
 }
 
 type ToolDefinition = Omit<RegisteredTool, "execute">
@@ -169,17 +261,6 @@ type ToolExecute = (
   context: ToolExecuteContext,
   lang: Lang,
 ) => Promise<ToolExecutionResult>
-
-/**
- * Marker used to let host permission denials escape the tool wrapper. A denied
- * `ctx.permission.assert` must surface as a Tool.Error, never as normal content.
- */
-class PermissionDenied extends Error {
-  constructor(readonly cause: unknown) {
-    super("Permission denied by the host")
-    this.name = "PermissionDenied"
-  }
-}
 
 /**
  * JSON Schema objects are validated by OpenCode before `execute` runs. The
@@ -461,90 +542,100 @@ const diagnosticsOutput = outputSchema({
   additionalProperties: true,
 })
 
-function signalOf(context: ToolExecuteContext): AbortSignal {
-  return context.signal ?? new AbortController().signal
-}
+const worktreesOutput = outputSchema({
+  type: "object",
+  properties: {
+    action: { type: "string" },
+    worktrees: { type: "array", items: { type: "object", additionalProperties: true } },
+    removed: { type: "array", items: { type: "object", additionalProperties: true } },
+    orphans: { type: "array", items: { type: "string" } },
+    state: outputStateSchema,
+    error: { type: "string" },
+  },
+  additionalProperties: true,
+})
 
-/**
- * Evaluates the host's permission rules before a dangerous action. The marker
- * error is rethrown by the wrapper so `deny` and rejected `ask` responses are
- * visible to the caller instead of becoming a successful report.
- */
-async function assertPermission(
-  deps: ToolDeps,
-  context: ToolExecuteContext,
-  action: string,
-  resources: string[],
-  metadata?: Record<string, unknown>,
-): Promise<void> {
-  if (typeof deps.ctx.permission.assert !== "function") return
-  const source =
-    context.messageID && context.id
-      ? { type: "tool" as const, messageID: context.messageID, id: context.id }
-      : undefined
-  try {
-    await deps.ctx.permission.assert({
-      sessionID: context.sessionID,
-      agent: context.agent,
-      action,
-      resources,
-      metadata,
-      source,
-    })
-  } catch (error) {
-    throw new PermissionDenied(error)
-  }
-}
+const waitManyOutput = outputSchema({
+  type: "object",
+  properties: {
+    mode: { type: "string", enum: ["any", "all"] },
+    sessions: { type: "array", items: { type: "object", additionalProperties: true } },
+    pending: { type: "array", items: { type: "string" } },
+    elapsedMs: { type: "number" },
+    timedOut: { type: "boolean" },
+    aborted: { type: "boolean" },
+    state: outputStateSchema,
+    error: { type: "string" },
+  },
+  additionalProperties: true,
+})
 
-function abortError(signal: AbortSignal): unknown {
-  if (signal.reason instanceof Error) return signal.reason
-  return new DOMException("The operation was aborted", "AbortError")
-}
+const raceOutput = outputSchema({
+  type: "object",
+  properties: {
+    raceID: { type: "string" },
+    status: { type: "string" },
+    mode: { type: "string" },
+    base: { type: "string" },
+    targetDirectory: { type: "string" },
+    keepWorktrees: { type: "boolean" },
+    worktrees: { type: "array", items: { type: "string" } },
+    candidates: { type: "array", items: { type: "object", additionalProperties: true } },
+    recommended: { type: ["string", "null"] },
+    ranking: { type: "array", items: { type: "string" } },
+    rankingReasons: { type: "array", items: { type: "string" } },
+    state: outputStateSchema,
+    error: { type: "string" },
+  },
+  additionalProperties: true,
+})
 
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) throw abortError(signal)
-}
+const applyOutput = outputSchema({
+  type: "object",
+  properties: {
+    raceID: { type: "string" },
+    candidateID: { type: "string" },
+    applied: { type: "boolean" },
+    alreadyApplied: { type: "boolean" },
+    dryRun: { type: "boolean" },
+    strategy: { type: "string" },
+    targetDirectory: { type: "string" },
+    integrationDirectory: { type: "string" },
+    base: { type: "string" },
+    backup: { type: "string" },
+    commit: { type: "string" },
+    pushed: { type: "boolean" },
+    pushError: { type: "string" },
+    verification: { type: "object", additionalProperties: true },
+    reason: { type: "string" },
+    state: outputStateSchema,
+    error: { type: "string" },
+  },
+  additionalProperties: true,
+})
 
-async function withRequest<T>(
-  signal: AbortSignal,
-  timeoutMs: number,
-  fn: (signal: AbortSignal) => Promise<T>,
-): Promise<T> {
-  throwIfAborted(signal)
-  const request = requestSignal(signal, timeoutMs)
-  try {
-    const result = await fn(request.signal)
-    // A host abort must never be reported as a successful tool result, even
-    // if the underlying client ignored the signal.
-    throwIfAborted(signal)
-    // A per-request timeout is an ordinary structured error, not a host abort.
-    if (request.signal.aborted && !signal.aborted) {
-      throw request.signal.reason ?? new DOMException("Request timed out", "TimeoutError")
-    }
-    return result
-  } finally {
-    request.cleanup()
-  }
-}
+const raceStatusOutput = outputSchema({
+  type: "object",
+  properties: {
+    races: { type: "array", items: { type: "object", additionalProperties: true } },
+    race: { type: "object", additionalProperties: true },
+    state: outputStateSchema,
+    error: { type: "string" },
+  },
+  additionalProperties: true,
+})
 
-function awaitWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  throwIfAborted(signal)
-  return new Promise<T>((resolve, reject) => {
-    let settled = false
-    const finish = (fn: () => void) => {
-      if (settled) return
-      settled = true
-      signal.removeEventListener("abort", onAbort)
-      fn()
-    }
-    const onAbort = () => finish(() => reject(abortError(signal)))
-    signal.addEventListener("abort", onAbort, { once: true })
-    promise.then(
-      (value) => finish(() => resolve(value)),
-      (error) => finish(() => reject(error)),
-    )
-  })
-}
+const raceCleanupOutput = outputSchema({
+  type: "object",
+  properties: {
+    raceID: { type: "string" },
+    removed: { type: "array", items: { type: "string" } },
+    orphans: { type: "array", items: { type: "string" } },
+    state: outputStateSchema,
+    error: { type: "string" },
+  },
+  additionalProperties: true,
+})
 
 function signatureOf(value: Record<string, unknown>): string {
   try {
@@ -563,7 +654,8 @@ function openSignature(data: OpenInput, directory: string | undefined): string {
     model: data.model,
     delivery: data.delivery,
     permissions: data.permissions,
-    directory,
+    directory: directory ? normalizeDirectory(directory) : undefined,
+    runID: data.runID,
   })
 }
 
@@ -907,6 +999,28 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       execute: async (input: unknown, context: ToolExecuteContext) => {
         const lang = deps.getLanguage()
         try {
+          let worker = isWorkerSession(
+            deps.workerSessions ?? getProcessWorkerSessions(),
+            context.sessionID,
+          )
+          if (!worker && deps.refreshWorkers) {
+            await deps.refreshWorkers()
+            worker = isWorkerSession(
+              deps.workerSessions ?? getProcessWorkerSessions(),
+              context.sessionID,
+            )
+          }
+          if (worker && !deps.options.allowWorkerOrchestration) {
+            return {
+              content: t(lang, "workerBlocked"),
+              output: {
+                state: "error",
+                error: t(lang, "workerBlocked"),
+                worker: true,
+                hint: t(lang, "workerHint"),
+              },
+            }
+          }
           const result = await execute(input, context, lang)
           throwIfAborted(context.signal)
           return {
@@ -948,7 +1062,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
     {
       name: "open",
       description:
-        "Create or reuse an OpenCode session in the current directory, send it a message, and wait for its turn. Returns the final state, response text, and actions (tools) performed. Pass sessionID or reuse messageID to retry without duplicating the session. Permission rules with effect allow are rejected unless allowPermissionRules is enabled.",
+        "Create or reuse an OpenCode session, optionally in another validated project/worktree directory, send it a message, and wait for its turn. Returns the final state, response text, actions (tools) performed, directory, owner, and role. Pass sessionID or reuse messageID to retry without duplicating the session; messageID is scoped to the target directory.",
       input: schema({
         type: "object",
         properties: {
@@ -979,6 +1093,18 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
             description:
               "Optional idempotency key for the message and for the session mapping. Reusing it does not create a second message or session.",
           },
+          directory: {
+            type: "string",
+            maxLength: deps.options.maxPathChars,
+            description:
+              "Absolute directory (project or registered worktree) where the session is created. Defaults to the caller's directory.",
+          },
+          runID: {
+            type: "string",
+            maxLength: deps.options.maxIdChars,
+            description:
+              "Optional orchestration run ID. Sessions created with a run ID are registered as workers of that run.",
+          },
           permissions: {
             type: "array",
             maxItems: deps.options.maxPermissionRules,
@@ -997,32 +1123,81 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
     async (input, context, lang) => {
       const data = parseOpenInput(input, lang, deps.options)
       const signal = signalOf(context)
-      const directory = deps.ctx.location?.directory
+      const ownerDirectory = deps.ctx.location?.directory
+      if (!ownerDirectory) {
+        throw new ValidationError(t(lang, "invalidDirectory"))
+      }
       const explicitModel = parseModel(data.model)
+      const ownerSessionID = context.sessionID
+      const runID = data.runID
+
+      let targetDirectory: string = ownerDirectory
+      if (data.directory) {
+        const validation = await (deps.validateDirectory ?? validateTargetDirectory)(
+          data.directory,
+          {
+            projectDirectory: deps.ctx.location?.project?.directory,
+            projectCanonical: deps.ctx.location?.project?.canonical,
+            registeredDirectories: registeredWorktreeDirectories(deps),
+            allowWorktreeDirectories: deps.options.allowWorktreeDirectories,
+          },
+        )
+        if (!validation.ok) {
+          throw new ValidationError(
+            `${t(lang, "directoryInvalid", { reason: validation.error })} ${t(lang, "directoryOutsideProject")}`,
+          )
+        }
+        targetDirectory = validation.realDirectory
+      }
+      const role: SessionRole =
+        runID || !sameDirectory(targetDirectory, ownerDirectory) ? "worker" : "orchestrator"
+      const permissionRules =
+        role === "worker"
+          ? workerPermissionRules(deps.options, data.permissions)
+          : data.permissions
 
       // Permission policy is evaluated for every caller, even when the
       // admission itself is deduplicated and shared.
-      await assertPermission(
-        deps,
-        context,
-        "session_bridge.open",
-        [data.sessionID ?? data.messageID ?? "new-session"],
+      await assertPermission(deps.ctx, context, "session_bridge.open",
+        [data.sessionID ?? data.messageID ?? "new-session", targetDirectory],
         {
           delivery: data.delivery,
           wait: data.wait,
+          directory: targetDirectory,
           hasSessionID: Boolean(data.sessionID),
           hasMessageID: Boolean(data.messageID),
+          role,
+          ...(runID ? { runID } : {}),
           ...(data.agent ? { agent: data.agent } : {}),
           ...(explicitModel ? { model: data.model } : {}),
         },
       )
 
+      // A messageID used in another directory is an explicit conflict, not a
+      // silent reuse. This check also covers concurrent admissions that have
+      // not written the mapping yet.
+      const mapped = findOpenSession(openSessions, data.messageID)
+      const mappedDirectory = mapped?.targetDirectory ?? mapped?.directory
+      if (mapped && mappedDirectory && !sameDirectory(mappedDirectory, targetDirectory)) {
+        throw new ValidationError(t(lang, "openConflict"))
+      }
+      if (data.messageID) {
+        for (const operation of inFlightOpens.values()) {
+          if (
+            operation.messageID === data.messageID &&
+            !sameDirectory(operation.directory, targetDirectory)
+          ) {
+            throw new ValidationError(t(lang, "openConflict"))
+          }
+        }
+      }
+
       const openKey = data.messageID
-        ? `message:${data.messageID}@${directory ?? ""}`
+        ? `message:${data.messageID}@${normalizeDirectory(targetDirectory)}`
         : data.sessionID
-          ? `session:${data.sessionID}@${directory ?? ""}`
+          ? `session:${data.sessionID}@${normalizeDirectory(targetDirectory)}`
           : undefined
-      const signature = openSignature(data, directory)
+      const signature = openSignature(data, targetDirectory)
       let inflight: OpenInflight
       const existing = openKey ? inFlightOpens.get(openKey) : undefined
       if (existing) {
@@ -1041,20 +1216,39 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         )
         const operation: OpenInflight = {
           signature,
+          messageID: data.messageID,
+          directory: targetDirectory,
           controller,
           waiters: 1,
           settled: false,
-          promise: Promise.resolve({ ok: false, error: new Error("not started"), title }),
+          promise: Promise.resolve({
+            ok: false,
+            error: new Error("not started"),
+            title,
+            directory: targetDirectory,
+          }),
         }
         operation.promise = (async (): Promise<OpenAdmission> => {
           let created: SessionInfo | undefined
           let reused = false
+          let permissionsApplied = false
+          let locationVerified = false
           let displayTitle = truncateCodePoints(title, deps.options.maxTitleChars)
           let targetSessionID =
-            data.sessionID ?? lookupOpenSession(openSessions, data.messageID, directory)
+            data.sessionID ?? lookupOpenSession(openSessions, data.messageID, targetDirectory)
           const internalSignal = controller.signal
           try {
             if (targetSessionID) {
+              const ownedEntry = deps.ownedSessions.get(targetSessionID)
+              if (
+                ownedEntry?.ownerSessionID &&
+                ownedEntry.ownerSessionID !== ownerSessionID &&
+                ownedEntry.runID !== runID
+              ) {
+                throw new ValidationError(
+                  `${t(lang, "foreignSessionBlocked")} ${t(lang, "foreignSessionHint")}`,
+                )
+              }
               try {
                 created = await withRequest(
                   internalSignal,
@@ -1066,6 +1260,42 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
                     ),
                 )
                 reused = true
+                const current = created
+                if (!current) throw new Error("session.get returned no session")
+                if (!current.location?.directory) {
+                  locationVerified = false
+                } else if (!sameDirectory(current.location.directory, targetDirectory)) {
+                  throw new ValidationError(
+                    `${t(lang, "openConflict")} (session location: ${current.location.directory}, requested: ${targetDirectory})`,
+                  )
+                } else {
+                  locationVerified = true
+                }
+                if (data.agent && current.agent && data.agent !== current.agent) {
+                  throw new ValidationError(
+                    `${t(lang, "openConflict")} (agent: ${current.agent}, requested: ${data.agent})`,
+                  )
+                }
+                if (explicitModel && current.model && !sameModel(modelRef(current.model), explicitModel)) {
+                  throw new ValidationError(
+                    `${t(lang, "openConflict")} (model: ${current.model.providerID}/${current.model.id}, requested: ${data.model})`,
+                  )
+                }
+                if (permissionRules?.length) {
+                  await withRequest(
+                    internalSignal,
+                    deps.options.requestTimeoutMs,
+                    (request) =>
+                      deps.ctx.session.update(
+                        {
+                          sessionID: current.id,
+                          permissions: permissionRules,
+                        },
+                        { signal: request },
+                      ),
+                  )
+                  permissionsApplied = true
+                }
               } catch (error) {
                 if (!isNotFoundError(error)) throw error
               }
@@ -1096,20 +1326,19 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
               }
 
               try {
+                type SessionCreateInput = Parameters<PluginContext["session"]["create"]>[0]
+                const createInput = {
+                  id: targetSessionID,
+                  title,
+                  agent: data.agent ?? "build",
+                  model: explicitModel ?? fallback,
+                  permissions: permissionRules,
+                  location: { directory: targetDirectory },
+                } as SessionCreateInput
                 created = await withRequest(
                   internalSignal,
                   deps.options.requestTimeoutMs,
-                  (request) =>
-                    deps.ctx.session.create(
-                      {
-                        id: targetSessionID,
-                        title,
-                        agent: data.agent ?? "build",
-                        model: explicitModel ?? fallback,
-                        permissions: data.permissions,
-                      },
-                      { signal: request },
-                    ),
+                  (request) => deps.ctx.session.create(createInput, { signal: request }),
                 )
               } catch (error) {
                 // A concurrent creator may have won the race for an explicit ID.
@@ -1136,27 +1365,88 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
               sanitizeTitle(created.title ?? title),
               deps.options.maxTitleChars,
             )
+
+            // Verify the location the host actually used. A session silently
+            // created in another directory must not receive this prompt.
+            const verified = await withRequest(
+              internalSignal,
+              deps.options.requestTimeoutMs,
+              (request) =>
+                deps.ctx.session.get({ sessionID: createdSessionID }, { signal: request }),
+            )
+            const verifiedDirectory = verified.location?.directory
+            locationVerified = Boolean(verifiedDirectory)
+            if (verifiedDirectory && !sameDirectory(verifiedDirectory, targetDirectory)) {
+              await deps.ctx.session
+                .remove({ sessionID: createdSessionID }, { signal: internalSignal })
+                .catch(() => undefined)
+              throw new ValidationError(
+                `${t(lang, "openConflict")} (session location: ${verifiedDirectory}, requested: ${targetDirectory})`,
+              )
+            }
+            created = verified
+            displayTitle = truncateCodePoints(
+              sanitizeTitle(created.title ?? title),
+              deps.options.maxTitleChars,
+            )
+
+            const ownedMetadata = {
+              ...(ownerSessionID ? { ownerSessionID } : {}),
+              ...(runID ? { runID } : {}),
+              ownerDirectory,
+              targetDirectory,
+              role,
+            }
             if (data.messageID) {
+              const mapping = {
+                ...(ownerSessionID ? { ownerSessionID } : {}),
+                ...(runID ? { runID } : {}),
+                targetDirectory,
+              }
               if (deps.registry) {
-                deps.registry.rememberOpen(data.messageID, createdSessionID, directory)
+                deps.registry.rememberOpen(
+                  data.messageID,
+                  createdSessionID,
+                  targetDirectory,
+                  mapping,
+                )
               } else {
                 await rememberOpenSession(
                   deps.ctx,
                   openSessions,
                   data.messageID,
                   createdSessionID,
-                  directory,
+                  targetDirectory,
+                  mapping,
                 )
               }
             }
             if (deps.registry) {
-              deps.registry.rememberOwned(createdSessionID, directory)
+              deps.registry.rememberOwned(createdSessionID, targetDirectory, ownedMetadata)
             } else {
               await rememberOwnedSession(
                 deps.ctx,
                 deps.ownedSessions,
                 createdSessionID,
-                directory,
+                targetDirectory,
+                ownedMetadata,
+              )
+            }
+            if (role === "worker" && deps.workerSessions) {
+              await rememberWorkerSession(deps.ctx, deps.workerSessions, {
+                sessionID: createdSessionID,
+                targetDirectory,
+                ...(ownerSessionID ? { ownerSessionID } : {}),
+                ...(runID ? { runID } : {}),
+                ownerDirectory,
+              })
+            }
+            if (deps.worktrees) {
+              await attachAndPersistSession(
+                deps.ctx,
+                deps.worktrees,
+                targetDirectory,
+                createdSessionID,
               )
             }
 
@@ -1180,6 +1470,12 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
               admitted,
               reused,
               title: displayTitle,
+              directory: targetDirectory,
+              role,
+              ...(ownerSessionID ? { ownerSessionID } : {}),
+              ...(runID ? { runID } : {}),
+              permissionsApplied,
+              locationVerified,
             }
           } catch (error) {
             return {
@@ -1188,6 +1484,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
               sessionID: created?.id ?? targetSessionID,
               title: displayTitle,
               messageID: data.messageID,
+              directory: targetDirectory,
             }
           }
         })()
@@ -1236,6 +1533,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
             sessionID: errorID,
             messageID: admission.messageID ?? data.messageID,
             title: boundTitle(data.title ?? title, deps.options.maxTitleChars),
+            directory: admission.directory,
           }),
         }
       }
@@ -1247,7 +1545,10 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       const header = `${t(lang, reused ? "reused" : "created")}: ${oneLine(
         created.id,
         256,
-      )}\n${t(lang, "title")}: ${displayTitle}`
+      )}\n${t(lang, "title")}: ${displayTitle}\n${t(lang, "directory")}: ${oneLine(
+        admission.directory,
+        deps.options.maxPathChars,
+      )}\n${t(lang, "role")}: ${admission.role}`
       if (!data.wait) {
         if (data.delivery === "queue") {
           enqueueQueuedPrompt(
@@ -1268,6 +1569,12 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
             sessionID: created.id,
             title: displayTitle,
             messageID: admitted.id,
+            directory: admission.directory,
+            role: admission.role,
+            ownerSessionID: admission.ownerSessionID,
+            runID: admission.runID,
+            locationVerified: admission.locationVerified,
+            permissionsApplied: admission.permissionsApplied,
             state: data.delivery === "queue" ? "queued" : "running",
             queued: data.delivery === "queue",
             pendingPermissions: [],
@@ -1325,6 +1632,12 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         content,
         output: turnOutputValue(created.id, displayTitle, turn, deps.options, {
           reused,
+          directory: admission.directory,
+          role: admission.role,
+          ownerSessionID: admission.ownerSessionID,
+          runID: admission.runID,
+          locationVerified: admission.locationVerified,
+          permissionsApplied: admission.permissionsApplied,
         }),
       }
     },
@@ -1373,7 +1686,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       const signature = sendSignature(data)
       const key = data.messageID ? `${data.sessionID}:${data.messageID}` : undefined
       await assertPermission(
-        deps,
+        deps.ctx,
         context,
         "session_bridge.send",
         [data.sessionID, data.messageID ?? "new-message", data.delivery],
@@ -1841,6 +2154,21 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
             .join(", ")}`,
         )
       }
+      if (live.background?.length) {
+        lines.push(
+          `${t(lang, "backgroundWork")}: ${live.background
+            .slice(0, 10)
+            .map((entry) =>
+              oneLine(
+                [entry.kind, entry.command ?? entry.description ?? entry.childSessionID ?? ""]
+                  .filter(Boolean)
+                  .join(" "),
+                200,
+              ),
+            )
+            .join(", ")}`,
+        )
+      }
 
       const errorBudget = Math.min(
         deps.options.maxErrorChars,
@@ -1983,6 +2311,8 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           transcriptAvailable: !contextError,
           permissionsAvailable: !permissionError,
           liveStale,
+          background: live.background,
+          backgroundCount: live.background?.length ?? 0,
           statusAt: liveStatusAt,
           lastError:
             liveFresh && live.lastError
@@ -2105,7 +2435,9 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         !isOwnedSession(
           deps.ownedSessions,
           data.sessionID,
-          deps.ctx.location?.directory,
+          callerOf(deps, context),
+          Date.now(),
+          { allowCrossDirectoryManagement: deps.options.allowCrossDirectoryManagement },
         ) &&
         !deps.options.allowReplyToForeignSessions
       ) {
@@ -2113,7 +2445,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       }
 
       await assertPermission(
-        deps,
+        deps.ctx,
         context,
         "session_bridge.reply",
         [data.sessionID, data.requestID, data.decision],
@@ -2592,7 +2924,9 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         !isOwnedSession(
           deps.ownedSessions,
           data.sessionID,
-          deps.ctx.location?.directory,
+          callerOf(deps, context),
+          Date.now(),
+          { allowCrossDirectoryManagement: deps.options.allowCrossDirectoryManagement },
         ) &&
         !deps.options.allowUpdateForeignSessions
       ) {
@@ -2601,7 +2935,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         )
       }
       await assertPermission(
-        deps,
+        deps.ctx,
         context,
         "session_bridge.compact",
         [data.sessionID, data.id ?? "new-compaction", data.delivery],
@@ -2719,13 +3053,43 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       const live = deps.liveState?.stats() ?? { sessions: 0, pending: 0 }
       let queueEntries = 0
       for (const entries of queuedPrompts.values()) queueEntries += entries.length
+      const races = [...(deps.races ?? new Map()).values()]
+        .filter((race) => {
+          const projectID = deps.ctx.location?.project?.id
+          return !race.projectID || !projectID || race.projectID === String(projectID)
+        })
+        .sort((left, right) => right.createdAt - left.createdAt)
+      const worktrees = [...(deps.worktrees ?? new Map()).values()].filter((record) => {
+        const projectID = deps.ctx.location?.project?.id
+        return !record.projectID || !projectID || record.projectID === String(projectID)
+      })
+      const workers = [...(deps.workerSessions ?? getProcessWorkerSessions()).values()]
+      const lastCleanupAt = races
+        .map((race) => race.cleanup?.at)
+        .filter((value): value is number => typeof value === "number")
+        .sort((left, right) => right - left)[0]
+      const raceSummary = {
+        count: races.length,
+        running: races.filter((race) => race.status === "running").length,
+        candidates: races.reduce((total, race) => total + race.candidates.length, 0),
+        lastRaceID: races[0]?.raceID,
+        lastCleanupAt,
+      }
+      const worktreeSummary = {
+        tracked: worktrees.length,
+        ready: worktrees.filter((record) => record.state === "ready").length,
+        orphans: worktrees.filter((record) => record.state === "orphan").length,
+      }
       const capabilities = {
         eventSubscribe: typeof deps.ctx.event?.subscribe === "function",
         sessionWait: typeof deps.ctx.session.wait === "function",
         sessionHook: typeof deps.ctx.session.hook === "function",
+        sessionMove: typeof deps.ctx.session.move === "function",
         storage: Boolean(deps.ctx.storage),
         worktree: typeof deps.ctx.worktree?.create === "function",
-        vcs: typeof deps.ctx.vcs?.diff === "function",
+        worktreeRemove: typeof deps.ctx.worktree?.remove === "function",
+        vcsDiff: typeof deps.ctx.vcs?.diff === "function",
+        vcsStatus: typeof deps.ctx.vcs?.status === "function",
       }
       const options = {
         maxOutputChars: deps.options.maxOutputChars,
@@ -2742,15 +3106,30 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         allowSessionRemoval: deps.options.allowSessionRemoval,
         allowRemoveForeignSessions: deps.options.allowRemoveForeignSessions,
         allowCompact: deps.options.allowCompact,
+        allowWorkerOrchestration: deps.options.allowWorkerOrchestration,
+        allowWorktreeManagement: deps.options.allowWorktreeManagement,
+        allowTestCommands: deps.options.allowTestCommands,
+        allowApplyCandidates: deps.options.allowApplyCandidates,
+        allowPushCandidates: deps.options.allowPushCandidates,
+        maxWorktrees: deps.options.maxWorktrees,
+        maxRaceCandidates: deps.options.maxRaceCandidates,
+        maxWaitSessions: deps.options.maxWaitSessions,
       }
       const lines = [
         `${t(lang, "session")}: session-bridge ${PLUGIN_VERSION}`,
         `${t(lang, "lastUpdate")}: ${formatTimestamp(live?.lastEventAt, lang)}`,
         `registry: owned=${registry?.owned ?? 0} open=${registry?.open ?? 0} dirty=${
           registry?.dirtyOwned || registry?.dirtyOpen ? "yes" : "no"
-        }`,
+        } workers=${workers.length}`,
         `live: sessions=${live?.sessions ?? 0} pending=${live?.pending ?? 0}`,
         `queues: sessions=${queuedPrompts.size} entries=${queueEntries}`,
+        `races: count=${raceSummary.count} running=${raceSummary.running} candidates=${
+          raceSummary.candidates
+        } last=${raceSummary.lastRaceID ?? "-"} cleanup=${formatTimestamp(
+          raceSummary.lastCleanupAt,
+          lang,
+        )}`,
+        `worktrees: tracked=${worktreeSummary.tracked} ready=${worktreeSummary.ready} orphans=${worktreeSummary.orphans}`,
         `capabilities: ${Object.entries(capabilities)
           .map(([key, value]) => `${key}=${value ? "yes" : "no"}`)
           .join(" ")}`,
@@ -2763,6 +3142,14 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           registry,
           live,
           queues: { sessions: queuedPrompts.size, entries: queueEntries },
+          races: raceSummary,
+          worktrees: worktreeSummary,
+          workers: { count: workers.length },
+          stream: {
+            eventSubscribe: capabilities.eventSubscribe,
+            lastEventAt: live?.lastEventAt,
+          },
+          storage: { available: capabilities.storage },
           options,
           state: "ok",
         }),
@@ -2798,14 +3185,16 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         !isOwnedSession(
           deps.ownedSessions,
           data.sessionID,
-          deps.ctx.location?.directory,
+          callerOf(deps, context),
+          Date.now(),
+          { allowCrossDirectoryManagement: deps.options.allowCrossDirectoryManagement },
         ) &&
         !deps.options.allowInterruptForeignSessions
       ) {
         throw new ValidationError(`${t(lang, "foreignInterruptBlocked")} ${t(lang, "foreignInterruptHint")}`)
       }
       await assertPermission(
-        deps,
+        deps.ctx,
         context,
         "session_bridge.interrupt",
         [data.sessionID, String(data.resume)],
@@ -2876,10 +3265,28 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
     },
     async (input, context, lang) => {
       const data = parseListInput(input, lang, deps.options)
+      let listDirectory: string | undefined = deps.ctx.location?.directory
+      if (data.directory) {
+        const validation = await (deps.validateDirectory ?? validateTargetDirectory)(
+          data.directory,
+          {
+            projectDirectory: deps.ctx.location?.project?.directory,
+            projectCanonical: deps.ctx.location?.project?.canonical,
+            registeredDirectories: registeredWorktreeDirectories(deps),
+            allowWorktreeDirectories: deps.options.allowWorktreeDirectories,
+          },
+        )
+        if (!validation.ok) {
+          throw new ValidationError(
+            `${t(lang, "directoryInvalid", { reason: validation.error })} ${t(lang, "directoryOutsideProject")}`,
+          )
+        }
+        listDirectory = validation.realDirectory
+      }
       const page = await withRequest(signalOf(context), deps.options.requestTimeoutMs, (signal) =>
         deps.ctx.session.list(
           {
-            directory: data.directory ?? deps.ctx.location?.directory,
+            directory: listDirectory,
             limit: data.limit,
             search: data.search,
             cursor: data.cursor,
@@ -2919,7 +3326,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       if (!shown.length) {
         return {
           content: t(lang, "noSessions"),
-          output: cleanOutput({ sessions: [], nextCursor, count: 0, state: "ok" }),
+          output: cleanOutput({ sessions: [], nextCursor, count: 0, directory: listDirectory, state: "ok" }),
         }
       }
 
@@ -2957,6 +3364,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           sessions: sessionsOutput,
           nextCursor,
           count: sessionsOutput.length,
+          directory: listDirectory,
           sessionsTruncated: page.data.length > shown.length,
           state: "ok",
         }),
@@ -3045,14 +3453,16 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         !isOwnedSession(
           deps.ownedSessions,
           data.sessionID,
-          deps.ctx.location?.directory,
+          callerOf(deps, context),
+          Date.now(),
+          { allowCrossDirectoryManagement: deps.options.allowCrossDirectoryManagement },
         ) &&
         !deps.options.allowUpdateForeignSessions
       ) {
         throw new ValidationError(`${t(lang, "foreignUpdateBlocked")} ${t(lang, "foreignUpdateHint")}`)
       }
       await assertPermission(
-        deps,
+        deps.ctx,
         context,
         "session_bridge.update",
         [data.sessionID],
@@ -3137,7 +3547,9 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         !isOwnedSession(
           deps.ownedSessions,
           data.sessionID,
-          deps.ctx.location?.directory,
+          callerOf(deps, context),
+          Date.now(),
+          { allowCrossDirectoryManagement: deps.options.allowCrossDirectoryManagement },
         ) &&
         !deps.options.allowRemoveForeignSessions
       ) {
@@ -3146,7 +3558,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         )
       }
       await assertPermission(
-        deps,
+        deps.ctx,
         context,
         "session_bridge.remove",
         [data.sessionID],
@@ -3165,6 +3577,11 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       }
       clearQueuedPrompts(queuedPrompts, data.sessionID)
       deps.liveState?.clearSession(data.sessionID)
+      await forgetWorkerSession(
+        deps.ctx,
+        deps.workerSessions ?? getProcessWorkerSessions(),
+        data.sessionID,
+      )
       return {
         content: `${t(lang, "removed")}: ${oneLine(data.sessionID, 256)}`,
         output: { sessionID: data.sessionID, removed: true, state: "ok" },
@@ -3172,5 +3589,904 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
     },
     "couldNotRemove",
     (error, input) => errorFor(deps, error, input, ["sessionID"]),
+  )
+
+  add(
+    {
+      name: "worktrees",
+      description:
+        "Create, list, and remove project worktrees through ctx.worktree. Creation and removal are opt-in (allowWorktreeManagement), and removal requires confirm: true. Only worktrees created by this plugin are removed; dirty or active worktrees are preserved unless force: true.",
+      input: schema({
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["create", "list", "remove"],
+            description: "create, list, or remove. Defaults to list.",
+          },
+          count: {
+            type: "integer",
+            minimum: 1,
+            maximum: deps.options.maxWorktrees,
+            description: "Number of worktrees to create.",
+          },
+          base: {
+            type: "string",
+            maxLength: deps.options.maxIdChars,
+            description: "Starting git ref/SHA. Defaults to HEAD.",
+          },
+          namePrefix: {
+            type: "string",
+            maxLength: 64,
+            description: "Prefix for generated worktree names. Defaults to sb.",
+          },
+          branch: {
+            type: "string",
+            maxLength: deps.options.maxIdChars,
+            description: "Optional starting branch/ref passed to ctx.worktree.create.",
+          },
+          runID: {
+            type: "string",
+            maxLength: deps.options.maxIdChars,
+            description: "Optional run ID used to group and clean up worktrees.",
+          },
+          directories: {
+            type: "array",
+            items: { type: "string", maxLength: deps.options.maxPathChars },
+            maxItems: Math.max(deps.options.maxWorktrees, 32),
+            description: "Directories to remove. Only tracked worktrees are eligible.",
+          },
+          force: {
+            type: "boolean",
+            description: "Remove dirty worktrees or worktrees with active sessions. Defaults to false.",
+          },
+          confirm: {
+            type: "boolean",
+            description: "Must be true for remove.",
+          },
+          archiveSessions: {
+            type: "boolean",
+            description: "Archive associated sessions before removing a worktree. Defaults to true.",
+          },
+          maxOutputChars: maxOutputSchemaFor(deps),
+        },
+        required: [],
+        additionalProperties: false,
+      }),
+      output: worktreesOutput,
+      options: { namespace: "sessions", codemode: true },
+    },
+    async (input, context, lang) => {
+      const data = parseWorktreesInput(input, lang, deps.options)
+      const signal = signalOf(context)
+      const orchestration = orchestrationDeps(deps)
+      if (data.action === "list") {
+        const worktrees = await listWorktrees(
+          {
+            ctx: deps.ctx,
+            options: deps.options,
+            worktrees: orchestration.worktrees,
+            git: orchestration.git,
+            liveState: deps.liveState,
+          },
+          signal,
+        )
+        const lines = worktrees.length
+          ? worktrees.map(
+              (worktree) =>
+                `- ${oneLine(worktree.directory, deps.options.maxPathChars)} | ${
+                  worktree.branch ?? t(lang, "unknown")
+                } | ${worktree.strategy} | ${worktree.dirty ? "dirty" : "clean"}${
+                  worktree.missing ? " | missing" : ""
+                }`,
+            )
+          : [t(lang, "noWorktrees")]
+        return {
+          content: capOutput(
+            `${t(lang, "worktreesListed")} (${worktrees.length}):\n${lines.join("\n")}`,
+            data.maxOutputChars,
+            lang,
+          ),
+          output: cleanOutput({
+            action: data.action,
+            worktrees,
+            removed: [],
+            orphans: [],
+            state: "ok",
+          }),
+        }
+      }
+
+      if (!deps.options.allowWorktreeManagement) {
+        throw new ValidationError(`${t(lang, "worktreesDisabled")} ${t(lang, "worktreesHint")}`)
+      }
+      await assertPermission(deps.ctx, context, "session_bridge.worktrees", [
+        data.action,
+        data.runID ?? "",
+        ...(data.directories ?? []),
+      ], {
+        action: data.action,
+        count: data.count,
+        ...(data.base ? { base: data.base } : {}),
+      })
+
+      if (data.action === "create") {
+        const created = await createWorktrees(
+          {
+            ctx: deps.ctx,
+            options: deps.options,
+            worktrees: orchestration.worktrees,
+            git: orchestration.git,
+            liveState: deps.liveState,
+          },
+          {
+            count: data.count,
+            base: data.base,
+            namePrefix: data.namePrefix,
+            branch: data.branch,
+          },
+          {
+            runID: data.runID ?? createRaceID(),
+            ownerSessionID: context.sessionID,
+            ownerDirectory: deps.ctx.location?.directory,
+          },
+          signal,
+        )
+        return {
+          content: capOutput(
+            `${t(lang, "worktreesCreated")} (${created.length}):\n${created
+              .map(
+                (worktree) =>
+                  `- ${oneLine(worktree.directory, deps.options.maxPathChars)} | ${
+                    worktree.branch ?? t(lang, "unknown")
+                  } | ${worktree.strategy} | ${worktree.runID}`,
+              )
+              .join("\n")}`,
+            data.maxOutputChars,
+            lang,
+          ),
+          output: cleanOutput({
+            action: data.action,
+            worktrees: created,
+            removed: [],
+            orphans: [],
+            state: "ok",
+          }),
+        }
+      }
+
+      if (!data.confirm) throw new ValidationError(t(lang, "invalidConfirm"))
+      if (!data.directories?.length) throw new ValidationError(t(lang, "invalidDirectories"))
+      const removed = await removeWorktrees(
+        {
+          ctx: deps.ctx,
+          options: deps.options,
+          worktrees: orchestration.worktrees,
+          git: orchestration.git,
+          liveState: deps.liveState,
+        },
+        data.directories,
+        { force: data.force, archiveSessions: data.archiveSessions },
+        signal,
+      )
+      const orphans = removed
+        .filter((entry) => entry.orphan)
+        .map((entry) => entry.directory)
+      const kept = removed
+        .filter((entry) => !entry.removed && !entry.orphan)
+        .map((entry) => entry.directory)
+      return {
+        content: capOutput(
+          `${t(lang, "worktreesRemoved")} (${removed.filter((entry) => entry.removed).length}/${
+            removed.length
+          }):\n${removed
+            .map(
+              (entry) =>
+                `- ${oneLine(entry.directory, deps.options.maxPathChars)} | ${
+                  entry.removed ? "removed" : "kept"
+                }${entry.reason ? ` | ${oneLine(entry.reason, 200)}` : ""}`,
+            )
+            .join("\n")}`,
+          data.maxOutputChars,
+          lang,
+        ),
+        output: cleanOutput({
+          action: data.action,
+          worktrees: [],
+          removed,
+          orphans,
+          kept,
+          state: "ok",
+        }),
+      }
+    },
+    "couldNotWorktrees",
+    (error, input) => errorFor(deps, error, input, []),
+  )
+
+  const waitManyHandler = async (
+    input: unknown,
+    context: ToolExecuteContext,
+    lang: Lang,
+    modeOverride?: "any" | "all",
+  ) => {
+    const data = parseWaitManyInput(input, lang, deps.options)
+    if (modeOverride) data.mode = modeOverride
+    await assertPermission(deps.ctx, context, "session_bridge.waitAny", [
+      ...data.sessionIDs,
+      data.mode,
+    ], { mode: data.mode, timeoutMs: data.timeoutMs })
+    const result = await waitMany(orchestrationDeps(deps), context, {
+      sessionIDs: data.sessionIDs,
+      messageIDs: data.messageIDs,
+      timeoutMs: data.timeoutMs,
+      perSessionTimeoutMs: data.perSessionTimeoutMs,
+      mode: data.mode,
+      returnOnPermission: data.returnOnPermission,
+    })
+    const lines = [
+      `${t(lang, "waitingSessions")} (${data.mode}) · ${result.elapsedMs}ms`,
+      ...result.results.map(
+        (entry) =>
+          `- ${oneLine(entry.sessionID, 256)} | ${entry.state} | ${entry.elapsedMs}ms${
+            entry.messageID ? ` | ${oneLine(entry.messageID, 256)}` : ""
+          }${entry.outcome ? ` | ${oneLine(entry.outcome, 120)}` : ""}${
+            entry.error ? ` | ${oneLine(entry.error, 300)}` : ""
+          }`,
+      ),
+    ]
+    if (result.pending.length) lines.push(`pending: ${result.pending.join(", ")}`)
+    return {
+      content: capOutput(lines.join("\n"), data.maxOutputChars, lang),
+      output: cleanOutput({
+        mode: result.mode,
+        sessions: result.results,
+        pending: result.pending,
+        elapsedMs: result.elapsedMs,
+        timedOut: result.timedOut,
+        aborted: result.aborted,
+        state:
+          result.state === "ok"
+            ? "ok"
+            : result.state === "permission"
+              ? "permission"
+              : result.state === "running"
+                ? "running"
+                : result.state === "timeout"
+                  ? "timeout"
+                  : "aborted",
+      }),
+    }
+  }
+
+  add(
+    {
+      name: "waitAny",
+      description:
+        "Wait for one or all background sessions. mode any returns the first session that finishes or needs permission; mode all returns every result, including partial results on timeout or abort. A pending permission is returned immediately so the orchestrator can reply and wait again.",
+      input: schema({
+        type: "object",
+        properties: {
+          sessionIDs: {
+            type: "array",
+            items: { type: "string", maxLength: deps.options.maxIdChars },
+            minItems: 1,
+            maxItems: deps.options.maxWaitSessions,
+            description: "Session IDs to wait for.",
+          },
+          messageIDs: {
+            type: "object",
+            additionalProperties: { type: "string", maxLength: deps.options.maxIdChars },
+            description: "Optional map from session ID to the exact prompt message ID.",
+          },
+          timeoutMs: {
+            type: "integer",
+            minimum: 1,
+            maximum: 3_600_000,
+            description: "Global timeout in milliseconds. Defaults to 120000.",
+          },
+          perSessionTimeoutMs: {
+            type: "integer",
+            minimum: 1,
+            maximum: 600_000,
+            description: "Optional timeout per session.",
+          },
+          mode: {
+            type: "string",
+            enum: ["any", "all"],
+            description: "any (default) or all.",
+          },
+          returnOnPermission: {
+            type: "boolean",
+            description: "In all mode, return early when a permission is pending. Defaults to true.",
+          },
+          maxOutputChars: maxOutputSchemaFor(deps),
+        },
+        required: ["sessionIDs"],
+        additionalProperties: false,
+      }),
+      output: waitManyOutput,
+      options: { namespace: "sessions", codemode: true },
+    },
+    (input, context, lang) => waitManyHandler(input, context, lang),
+    "couldNotWaitAny",
+    (error, input) => errorFor(deps, error, input, []),
+  )
+
+  add(
+    {
+      name: "waitAll",
+      description:
+        "Wait for all listed sessions. Alias of sessions.waitAny with mode: all; returns partial results on timeout or abort and never loses sessions that already finished.",
+      input: schema({
+        type: "object",
+        properties: {
+          sessionIDs: {
+            type: "array",
+            items: { type: "string", maxLength: deps.options.maxIdChars },
+            minItems: 1,
+            maxItems: deps.options.maxWaitSessions,
+            description: "Session IDs to wait for.",
+          },
+          messageIDs: {
+            type: "object",
+            additionalProperties: { type: "string", maxLength: deps.options.maxIdChars },
+            description: "Optional map from session ID to the exact prompt message ID.",
+          },
+          timeoutMs: {
+            type: "integer",
+            minimum: 1,
+            maximum: 3_600_000,
+            description: "Global timeout in milliseconds. Defaults to 120000.",
+          },
+          perSessionTimeoutMs: {
+            type: "integer",
+            minimum: 1,
+            maximum: 600_000,
+            description: "Optional timeout per session.",
+          },
+          returnOnPermission: {
+            type: "boolean",
+            description: "Return early when a permission is pending. Defaults to true.",
+          },
+          maxOutputChars: maxOutputSchemaFor(deps),
+        },
+        required: ["sessionIDs"],
+        additionalProperties: false,
+      }),
+      output: waitManyOutput,
+      options: { namespace: "sessions", codemode: true },
+    },
+    (input, context, lang) => waitManyHandler(input, context, lang, "all"),
+    "couldNotWaitAny",
+    (error, input) => errorFor(deps, error, input, []),
+  )
+
+  const raceHandler = async (
+    input: unknown,
+    context: ToolExecuteContext,
+    lang: Lang,
+    bestOf: boolean,
+  ) => {
+    const data = parseRaceInput(input, lang, deps.options)
+    await assertPermission(deps.ctx, context, bestOf ? "session_bridge.bestOf" : "session_bridge.race", [
+      data.mode,
+      String(data.count),
+      data.base ?? "HEAD",
+    ], {
+      mode: data.mode,
+      count: data.count,
+      testCommand: Boolean(data.testCommand),
+      keepWorktrees: data.keepWorktrees,
+    })
+    const result = await runRace(orchestrationDeps(deps), context, data, signalOf(context))
+    const ranking = bestOf || data.testCommand ? result.ranking : undefined
+    const output = shapeRace(result.race, deps.options, ranking)
+    const candidates = result.race.candidates
+    const lines = [
+      `${t(lang, "raceStatusLabel")}: ${result.race.status} · ${result.race.raceID}`,
+      `${t(lang, "raceCandidates")}: ${candidates.length} · base: ${oneLine(
+        result.race.base ?? "HEAD",
+        64,
+      )}`,
+      ...candidates.map((candidate) => {
+        const tests = candidate.tests
+          ? candidate.tests.skipped
+            ? t(lang, "testsSkipped")
+            : candidate.tests.passed
+              ? t(lang, "testsPassed")
+              : t(lang, "testsFailed")
+          : t(lang, "verificationUnknown")
+        return `- ${candidate.candidateID} | ${oneLine(candidate.sessionID ?? "-", 256)} | ${
+          candidate.state
+        } | +${candidate.diffStats.additions}/-${candidate.diffStats.deletions} | ${tests} | ${
+          candidate.verification
+        }${candidate.error ? ` | ${oneLine(candidate.error, 300)}` : ""}`
+      }),
+    ]
+    if (ranking?.recommended) {
+      lines.push(
+        `${t(lang, "raceRecommended")}: ${ranking.recommended} (${ranking.rankingReasons.join(", ")})`,
+      )
+    } else if (bestOf) {
+      lines.push(t(lang, "raceNoRecommendation"))
+    }
+    return {
+      content: capOutput(lines.join("\n"), data.maxOutputChars, lang),
+      output: cleanOutput({
+        ...output,
+        state: "ok",
+      }),
+    }
+  }
+
+  add(
+    {
+      name: "race",
+      description:
+        "Run the same prompt in N candidate sessions (worktrees by default), wait for them, snapshot commits/patches, optionally run tests serially, and return candidates with diffs and verification. Never applies changes. Worktrees are kept by default.",
+      input: schema({
+        type: "object",
+        properties: {
+          prompt: { type: "string", minLength: 1, maxLength: deps.options.maxPromptChars, description: "Prompt sent to every candidate." },
+          count: {
+            type: "integer",
+            minimum: 2,
+            maximum: deps.options.maxRaceCandidates,
+            description: "Number of candidates. Defaults to 3.",
+          },
+          mode: {
+            type: "string",
+            enum: ["worktrees", "same-directory"],
+            description: "worktrees (default) or same-directory (review only).",
+          },
+          base: {
+            type: "string",
+            maxLength: deps.options.maxIdChars,
+            description: "Starting git ref/SHA. Defaults to HEAD.",
+          },
+          models: {
+            type: "array",
+            items: { type: "string", maxLength: deps.options.maxModelChars },
+            maxItems: deps.options.maxRaceCandidates,
+            description: "Optional model per candidate, in provider/model format.",
+          },
+          agents: {
+            type: "array",
+            items: { type: "string", maxLength: deps.options.maxAgentChars },
+            maxItems: deps.options.maxRaceCandidates,
+            description: "Optional agent per candidate.",
+          },
+          permissions: {
+            type: "array",
+            maxItems: deps.options.maxPermissionRules,
+            items: permissionRuleSchemaFor(deps),
+            description: "Additional deny rules for worker sessions.",
+          },
+          testCommand: {
+            type: "string",
+            maxLength: 8_192,
+            description: "Optional test command. Requires allowTestCommands: true; runs without a shell.",
+          },
+          setupCommand: {
+            type: "string",
+            maxLength: 8_192,
+            description: "Optional setup command run before tests.",
+          },
+          teardownCommand: {
+            type: "string",
+            maxLength: 8_192,
+            description: "Optional teardown command run after tests.",
+          },
+          env: {
+            type: "object",
+            additionalProperties: { type: "string", maxLength: 4_096 },
+            description: "Optional test environment variables (allowlisted; secret-like keys are skipped).",
+          },
+          cwd: {
+            type: "string",
+            maxLength: deps.options.maxPathChars,
+            description: "Optional working directory relative to each candidate worktree.",
+          },
+          timeoutMs: {
+            type: "integer",
+            minimum: 1_000,
+            maximum: 3_600_000,
+            description: "Wall-clock timeout for the race.",
+          },
+          testTimeoutMs: {
+            type: "integer",
+            minimum: 1_000,
+            maximum: 600_000,
+            description: "Timeout for each test command.",
+          },
+          keepWorktrees: {
+            type: "boolean",
+            description: "Keep candidate worktrees after the snapshot. Defaults to true.",
+          },
+          snapshot: {
+            type: "string",
+            enum: ["auto", "commit", "patch"],
+            description: "Snapshot strategy. auto commits when safe, otherwise captures a patch.",
+          },
+          maxDiffBytes: {
+            type: "integer",
+            minimum: 1_000,
+            maximum: deps.options.maxDiffBytes,
+            description: "Maximum displayed diff bytes per candidate.",
+          },
+          maxTestOutputChars: {
+            type: "integer",
+            minimum: 100,
+            maximum: deps.options.maxTestOutputChars,
+            description: "Maximum stdout/stderr characters per test command.",
+          },
+          runID: {
+            type: "string",
+            maxLength: deps.options.maxIdChars,
+            description: "Optional run ID; the default is generated.",
+          },
+          maxOutputChars: maxOutputSchemaFor(deps),
+        },
+        required: ["prompt"],
+        additionalProperties: false,
+      }),
+      output: raceOutput,
+      options: { namespace: "sessions", codemode: true },
+    },
+    (input, context, lang) => raceHandler(input, context, lang, false),
+    "couldNotRace",
+    (error, input) => errorFor(deps, error, input, ["runID"]),
+  )
+
+  add(
+    {
+      name: "bestOf",
+      description:
+        "Run the same race as sessions.race and return a heuristic recommended candidate plus rankingReasons. Tests passed first, then smaller diff, then faster. No candidate is applied automatically.",
+      input: schema({
+        type: "object",
+        properties: {
+          prompt: { type: "string", minLength: 1, maxLength: deps.options.maxPromptChars, description: "Prompt sent to every candidate." },
+          count: {
+            type: "integer",
+            minimum: 2,
+            maximum: deps.options.maxRaceCandidates,
+            description: "Number of candidates. Defaults to 3.",
+          },
+          mode: {
+            type: "string",
+            enum: ["worktrees", "same-directory"],
+            description: "worktrees (default) or same-directory (review only).",
+          },
+          base: { type: "string", maxLength: deps.options.maxIdChars, description: "Starting git ref/SHA." },
+          models: {
+            type: "array",
+            items: { type: "string", maxLength: deps.options.maxModelChars },
+            maxItems: deps.options.maxRaceCandidates,
+          },
+          agents: {
+            type: "array",
+            items: { type: "string", maxLength: deps.options.maxAgentChars },
+            maxItems: deps.options.maxRaceCandidates,
+          },
+          permissions: {
+            type: "array",
+            maxItems: deps.options.maxPermissionRules,
+            items: permissionRuleSchemaFor(deps),
+          },
+          testCommand: { type: "string", maxLength: 8_192 },
+          setupCommand: { type: "string", maxLength: 8_192 },
+          teardownCommand: { type: "string", maxLength: 8_192 },
+          env: { type: "object", additionalProperties: { type: "string", maxLength: 4_096 } },
+          cwd: { type: "string", maxLength: deps.options.maxPathChars },
+          timeoutMs: { type: "integer", minimum: 1_000, maximum: 3_600_000 },
+          testTimeoutMs: { type: "integer", minimum: 1_000, maximum: 600_000 },
+          keepWorktrees: { type: "boolean" },
+          snapshot: { type: "string", enum: ["auto", "commit", "patch"] },
+          maxDiffBytes: {
+            type: "integer",
+            minimum: 1_000,
+            maximum: deps.options.maxDiffBytes,
+          },
+          maxTestOutputChars: {
+            type: "integer",
+            minimum: 100,
+            maximum: deps.options.maxTestOutputChars,
+          },
+          runID: { type: "string", maxLength: deps.options.maxIdChars },
+          maxOutputChars: maxOutputSchemaFor(deps),
+        },
+        required: ["prompt"],
+        additionalProperties: false,
+      }),
+      output: raceOutput,
+      options: { namespace: "sessions", codemode: true },
+    },
+    (input, context, lang) => raceHandler(input, context, lang, true),
+    "couldNotRace",
+    (error, input) => errorFor(deps, error, input, ["runID"]),
+  )
+
+  add(
+    {
+      name: "applyCandidate",
+      description:
+        "Apply a candidate from a registered race. Requires allowApplyCandidates: true and confirm: true. Dry-run is the default. Prefer an integration worktree plus verifyCommand; a failed verification leaves the target untouched. Commit and push are separate opt-ins.",
+      input: schema({
+        type: "object",
+        properties: {
+          raceID: { type: "string", maxLength: deps.options.maxIdChars, description: "Race ID." },
+          candidateID: { type: "string", maxLength: deps.options.maxIdChars, description: "Candidate ID." },
+          targetDirectory: {
+            type: "string",
+            maxLength: deps.options.maxPathChars,
+            description: "Target directory. Defaults to the race target.",
+          },
+          strategy: {
+            type: "string",
+            enum: ["apply", "cherry-pick"],
+            description: "apply (patch) or cherry-pick (requires a candidate commit). Defaults to apply.",
+          },
+          verifyCommand: {
+            type: "string",
+            maxLength: 8_192,
+            description: "Optional command run in the integration worktree before touching the target.",
+          },
+          dryRun: {
+            type: "boolean",
+            description: "If true (default), verify in an integration worktree without modifying the target.",
+          },
+          commit: {
+            type: "boolean",
+            description: "Create a commit in the target after applying. Defaults to false.",
+          },
+          commitMessage: {
+            type: "string",
+            maxLength: deps.options.maxTitleChars,
+            description: "Commit message when commit: true.",
+          },
+          confirm: {
+            type: "boolean",
+            description: "Must be true to apply.",
+          },
+          push: {
+            type: "boolean",
+            description: "Push after a successful commit. Requires allowPushCandidates: true. No force push.",
+          },
+          maxOutputChars: maxOutputSchemaFor(deps),
+        },
+        required: ["raceID", "candidateID", "confirm"],
+        additionalProperties: false,
+      }),
+      output: applyOutput,
+      options: { namespace: "sessions", codemode: true },
+    },
+    async (input, context, lang) => {
+      const data = parseApplyInput(input, lang, deps.options)
+      if (!deps.options.allowApplyCandidates) {
+        throw new ValidationError(`${t(lang, "applyDisabled")} ${t(lang, "applyHint")}`)
+      }
+      if (!data.confirm) throw new ValidationError(t(lang, "applyConfirm"))
+      const result = await applyCandidate(
+        orchestrationDeps(deps),
+        context,
+        {
+          raceID: data.raceID,
+          candidateID: data.candidateID,
+          targetDirectory: data.targetDirectory,
+          strategy: data.strategy,
+          verifyCommand: data.verifyCommand,
+          dryRun: data.dryRun,
+          commit: data.commit,
+          commitMessage: data.commitMessage,
+          confirm: data.confirm,
+          push: data.push,
+        },
+        signalOf(context),
+      )
+      const lines = [
+        `${t(lang, "applyCandidate")}: ${data.raceID}/${data.candidateID}`,
+        `${t(lang, "state")}: ${result.state}`,
+        `${t(lang, "strategy")}: ${result.strategy}`,
+        `${t(lang, "directory")}: ${oneLine(result.targetDirectory, deps.options.maxPathChars)}`,
+        `${t(lang, "applyApplied")}: ${result.applied ? "yes" : "no"} | ${
+          t(lang, "applyAlready")
+        }: ${result.alreadyApplied ? "yes" : "no"}`,
+      ]
+      if (result.dryRun) lines.push(t(lang, "applyDryRun"))
+      if (result.integrationDirectory) {
+        lines.push(
+          `${t(lang, "applyIntegration")}: ${oneLine(
+            result.integrationDirectory,
+            deps.options.maxPathChars,
+          )}`,
+        )
+      }
+      if (result.backup) lines.push(`${t(lang, "applyBackup")}: ${oneLine(result.backup, 256)}`)
+      if (result.verification) {
+        lines.push(
+          `${t(lang, "applyVerification")}: ${
+            result.verification.skipped
+              ? t(lang, "testsSkipped")
+              : result.verification.passed
+                ? t(lang, "testsPassed")
+                : t(lang, "testsFailed")
+          }${result.verification.reason ? ` | ${oneLine(result.verification.reason, 300)}` : ""}`,
+        )
+      }
+      if (result.pushError) {
+        lines.push(`${t(lang, "applyPushFailed")}: ${oneLine(result.pushError, 500)}`)
+      } else if (result.pushed !== undefined) {
+        lines.push(`${t(lang, "applyPush")}: ${result.pushed ? t(lang, "applyPushed") : "no"}`)
+      }
+      if (result.reason) lines.push(`${t(lang, "result")}: ${oneLine(result.reason, 500)}`)
+      return {
+        content: capOutput(lines.join("\n"), data.maxOutputChars, lang),
+        output: cleanOutput({
+          raceID: data.raceID,
+          candidateID: data.candidateID,
+          ...result,
+        }),
+      }
+    },
+    "couldNotApply",
+    (error, input) => errorFor(deps, error, input, ["raceID", "candidateID"]),
+  )
+
+  add(
+    {
+      name: "raceStatus",
+      description:
+        "Show one race or all registered races, including candidates, commits/patches, tests, verification, worktrees, and cleanup state. Read-only.",
+      input: schema({
+        type: "object",
+        properties: {
+          raceID: { type: "string", maxLength: deps.options.maxIdChars, description: "Optional race ID." },
+          maxOutputChars: maxOutputSchemaFor(deps),
+        },
+        required: [],
+        additionalProperties: false,
+      }),
+      output: raceStatusOutput,
+      options: { namespace: "sessions", codemode: true },
+    },
+    async (input, _context, lang) => {
+      const data = parseRaceStatusInput(input, lang, deps.options)
+      const orchestration = orchestrationDeps(deps)
+      if (data.raceID) {
+        const race = raceStatus(orchestration, data.raceID) as import("./races.ts").RaceRecord
+        const output = shapeRace(race, deps.options, rankCandidates(race.candidates))
+        return {
+          content: capOutput(
+            `${t(lang, "raceStatusLabel")}: ${race.status} · ${race.raceID}\n${t(
+              lang,
+              "raceCandidates",
+            )}: ${race.candidates.length}\n${t(lang, "directory")}: ${oneLine(
+              race.targetDirectory,
+              deps.options.maxPathChars,
+            )}`,
+            data.maxOutputChars,
+            lang,
+          ),
+          output: cleanOutput({ race: output, state: "ok" }),
+        }
+      }
+      const races = raceList(orchestration)
+      return {
+        content: capOutput(
+          races.length
+            ? races
+                .map(
+                  (race) =>
+                    `- ${race.raceID} | ${race.status} | ${race.mode} | candidates=${
+                      race.candidates
+                    } | worktrees=${race.worktrees}`,
+                )
+                .join("\n")
+            : t(lang, "raceNotFound"),
+          data.maxOutputChars,
+          lang,
+        ),
+        output: cleanOutput({ races, state: "ok" }),
+      }
+    },
+    "couldNotRaceStatus",
+    (error, input) => errorFor(deps, error, input, ["raceID"]),
+  )
+
+  add(
+    {
+      name: "raceList",
+      description: "List registered races with status, candidate counts, worktrees, and cleanup state. Read-only.",
+      input: schema({
+        type: "object",
+        properties: { maxOutputChars: maxOutputSchemaFor(deps) },
+        required: [],
+        additionalProperties: false,
+      }),
+      output: raceStatusOutput,
+      options: { namespace: "sessions", codemode: true },
+    },
+    async (input, _context, lang) => {
+      const data = parseRaceStatusInput(input, lang, deps.options)
+      const races = raceList(orchestrationDeps(deps))
+      return {
+        content: capOutput(
+          races.length
+            ? races.map((race) => `- ${race.raceID} | ${race.status} | ${race.mode}`).join("\n")
+            : t(lang, "raceNotFound"),
+          data.maxOutputChars,
+          lang,
+        ),
+        output: cleanOutput({ races, state: "ok" }),
+      }
+    },
+    "couldNotRaceStatus",
+    (error, input) => errorFor(deps, error, input, []),
+  )
+
+  add(
+    {
+      name: "raceCleanup",
+      description:
+        "Remove the worktrees created by a race. Requires allowWorktreeManagement: true and confirm: true. Dirty worktrees need force: true. Branches are kept.",
+      input: schema({
+        type: "object",
+        properties: {
+          raceID: { type: "string", maxLength: deps.options.maxIdChars, description: "Race ID to clean up." },
+          confirm: { type: "boolean", description: "Must be true." },
+          force: { type: "boolean", description: "Remove dirty worktrees. Defaults to false." },
+          archiveSessions: {
+            type: "boolean",
+            description: "Archive associated sessions before removing worktrees. Defaults to true.",
+          },
+          maxOutputChars: maxOutputSchemaFor(deps),
+        },
+        required: ["raceID", "confirm"],
+        additionalProperties: false,
+      }),
+      output: raceCleanupOutput,
+      options: { namespace: "sessions", codemode: true },
+    },
+    async (input, context, lang) => {
+      const data = parseRaceCleanupInput(input, lang, deps.options)
+      if (!deps.options.allowWorktreeManagement) {
+        throw new ValidationError(`${t(lang, "cleanupDisabled")} ${t(lang, "cleanupHint")}`)
+      }
+      await assertPermission(deps.ctx, context, "session_bridge.raceCleanup", [
+        data.raceID,
+        String(data.force),
+      ], { raceID: data.raceID, force: data.force })
+      const result = await raceCleanup(
+        orchestrationDeps(deps),
+        context,
+        {
+          raceID: data.raceID,
+          confirm: data.confirm,
+          force: data.force,
+          archiveSessions: data.archiveSessions,
+        },
+        signalOf(context),
+      )
+      return {
+        content: capOutput(
+          `${t(lang, "worktreesRemoved")}: ${result.cleanup.removed.length} | ${
+            t(lang, "error")
+          }: ${result.cleanup.orphans.length}`,
+          data.maxOutputChars,
+          lang,
+        ),
+        output: cleanOutput({
+          raceID: data.raceID,
+          removed: result.cleanup.removed,
+          orphans: result.cleanup.orphans,
+          kept: result.cleanup.kept,
+          state: "ok",
+        }),
+      }
+    },
+    "couldNotCleanup",
+    (error, input) => errorFor(deps, error, input, ["raceID"]),
   )
 }

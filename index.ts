@@ -1,10 +1,15 @@
 import { Plugin } from "@opencode/plugin"
-import { createLiveState, type LiveState } from "./src/live.ts"
+import { runGit } from "./src/git.ts"
+import { createLiveState, type LiveBackground, type LiveState } from "./src/live.ts"
 import { parseOptions } from "./src/options.ts"
+import { loadRaces, persistRaces } from "./src/races.ts"
 import {
   createRegistryPersistence,
+  getProcessWorkerSessions,
   loadOpenSessions,
   loadOwnedSessions,
+  loadWorkerSessions,
+  persistWorkerSessions,
 } from "./src/registry.ts"
 import {
   registerTools,
@@ -13,6 +18,7 @@ import {
   type SentMessages,
 } from "./src/tools.ts"
 import type { Lang, PluginContext, SessionEventLike } from "./src/types.ts"
+import { loadWorktrees, persistWorktrees } from "./src/worktrees.ts"
 import { sleep } from "./src/wait.ts"
 
 const LANGUAGE_KEY = "language"
@@ -82,6 +88,9 @@ export default Plugin.define({
     let language: Lang = stored === "es" || stored === "en" ? stored : options.language
     const ownedSessions = await loadOwnedSessions(ctx)
     const openSessions = await loadOpenSessions(ctx)
+    const workerSessions = await loadWorkerSessions(ctx)
+    const worktrees = await loadWorktrees(ctx)
+    const races = await loadRaces(ctx)
     const registry = createRegistryPersistence(ctx, ownedSessions, openSessions)
     const inFlightOpens = new Map<string, OpenInflight>()
     const inFlightSends = new Map<string, SendInflight>()
@@ -94,6 +103,26 @@ export default Plugin.define({
     const registrations: RegistrationLike[] = []
     const liveController = new AbortController()
 
+    const refreshWorkers = async () => {
+      const loaded = await loadWorkerSessions(ctx)
+      for (const [sessionID, entry] of loaded) workerSessions.set(sessionID, entry)
+      for (const [sessionID, entry] of getProcessWorkerSessions()) workerSessions.set(sessionID, entry)
+    }
+
+    if (typeof ctx.session.hook === "function") {
+      try {
+        const registration = await ctx.session.hook("experimental.idle", (input) => {
+          const background = Array.isArray(input?.background)
+            ? (input.background as unknown as LiveBackground[])
+            : []
+          liveState.noteIdleBackground(String(input?.sessionID ?? ""), background)
+        })
+        registrations.push(registration)
+      } catch {
+        // The experimental idle hook is optional; waitAny then cannot detect
+        // background shells/subagents and reports the model idle only.
+      }
+    }
     if (typeof ctx.session.hook === "function") {
       try {
         const registration = await ctx.session.hook("prompt", (input) => {
@@ -138,6 +167,11 @@ export default Plugin.define({
         inFlightSends,
         sentMessages,
         registry,
+        workerSessions,
+        worktrees,
+        races,
+        git: runGit,
+        refreshWorkers,
       })
     })
 
@@ -151,6 +185,11 @@ export default Plugin.define({
         }
       }
       await registry.dispose()
+      await Promise.allSettled([
+        persistWorkerSessions(ctx, workerSessions),
+        persistWorktrees(ctx, worktrees),
+        persistRaces(ctx, races),
+      ])
       liveState.clear()
     }
   },

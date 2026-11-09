@@ -1,26 +1,65 @@
+import { sameDirectory } from "./directories.ts"
 import type { PluginContext } from "./types.ts"
 
 const OWNED_KEY = "session-bridge:owned-sessions"
 const OPEN_KEY = "session-bridge:open-sessions"
+const WORKERS_KEY = "session-bridge:workers"
 const MAX_OWNED = 500
 const MAX_OPEN = 500
+const MAX_WORKERS = 500
 const OPEN_TTL_MS = 7 * 24 * 60 * 60 * 1_000
 export const OWNED_TTL_MS = 30 * 24 * 60 * 60 * 1_000
+export const WORKER_TTL_MS = 7 * 24 * 60 * 60 * 1_000
+
+export type SessionRole = "orchestrator" | "worker"
 
 export type OwnedSessionEntry = {
   at: number
+  /** Legacy directory metadata. Kept for old registries and same-directory auth. */
   directory?: string
+  ownerSessionID?: string
+  runID?: string
+  ownerDirectory?: string
+  targetDirectory?: string
+  role?: SessionRole
 }
 
 export type OwnedSessions = Map<string, OwnedSessionEntry>
+
+export type OwnedCaller = {
+  sessionID?: string
+  runID?: string
+  role?: SessionRole
+  directory?: string
+}
+
+export type OwnershipOptions = {
+  /** When false, owner/run authorization does not cross directories. */
+  allowCrossDirectoryManagement?: boolean
+}
 
 export type OpenSessionEntry = {
   sessionID: string
   at: number
   directory?: string
+  ownerSessionID?: string
+  runID?: string
+  targetDirectory?: string
 }
 
 export type OpenSessionMapping = Map<string, OpenSessionEntry>
+
+export type WorkerSessionEntry = {
+  sessionID: string
+  at: number
+  ownerSessionID?: string
+  runID?: string
+  ownerDirectory?: string
+  targetDirectory: string
+  role: "worker"
+}
+
+export type WorkerSessions = Map<string, WorkerSessionEntry>
 
 function directoryOf(ctx: PluginContext): string | undefined {
   try {
@@ -64,10 +103,52 @@ function validTimestamp(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined
 }
 
-function validDirectory(value: unknown, current: string | undefined): string | undefined {
-  if (typeof value !== "string" || !value) return current
-  if (current && value !== current) return undefined
-  return value
+function validString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined
+}
+
+function validRole(value: unknown): SessionRole | undefined {
+  return value === "orchestrator" || value === "worker" ? value : undefined
+}
+
+function ownedEntryFromRecord(
+  record: Record<string, unknown>,
+  currentDirectory: string | undefined,
+  now: number,
+): OwnedSessionEntry | undefined {
+  const at = validTimestamp(record.at) ?? now
+  const legacyDirectory =
+    typeof record.directory === "string" && record.directory
+      ? record.directory
+      : undefined
+  const explicitTarget = validString(record.targetDirectory)
+  const targetDirectory = explicitTarget ?? legacyDirectory
+  const ownerDirectory = validString(record.ownerDirectory)
+  const ownerSessionID = validString(record.ownerSessionID)
+  const runID = validString(record.runID)
+  const role = validRole(record.role)
+  // Old registries only carry `directory`; keep them usable for
+  // same-directory ownership. Entries from another directory are legitimate
+  // when they carry owner/run/target metadata, so do not drop those.
+  if (
+    legacyDirectory &&
+    !explicitTarget &&
+    !ownerSessionID &&
+    !runID &&
+    currentDirectory &&
+    legacyDirectory !== currentDirectory
+  ) {
+    return undefined
+  }
+  return {
+    at,
+    ...(legacyDirectory ? { directory: legacyDirectory } : {}),
+    ...(ownerSessionID ? { ownerSessionID } : {}),
+    ...(runID ? { runID } : {}),
+    ...(ownerDirectory ? { ownerDirectory } : {}),
+    ...(targetDirectory ? { targetDirectory } : {}),
+    ...(role ? { role } : {}),
+  }
 }
 
 export function pruneOwnedSessions(sessions: OwnedSessions, now = Date.now()): void {
@@ -94,11 +175,10 @@ export async function loadOwnedSessions(ctx: PluginContext): Promise<OwnedSessio
     for (const record of readStoredEntries(raw)) {
       const sessionID = typeof record.sessionID === "string" ? record.sessionID : ""
       if (!sessionID) continue
-      const at = validTimestamp(record.at) ?? now
-      const entryDirectory = validDirectory(record.directory, directory)
-      if (record.directory !== undefined && entryDirectory === undefined) continue
+      const entry = ownedEntryFromRecord(record, directory, now)
+      if (!entry) continue
       sessions.delete(sessionID)
-      sessions.set(sessionID, { at, ...(entryDirectory ? { directory: entryDirectory } : {}) })
+      sessions.set(sessionID, entry)
     }
     pruneOwnedSessions(sessions, now)
   } catch {
@@ -117,7 +197,12 @@ export async function persistOwnedSessions(
       ([sessionID, entry]) => ({
         sessionID,
         at: entry.at,
-        directory: entry.directory ?? directory ?? "",
+        directory: entry.directory ?? entry.targetDirectory ?? directory ?? "",
+        ...(entry.ownerSessionID ? { ownerSessionID: entry.ownerSessionID } : {}),
+        ...(entry.runID ? { runID: entry.runID } : {}),
+        ...(entry.ownerDirectory ? { ownerDirectory: entry.ownerDirectory } : {}),
+        ...(entry.targetDirectory ? { targetDirectory: entry.targetDirectory } : {}),
+        ...(entry.role ? { role: entry.role } : {}),
       }),
     )
     await ctx.storage?.set(storageKey(OWNED_KEY, directory), values)
@@ -131,11 +216,13 @@ export async function rememberOwnedSession(
   sessions: OwnedSessions,
   sessionID: string,
   directory = directoryOf(ctx),
+  metadata: Omit<OwnedSessionEntry, "at" | "directory"> = {},
 ): Promise<void> {
   sessions.delete(sessionID)
   sessions.set(sessionID, {
     at: Date.now(),
     ...(directory ? { directory } : {}),
+    ...metadata,
   })
   pruneOwnedSessions(sessions)
   await persistOwnedSessions(ctx, sessions)
@@ -150,11 +237,23 @@ export async function forgetOwnedSession(
   await persistOwnedSessions(ctx, sessions)
 }
 
+/**
+ * Authorizes management of a session.
+ *
+ * Priority:
+ * 1. the caller is the recorded owner (`ownerSessionID`);
+ * 2. the caller is an orchestrator of the same run;
+ * 3. a legacy entry without owner/run still authorizes the same directory.
+ *
+ * Directory equality alone never authorizes a session that has an owner or a
+ * run, so a foreign caller cannot inherit access by sharing a worktree.
+ */
 export function isOwnedSession(
   sessions: OwnedSessions,
   sessionID: string,
-  directory?: string,
+  caller?: string | OwnedCaller,
   now = Date.now(),
+  options: OwnershipOptions = {},
 ): boolean {
   const entry = sessions.get(sessionID)
   if (!entry) return false
@@ -162,21 +261,181 @@ export function isOwnedSession(
     sessions.delete(sessionID)
     return false
   }
-  if (directory && entry.directory && entry.directory !== directory) return false
-  return true
+
+  const who: OwnedCaller =
+    typeof caller === "string" || caller === undefined
+      ? { directory: caller }
+      : caller
+  const callerEntry = who.sessionID ? sessions.get(who.sessionID) : undefined
+  const callerRunID = who.runID ?? callerEntry?.runID
+  const callerRole = who.role ?? callerEntry?.role
+  const crossDirectory = options.allowCrossDirectoryManagement ?? true
+  const callerDirectory = who.directory ?? callerEntry?.directory ?? callerEntry?.targetDirectory
+  const entryDirectory = entry.targetDirectory ?? entry.directory
+
+  if (entry.ownerSessionID && who.sessionID && who.sessionID === entry.ownerSessionID) {
+    if (!crossDirectory && callerDirectory && entryDirectory && !sameDirectory(callerDirectory, entryDirectory)) {
+      return false
+    }
+    return true
+  }
+
+  if (
+    entry.runID &&
+    callerRunID &&
+    callerRunID === entry.runID &&
+    callerRole === "orchestrator" &&
+    entry.role !== "orchestrator"
+  ) {
+    if (!crossDirectory && callerDirectory && entryDirectory && !sameDirectory(callerDirectory, entryDirectory)) {
+      return false
+    }
+    return true
+  }
+
+  // Legacy entries only. Once an entry has an owner or a run, directory
+  // equality is metadata and not an authorization grant.
+  if (!entry.ownerSessionID && !entry.runID) {
+    if (!callerDirectory || !entryDirectory) return true
+    return sameDirectory(callerDirectory, entryDirectory)
+  }
+
+  return false
+}
+
+export function isWorkerSession(
+  workers: WorkerSessions,
+  sessionID: string | undefined,
+  now = Date.now(),
+): WorkerSessionEntry | undefined {
+  if (!sessionID) return undefined
+  const entry = workers.get(sessionID)
+  if (!entry) return undefined
+  if (now - entry.at > WORKER_TTL_MS) {
+    workers.delete(sessionID)
+    return undefined
+  }
+  return entry
+}
+
+/**
+ * Plugin instances for different locations share the process but not their
+ * in-memory module state when they run in separate workers. This module-level
+ * map still covers the common case (one server process); storage is the
+ * cross-process fallback.
+ */
+const processWorkers: WorkerSessions = new Map()
+
+export function getProcessWorkerSessions(): WorkerSessions {
+  return processWorkers
+}
+
+function pruneWorkers(workers: WorkerSessions, now = Date.now()): void {
+  for (const [sessionID, entry] of workers) {
+    if (now - entry.at > WORKER_TTL_MS) workers.delete(sessionID)
+  }
+  while (workers.size > MAX_WORKERS) {
+    const oldest = workers.keys().next().value
+    if (typeof oldest !== "string") break
+    workers.delete(oldest)
+  }
+}
+
+export async function loadWorkerSessions(ctx: PluginContext): Promise<WorkerSessions> {
+  const workers: WorkerSessions = new Map()
+  try {
+    const raw = await ctx.storage?.get(WORKERS_KEY)
+    for (const record of readStoredEntries(raw)) {
+      const sessionID = typeof record.sessionID === "string" ? record.sessionID : ""
+      if (!sessionID) continue
+      const targetDirectory = validString(record.targetDirectory)
+      if (!targetDirectory) continue
+      const at = validTimestamp(record.at) ?? Date.now()
+      workers.set(sessionID, {
+        sessionID,
+        at,
+        targetDirectory,
+        role: "worker",
+        ...(validString(record.ownerSessionID)
+          ? { ownerSessionID: validString(record.ownerSessionID) }
+          : {}),
+        ...(validString(record.runID) ? { runID: validString(record.runID) } : {}),
+        ...(validString(record.ownerDirectory)
+          ? { ownerDirectory: validString(record.ownerDirectory) }
+          : {}),
+      })
+    }
+  } catch {
+    // Storage is optional; the process map still protects this process.
+  }
+  for (const [sessionID, entry] of processWorkers) workers.set(sessionID, entry)
+  pruneWorkers(workers)
+  return workers
+}
+
+export async function persistWorkerSessions(
+  ctx: PluginContext,
+  workers: WorkerSessions,
+): Promise<void> {
+  try {
+    const values: Array<Record<string, string | number>> = [...workers.values()].map(
+      (entry) => ({
+        sessionID: entry.sessionID,
+        at: entry.at,
+        targetDirectory: entry.targetDirectory,
+        role: "worker",
+        ...(entry.ownerSessionID ? { ownerSessionID: entry.ownerSessionID } : {}),
+        ...(entry.runID ? { runID: entry.runID } : {}),
+        ...(entry.ownerDirectory ? { ownerDirectory: entry.ownerDirectory } : {}),
+      }),
+    )
+    await ctx.storage?.set(WORKERS_KEY, values)
+  } catch {
+    // Storage is optional.
+  }
+}
+
+/**
+ * Worker registrations are written immediately (not coalesced): the worker
+ * may run in another location/plugin instance and its first tool call must
+ * already see the role.
+ */
+export async function rememberWorkerSession(
+  ctx: PluginContext,
+  workers: WorkerSessions,
+  entry: Omit<WorkerSessionEntry, "at" | "role"> & { at?: number },
+): Promise<void> {
+  const value: WorkerSessionEntry = {
+    ...entry,
+    at: entry.at ?? Date.now(),
+    role: "worker",
+  }
+  workers.delete(value.sessionID)
+  workers.set(value.sessionID, value)
+  processWorkers.delete(value.sessionID)
+  processWorkers.set(value.sessionID, value)
+  pruneWorkers(workers)
+  pruneWorkers(processWorkers)
+  await persistWorkerSessions(ctx, workers)
+}
+
+export async function forgetWorkerSession(
+  ctx: PluginContext,
+  workers: WorkerSessions,
+  sessionID: string,
+): Promise<void> {
+  const changed = workers.delete(sessionID)
+  processWorkers.delete(sessionID)
+  if (changed) await persistWorkerSessions(ctx, workers)
 }
 
 export function pruneOpenSessions(
   mapping: OpenSessionMapping,
   now = Date.now(),
-  directory?: string,
+  _directory?: string,
 ): void {
   for (const [messageID, entry] of mapping) {
     if (!entry.sessionID || now - entry.at > OPEN_TTL_MS) {
-      mapping.delete(messageID)
-      continue
-    }
-    if (directory && entry.directory && entry.directory !== directory) {
       mapping.delete(messageID)
     }
   }
@@ -201,13 +460,32 @@ export async function loadOpenSessions(ctx: PluginContext): Promise<OpenSessionM
       const sessionID = typeof record.sessionID === "string" ? record.sessionID : ""
       if (!messageID || !sessionID) continue
       const at = validTimestamp(record.at) ?? Date.now()
-      const entryDirectory = validDirectory(record.directory, directory)
-      if (record.directory !== undefined && entryDirectory === undefined) continue
+      const legacyDirectory =
+        typeof record.directory === "string" && record.directory
+          ? record.directory
+          : undefined
+      const explicitTarget = validString(record.targetDirectory)
+      const targetDirectory = explicitTarget ?? legacyDirectory
+      const ownerSessionID = validString(record.ownerSessionID)
+      const runID = validString(record.runID)
+      if (
+        legacyDirectory &&
+        !explicitTarget &&
+        !ownerSessionID &&
+        !runID &&
+        directory &&
+        legacyDirectory !== directory
+      ) {
+        continue
+      }
       mapping.delete(messageID)
       mapping.set(messageID, {
         sessionID,
         at,
-        ...(entryDirectory ? { directory: entryDirectory } : {}),
+        ...(legacyDirectory ? { directory: legacyDirectory } : {}),
+        ...(ownerSessionID ? { ownerSessionID } : {}),
+        ...(runID ? { runID } : {}),
+        ...(targetDirectory ? { targetDirectory } : {}),
       })
     }
     pruneOpenSessions(mapping, Date.now(), directory)
@@ -228,7 +506,10 @@ export async function persistOpenSessions(
         messageID,
         sessionID: entry.sessionID,
         at: entry.at,
-        directory: entry.directory ?? directory ?? "",
+        directory: entry.directory ?? entry.targetDirectory ?? directory ?? "",
+        ...(entry.ownerSessionID ? { ownerSessionID: entry.ownerSessionID } : {}),
+        ...(entry.runID ? { runID: entry.runID } : {}),
+        ...(entry.targetDirectory ? { targetDirectory: entry.targetDirectory } : {}),
       }),
     )
     await ctx.storage?.set(storageKey(OPEN_KEY, directory), values)
@@ -237,12 +518,16 @@ export async function persistOpenSessions(
   }
 }
 
-export function lookupOpenSession(
+/**
+ * Returns the raw mapping regardless of directory. `open` uses this to turn a
+ * same `messageID` in another directory into an explicit conflict instead of
+ * silently reusing or discarding the session.
+ */
+export function findOpenSession(
   mapping: OpenSessionMapping,
   messageID: string | undefined,
-  directory?: string,
   now = Date.now(),
-): string | undefined {
+): OpenSessionEntry | undefined {
   if (!messageID) return undefined
   const entry = mapping.get(messageID)
   if (!entry) return undefined
@@ -250,8 +535,19 @@ export function lookupOpenSession(
     mapping.delete(messageID)
     return undefined
   }
-  if (directory && entry.directory && entry.directory !== directory) {
-    mapping.delete(messageID)
+  return entry
+}
+
+export function lookupOpenSession(
+  mapping: OpenSessionMapping,
+  messageID: string | undefined,
+  directory?: string,
+  now = Date.now(),
+): string | undefined {
+  const entry = findOpenSession(mapping, messageID, now)
+  if (!entry) return undefined
+  const entryDirectory = entry.targetDirectory ?? entry.directory
+  if (directory && entryDirectory && !sameDirectory(entryDirectory, directory)) {
     return undefined
   }
   return entry.sessionID
@@ -263,12 +559,14 @@ export async function rememberOpenSession(
   messageID: string,
   sessionID: string,
   directory = directoryOf(ctx),
+  metadata: Omit<OpenSessionEntry, "sessionID" | "at" | "directory"> = {},
 ): Promise<void> {
   mapping.delete(messageID)
   mapping.set(messageID, {
     sessionID,
     at: Date.now(),
     ...(directory ? { directory } : {}),
+    ...metadata,
   })
   pruneOpenSessions(mapping, Date.now(), directory)
   await persistOpenSessions(ctx, mapping)
@@ -308,8 +606,17 @@ export type RegistryStats = {
 }
 
 export type RegistryPersistence = {
-  rememberOpen: (messageID: string, sessionID: string, directory?: string) => void
-  rememberOwned: (sessionID: string, directory?: string) => void
+  rememberOpen: (
+    messageID: string,
+    sessionID: string,
+    directory?: string,
+    metadata?: Omit<OpenSessionEntry, "sessionID" | "at" | "directory">,
+  ) => void
+  rememberOwned: (
+    sessionID: string,
+    directory?: string,
+    metadata?: Omit<OwnedSessionEntry, "at" | "directory">,
+  ) => void
   forgetOwned: (sessionID: string) => void
   forgetOpenBySessionID: (sessionID: string) => void
   flush: () => Promise<void>
@@ -383,22 +690,24 @@ export function createRegistryPersistence(
   }
 
   return {
-    rememberOpen(messageID, sessionID, targetDirectory = directory) {
+    rememberOpen(messageID, sessionID, targetDirectory = directory, metadata = {}) {
       open.delete(messageID)
       open.set(messageID, {
         sessionID,
         at: Date.now(),
         ...(targetDirectory ? { directory: targetDirectory } : {}),
+        ...metadata,
       })
       pruneOpenSessions(open, Date.now(), directory)
       dirtyOpen = true
       schedule()
     },
-    rememberOwned(sessionID, targetDirectory = directory) {
+    rememberOwned(sessionID, targetDirectory = directory, metadata = {}) {
       owned.delete(sessionID)
       owned.set(sessionID, {
         at: Date.now(),
         ...(targetDirectory ? { directory: targetDirectory } : {}),
+        ...metadata,
       })
       pruneOwnedSessions(owned)
       dirtyOwned = true

@@ -37,6 +37,24 @@ export type BridgeOptions = {
   allowInterruptForeignSessions: boolean
   allowUpdateForeignSessions: boolean
   allowCompact: boolean
+  allowCrossDirectoryManagement: boolean
+  allowWorkerOrchestration: boolean
+  allowWorktreeDirectories: boolean
+  allowWorktreeManagement: boolean
+  allowTestCommands: boolean
+  allowTestChanges: boolean
+  allowApplyCandidates: boolean
+  allowPushCandidates: boolean
+  allowSnapshotCommits: boolean
+  maxWorktrees: number
+  maxRaceCandidates: number
+  maxWaitSessions: number
+  maxConcurrentSessions: number
+  maxDiffBytes: number
+  maxTestOutputChars: number
+  maxRaceWallClockMs: number
+  raceRetentionMs: number
+  gitTimeoutMs: number
   debug: boolean
 }
 
@@ -76,6 +94,24 @@ export const DEFAULT_OPTIONS: BridgeOptions = {
   allowInterruptForeignSessions: false,
   allowUpdateForeignSessions: false,
   allowCompact: false,
+  allowCrossDirectoryManagement: true,
+  allowWorkerOrchestration: false,
+  allowWorktreeDirectories: false,
+  allowWorktreeManagement: false,
+  allowTestCommands: false,
+  allowTestChanges: false,
+  allowApplyCandidates: false,
+  allowPushCandidates: false,
+  allowSnapshotCommits: true,
+  maxWorktrees: 8,
+  maxRaceCandidates: 8,
+  maxWaitSessions: 8,
+  maxConcurrentSessions: 4,
+  maxDiffBytes: 200_000,
+  maxTestOutputChars: 20_000,
+  maxRaceWallClockMs: 600_000,
+  raceRetentionMs: 7 * 24 * 60 * 60 * 1_000,
+  gitTimeoutMs: 120_000,
   debug: false,
 }
 
@@ -158,6 +194,24 @@ export function parseOptions(raw: Record<string, unknown> | undefined): BridgeOp
     allowInterruptForeignSessions: readBoolean(input, "allowInterruptForeignSessions"),
     allowUpdateForeignSessions: readBoolean(input, "allowUpdateForeignSessions"),
     allowCompact: readBoolean(input, "allowCompact"),
+    allowCrossDirectoryManagement: readBoolean(input, "allowCrossDirectoryManagement"),
+    allowWorkerOrchestration: readBoolean(input, "allowWorkerOrchestration"),
+    allowWorktreeDirectories: readBoolean(input, "allowWorktreeDirectories"),
+    allowWorktreeManagement: readBoolean(input, "allowWorktreeManagement"),
+    allowTestCommands: readBoolean(input, "allowTestCommands"),
+    allowTestChanges: readBoolean(input, "allowTestChanges"),
+    allowApplyCandidates: readBoolean(input, "allowApplyCandidates"),
+    allowPushCandidates: readBoolean(input, "allowPushCandidates"),
+    allowSnapshotCommits: readBoolean(input, "allowSnapshotCommits"),
+    maxWorktrees: readNumber(input, "maxWorktrees", 1, 32),
+    maxRaceCandidates: readNumber(input, "maxRaceCandidates", 2, 16),
+    maxWaitSessions: readNumber(input, "maxWaitSessions", 1, 32),
+    maxConcurrentSessions: readNumber(input, "maxConcurrentSessions", 1, 16),
+    maxDiffBytes: readNumber(input, "maxDiffBytes", 1_000, 10_000_000),
+    maxTestOutputChars: readNumber(input, "maxTestOutputChars", 100, 1_000_000),
+    maxRaceWallClockMs: readNumber(input, "maxRaceWallClockMs", 1_000, 3_600_000),
+    raceRetentionMs: readNumber(input, "raceRetentionMs", 60_000, 30 * 24 * 60 * 60 * 1_000),
+    gitTimeoutMs: readNumber(input, "gitTimeoutMs", 1_000, 600_000),
     debug: readBoolean(input, "debug"),
   }
 }

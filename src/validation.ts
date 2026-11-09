@@ -105,6 +105,58 @@ function optionalBoolean(value: unknown, key: StringKey, lang: Lang, fallback: b
   return value
 }
 
+function requireBoolean(value: unknown, key: StringKey, lang: Lang): boolean {
+  if (typeof value !== "boolean") throw new ValidationError(t(lang, key))
+  return value
+}
+
+function stringArray(
+  value: unknown,
+  key: StringKey,
+  lang: Lang,
+  maxItems: number,
+  maxChars: number,
+  field: string,
+): string[] | undefined {
+  if (value === undefined || value === null) return undefined
+  if (!Array.isArray(value)) throw new ValidationError(t(lang, key))
+  if (value.length > maxItems) {
+    throw new ValidationError(t(lang, "tooManyItems", { max: maxItems }))
+  }
+  return value.map((item) => {
+    if (typeof item !== "string" || !item.trim()) throw new ValidationError(t(lang, key))
+    const text = item.trim()
+    if (codePointLength(text) > maxChars) {
+      throw new ValidationError(t(lang, "fieldTooLong", { field, min: 1, max: maxChars }))
+    }
+    return text
+  })
+}
+
+function stringRecord(
+  value: unknown,
+  key: StringKey,
+  lang: Lang,
+  maxItems: number,
+  maxChars: number,
+): Record<string, string> | undefined {
+  if (value === undefined || value === null) return undefined
+  if (!isRecord(value)) throw new ValidationError(t(lang, key))
+  const entries = Object.entries(value)
+  if (entries.length > maxItems) {
+    throw new ValidationError(t(lang, "tooManyItems", { max: maxItems }))
+  }
+  const result: Record<string, string> = {}
+  for (const [name, raw] of entries) {
+    if (typeof raw !== "string") throw new ValidationError(t(lang, key))
+    if (codePointLength(name) > 128 || codePointLength(raw) > maxChars) {
+      throw new ValidationError(t(lang, "fieldTooLong", { field: name, min: 0, max: maxChars }))
+    }
+    result[name] = raw
+  }
+  return result
+}
+
 function integerOption(
   value: unknown,
   key: StringKey,
@@ -249,6 +301,8 @@ export type OpenInput = {
   permissions?: PermissionRuleInput[]
   delivery: "steer" | "queue"
   messageID?: string
+  directory?: string
+  runID?: string
   maxOutputChars: number
 }
 
@@ -304,6 +358,20 @@ export function parseOpenInput(input: unknown, lang: Lang, options: BridgeOption
       "invalidMessageID",
       options.maxIdChars,
       "messageID",
+      lang,
+    ),
+    directory: optionalBoundedString(
+      data.directory,
+      "invalidDirectory",
+      options.maxPathChars,
+      "directory",
+      lang,
+    ),
+    runID: optionalBoundedString(
+      data.runID,
+      "invalidRunID",
+      options.maxIdChars,
+      "runID",
       lang,
     ),
     maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
@@ -684,6 +752,381 @@ export function parseRemoveInput(input: unknown, lang: Lang, options: BridgeOpti
   return {
     sessionID: requireBoundedId(data.sessionID, "invalidSessionID", "sessionID", options, lang),
     confirm: optionalBoolean(data.confirm, "invalidInput", lang, false),
+    maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
+  }
+}
+
+function optionalCommand(
+  value: unknown,
+  key: StringKey,
+  lang: Lang,
+  maxChars = 8_192,
+): string | undefined {
+  return optionalBoundedString(value, key, maxChars, "command", lang)
+}
+
+function validateEnum<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  fallback: T,
+  key: StringKey,
+  lang: Lang,
+): T {
+  if (value === undefined || value === null) return fallback
+  if (typeof value === "string" && (allowed as readonly string[]).includes(value)) {
+    return value as T
+  }
+  throw new ValidationError(t(lang, key))
+}
+
+export type WorktreesInput = {
+  action: "create" | "list" | "remove"
+  count: number
+  base?: string
+  namePrefix: string
+  branch?: string
+  runID?: string
+  directories?: string[]
+  force: boolean
+  confirm: boolean
+  archiveSessions: boolean
+  maxOutputChars: number
+}
+
+export function parseWorktreesInput(
+  input: unknown,
+  lang: Lang,
+  options: BridgeOptions,
+): WorktreesInput {
+  const data = record(input, lang)
+  return {
+    action: validateEnum(
+      data.action,
+      ["create", "list", "remove"] as const,
+      "list",
+      "invalidAction",
+      lang,
+    ),
+    count: integerOption(data.count, "invalidCount", lang, 1, options.maxWorktrees, 1, true, {
+      min: 1,
+      max: options.maxWorktrees,
+    }),
+    base: optionalBoundedString(
+      data.base,
+      "invalidBase",
+      options.maxIdChars,
+      "base",
+      lang,
+    ),
+    namePrefix:
+      optionalBoundedString(
+        data.namePrefix,
+        "invalidNamePrefix",
+        64,
+        "namePrefix",
+        lang,
+      ) ?? "sb",
+    branch: optionalBoundedString(
+      data.branch,
+      "invalidBranch",
+      options.maxIdChars,
+      "branch",
+      lang,
+    ),
+    runID: optionalBoundedString(
+      data.runID,
+      "invalidRunID",
+      options.maxIdChars,
+      "runID",
+      lang,
+    ),
+    directories: stringArray(
+      data.directories,
+      "invalidDirectories",
+      lang,
+      Math.max(options.maxWorktrees, 32),
+      options.maxPathChars,
+      "directories",
+    ),
+    force: optionalBoolean(data.force, "invalidInput", lang, false),
+    confirm: optionalBoolean(data.confirm, "invalidInput", lang, false),
+    archiveSessions: optionalBoolean(data.archiveSessions, "invalidInput", lang, true),
+    maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
+  }
+}
+
+export type WaitManyInput = {
+  sessionIDs: string[]
+  messageIDs?: Record<string, string>
+  timeoutMs: number
+  perSessionTimeoutMs?: number
+  mode: "any" | "all"
+  returnOnPermission: boolean
+  maxOutputChars: number
+}
+
+export function parseWaitManyInput(
+  input: unknown,
+  lang: Lang,
+  options: BridgeOptions,
+): WaitManyInput {
+  const data = record(input, lang)
+  const sessionIDs = stringArray(
+    data.sessionIDs,
+    "invalidSessionIDs",
+    lang,
+    options.maxWaitSessions,
+    options.maxIdChars,
+    "sessionIDs",
+  )
+  if (!sessionIDs?.length) throw new ValidationError(t(lang, "invalidSessionIDs"))
+  const rawMessageIDs = stringRecord(data.messageIDs, "invalidMessageIDs", lang, 32, options.maxIdChars)
+  return {
+    sessionIDs,
+    messageIDs: rawMessageIDs,
+    timeoutMs: integerOption(
+      data.timeoutMs,
+      "invalidTimeout",
+      lang,
+      1,
+      3_600_000,
+      options.defaultTimeoutMs,
+      false,
+    ),
+    perSessionTimeoutMs:
+      data.perSessionTimeoutMs === undefined || data.perSessionTimeoutMs === null
+        ? undefined
+        : integerOption(
+            data.perSessionTimeoutMs,
+            "invalidTimeout",
+            lang,
+            1,
+            600_000,
+            options.defaultTimeoutMs,
+            false,
+          ),
+    mode: validateEnum(data.mode, ["any", "all"] as const, "any", "invalidWaitMode", lang),
+    returnOnPermission: optionalBoolean(data.returnOnPermission, "invalidInput", lang, true),
+    maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
+  }
+}
+
+export type RaceInput = {
+  prompt: string
+  count: number
+  mode: "worktrees" | "same-directory"
+  base?: string
+  models?: string[]
+  agents?: string[]
+  permissions?: PermissionRuleInput[]
+  testCommand?: string
+  setupCommand?: string
+  teardownCommand?: string
+  env?: Record<string, string>
+  cwd?: string
+  timeoutMs: number
+  testTimeoutMs: number
+  keepWorktrees: boolean
+  snapshot: "auto" | "commit" | "patch"
+  maxDiffBytes: number
+  maxTestOutputChars: number
+  runID?: string
+  maxOutputChars: number
+}
+
+export function parseRaceInput(input: unknown, lang: Lang, options: BridgeOptions): RaceInput {
+  const data = record(input, lang)
+  return {
+    prompt: requirePrompt(data.prompt, lang, options.maxPromptChars),
+    count: integerOption(
+      data.count,
+      "invalidCount",
+      lang,
+      2,
+      options.maxRaceCandidates,
+      3,
+      true,
+      { min: 2, max: options.maxRaceCandidates },
+    ),
+    mode: validateEnum(
+      data.mode,
+      ["worktrees", "same-directory"] as const,
+      "worktrees",
+      "invalidRaceMode",
+      lang,
+    ),
+    base: optionalBoundedString(data.base, "invalidBase", options.maxIdChars, "base", lang),
+    models: stringArray(
+      data.models,
+      "invalidModel",
+      lang,
+      options.maxRaceCandidates,
+      options.maxModelChars,
+      "models",
+    )?.map((value) => {
+      if (!parseModel(value)) throw new ValidationError(t(lang, "invalidModel"))
+      return value
+    }),
+    agents: stringArray(
+      data.agents,
+      "invalidAgent",
+      lang,
+      options.maxRaceCandidates,
+      options.maxAgentChars,
+      "agents",
+    ),
+    permissions: validatePermissionRules(
+      data.permissions,
+      lang,
+      options.allowPermissionRules,
+      options.maxPermissionRules,
+      options.maxPermissionFieldChars,
+    ),
+    testCommand: optionalCommand(data.testCommand, "invalidCommand", lang),
+    setupCommand: optionalCommand(data.setupCommand, "invalidCommand", lang),
+    teardownCommand: optionalCommand(data.teardownCommand, "invalidCommand", lang),
+    env: stringRecord(data.env, "invalidEnv", lang, 32, 4_096),
+    cwd: optionalBoundedString(data.cwd, "invalidDirectory", options.maxPathChars, "cwd", lang),
+    timeoutMs: integerOption(
+      data.timeoutMs,
+      "invalidTimeout",
+      lang,
+      1_000,
+      3_600_000,
+      options.maxRaceWallClockMs,
+      false,
+    ),
+    testTimeoutMs: integerOption(
+      data.testTimeoutMs,
+      "invalidTimeout",
+      lang,
+      1_000,
+      600_000,
+      options.gitTimeoutMs,
+      false,
+    ),
+    keepWorktrees: optionalBoolean(data.keepWorktrees, "invalidInput", lang, true),
+    snapshot: validateEnum(
+      data.snapshot,
+      ["auto", "commit", "patch"] as const,
+      "auto",
+      "invalidSnapshot",
+      lang,
+    ),
+    maxDiffBytes: integerOption(
+      data.maxDiffBytes,
+      "invalidMaxDiff",
+      lang,
+      1_000,
+      options.maxDiffBytes,
+      options.maxDiffBytes,
+      true,
+      { min: 1_000, max: options.maxDiffBytes },
+    ),
+    maxTestOutputChars: integerOption(
+      data.maxTestOutputChars,
+      "invalidMaxOutput",
+      lang,
+      100,
+      options.maxTestOutputChars,
+      options.maxTestOutputChars,
+      true,
+      { min: 100, max: options.maxTestOutputChars },
+    ),
+    runID: optionalBoundedString(data.runID, "invalidRunID", options.maxIdChars, "runID", lang),
+    maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
+  }
+}
+
+export type ApplyInput = {
+  raceID: string
+  candidateID: string
+  targetDirectory?: string
+  strategy: "apply" | "cherry-pick"
+  verifyCommand?: string
+  dryRun: boolean
+  commit: boolean
+  commitMessage?: string
+  confirm: boolean
+  push: boolean
+  maxOutputChars: number
+}
+
+export function parseApplyInput(input: unknown, lang: Lang, options: BridgeOptions): ApplyInput {
+  const data = record(input, lang)
+  return {
+    raceID: requireBoundedId(data.raceID, "invalidRaceID", "raceID", options, lang),
+    candidateID: requireBoundedId(
+      data.candidateID,
+      "invalidCandidateID",
+      "candidateID",
+      options,
+      lang,
+    ),
+    targetDirectory: optionalBoundedString(
+      data.targetDirectory,
+      "invalidDirectory",
+      options.maxPathChars,
+      "targetDirectory",
+      lang,
+    ),
+    strategy: validateEnum(
+      data.strategy,
+      ["apply", "cherry-pick"] as const,
+      "apply",
+      "invalidStrategy",
+      lang,
+    ),
+    verifyCommand: optionalCommand(data.verifyCommand, "invalidCommand", lang),
+    // Applying changes to the user's tree is opt-in and dry-run by default.
+    dryRun: optionalBoolean(data.dryRun, "invalidInput", lang, true),
+    commit: optionalBoolean(data.commit, "invalidInput", lang, false),
+    commitMessage: optionalLimitedString(
+      data.commitMessage,
+      "invalidMessage",
+      "messageTooLong",
+      options.maxTitleChars,
+      lang,
+    ),
+    confirm: requireBoolean(data.confirm, "invalidConfirm", lang),
+    push: optionalBoolean(data.push, "invalidInput", lang, false),
+    maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
+  }
+}
+
+export type RaceStatusInput = { raceID?: string; maxOutputChars: number }
+
+export function parseRaceStatusInput(
+  input: unknown,
+  lang: Lang,
+  options: BridgeOptions,
+): RaceStatusInput {
+  const data = record(input, lang)
+  return {
+    raceID: optionalBoundedString(data.raceID, "invalidRaceID", options.maxIdChars, "raceID", lang),
+    maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
+  }
+}
+
+export type RaceCleanupInput = {
+  raceID: string
+  confirm: boolean
+  force: boolean
+  archiveSessions: boolean
+  maxOutputChars: number
+}
+
+export function parseRaceCleanupInput(
+  input: unknown,
+  lang: Lang,
+  options: BridgeOptions,
+): RaceCleanupInput {
+  const data = record(input, lang)
+  return {
+    raceID: requireBoundedId(data.raceID, "invalidRaceID", "raceID", options, lang),
+    confirm: requireBoolean(data.confirm, "invalidConfirm", lang),
+    force: optionalBoolean(data.force, "invalidInput", lang, false),
+    archiveSessions: optionalBoolean(data.archiveSessions, "invalidInput", lang, true),
     maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
   }
 }

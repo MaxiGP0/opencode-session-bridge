@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import plugin from "../index.ts"
+import { runGit } from "../src/git.ts"
+import type { DirectoryValidator } from "../src/orchestration.ts"
+import type { GitRunner } from "../src/git.ts"
 import type {
   Lang,
   MessageLike,
@@ -95,6 +101,26 @@ type HarnessOptions = {
   promptGate?: Promise<void>
   createConflictOnce?: boolean
   enableLive?: boolean
+  worktreeMissing?: boolean
+  worktreeRoot?: string
+  worktreeStrategy?: string
+  worktreeDirty?: boolean
+  locationMismatch?: boolean
+  initialRaces?: unknown[]
+  initialWorktrees?: unknown[]
+  initialWorkers?: unknown[]
+  git?: GitRunner
+  validateDirectory?: DirectoryValidator
+  vcsFiles?: unknown[]
+  repoDirectory?: string
+  realWorktrees?: boolean
+  onPrompt?: (input: {
+    sessionID: string
+    text: string
+    id?: string
+    index: number
+    directory: string
+  }) => void | Promise<void>
 }
 
 function fakeSession(id: string, overrides: Partial<FakeSession> = {}): FakeSession {
@@ -109,10 +135,18 @@ function fakeSession(id: string, overrides: Partial<FakeSession> = {}): FakeSess
 
 function makeHarness(options: HarnessOptions = {}) {
   const tools = new Map<string, FakeTool>()
+  const repoDirectory = options.repoDirectory ?? "C:/repo"
+  const worktreeRoot = options.worktreeRoot ?? path.join(repoDirectory, ".worktrees")
+  const worktreeEntries = new Map<string, { directory: string; strategy?: string }>()
+  const worktreeCreateCalls: Array<Record<string, unknown>> = []
+  const worktreeRemoveCalls: Array<Record<string, unknown>> = []
   const sessions = new Map<string, FakeSession>()
   const messages = new Map<string, MessageLike[]>()
   const permissions = new Map<string, PermissionLike[]>()
   const storage = new Map<string, unknown>()
+  if (options.initialRaces) storage.set("session-bridge:races", options.initialRaces)
+  if (options.initialWorktrees) storage.set("session-bridge:worktrees", options.initialWorktrees)
+  if (options.initialWorkers) storage.set("session-bridge:workers", options.initialWorkers)
   const promptCalls: Array<{ sessionID: string; text: string; id?: string; delivery?: string }> = []
   const admissions = new Map<string, FakeAdmission>()
   const updateCalls: Array<Record<string, unknown>> = []
@@ -167,7 +201,12 @@ function makeHarness(options: HarnessOptions = {}) {
     fakeSession("ses_1"),
     fakeSession("ses_caller", { model: { providerID: "p", id: "m" } }),
   ]
-  for (const session of initialSessions) sessions.set(session.id, session)
+  for (const session of initialSessions) {
+    if (!session.location || session.location.directory === "C:/repo") {
+      session.location = { directory: repoDirectory }
+    }
+    sessions.set(session.id, session)
+  }
   for (const [sessionID, list] of Object.entries(options.messages ?? {})) {
     messages.set(sessionID, list)
   }
@@ -180,7 +219,14 @@ function makeHarness(options: HarnessOptions = {}) {
   let permissionCalls = 0
   const ctx = {
     options: options.options ?? {},
-    location: { directory: "C:/repo" },
+    location: {
+      directory: repoDirectory,
+      project: {
+        id: "proj_1",
+        directory: repoDirectory,
+        canonical: repoDirectory,
+      },
+    },
     event: options.enableLive
       ? {
           subscribe: (subscribeOptions?: { signal?: AbortSignal }) =>
@@ -203,6 +249,71 @@ function makeHarness(options: HarnessOptions = {}) {
         return options.modelDefault ?? { providerID: "p", id: "m" }
       },
     },
+    vcs: {
+      status: async (input: { location?: { directory?: string } }) => {
+        const directory = input?.location?.directory ?? repoDirectory
+        if (options.realWorktrees && directory) {
+          const result = await runGit(["status", "--porcelain=v1"], directory)
+          const data = result.stdout
+            .split(/\r?\n/)
+            .filter(Boolean)
+            .map((line) => ({
+              file: line.slice(3).trim(),
+              additions: 0,
+              deletions: 0,
+              status: "modified" as const,
+            }))
+          return { location: { directory }, data }
+        }
+        return {
+          location: { directory },
+          data: options.worktreeDirty
+            ? [{ file: "dirty.txt", additions: 1, deletions: 0, status: "modified" }]
+            : [],
+        }
+      },
+      diff: async (input: { location?: { directory?: string } }) => ({
+        location: { directory: input?.location?.directory ?? repoDirectory },
+        data: options.vcsFiles ?? [],
+      }),
+    },
+    worktree: options.worktreeMissing
+      ? undefined
+      : {
+          create: async (input: {
+            projectID: string
+            name?: string
+            directory?: string
+            branch?: string
+          }) => {
+            worktreeCreateCalls.push(input as Record<string, unknown>)
+            const directory =
+              input.directory ?? path.join(worktreeRoot, input.name ?? `wt_${worktreeEntries.size + 1}`)
+            if (options.realWorktrees) {
+              await mkdir(worktreeRoot, { recursive: true })
+              const added = await runGit(
+                ["worktree", "add", "-b", input.name ?? `wt_${worktreeEntries.size + 1}`, directory, input.branch ?? "HEAD"],
+                repoDirectory,
+              )
+              if (added.exitCode !== 0) throw new Error(added.stderr || "git worktree add failed")
+            } else {
+              await mkdir(directory, { recursive: true }).catch(() => undefined)
+            }
+            worktreeEntries.set(directory, {
+              directory,
+              strategy: options.worktreeStrategy ?? "worktree",
+            })
+            return { directory }
+          },
+          list: async () => [...worktreeEntries.values()],
+          remove: async (input: { directory: string; force?: boolean }) => {
+            worktreeRemoveCalls.push(input as Record<string, unknown>)
+            if (options.realWorktrees) {
+              await runGit(["worktree", "remove", "--force", input.directory], repoDirectory)
+            }
+            worktreeEntries.delete(input.directory)
+          },
+        },
     session: {
       hook: options.enableLive
         ? async (name: string, callback: (input: unknown) => void | Promise<void>) => {
@@ -216,15 +327,25 @@ function makeHarness(options: HarnessOptions = {}) {
         if (!session) throw new Error(`session not found: ${input.sessionID}`)
         return session
       },
-      create: async (input: { id?: string; title?: string; agent?: string; model?: unknown }) => {
+      create: async (input: {
+        id?: string
+        title?: string
+        agent?: string
+        model?: unknown
+        location?: { directory?: string }
+      }) => {
         createCalls++
         createInputs.push(input as Record<string, unknown>)
         if (options.createGate) await options.createGate
+        const location = options.locationMismatch
+          ? { directory: "C:/elsewhere" }
+          : { directory: input.location?.directory ?? repoDirectory }
         if (options.createConflictOnce && input.id && !sessions.has(input.id)) {
           const created = fakeSession(input.id, {
             title: input.title,
             agent: input.agent,
             model: input.model as FakeSession["model"],
+            location,
             time: { created: now++, updated: now },
           })
           sessions.set(input.id, created)
@@ -238,6 +359,7 @@ function makeHarness(options: HarnessOptions = {}) {
           title: input.title,
           agent: input.agent,
           model: input.model as FakeSession["model"],
+          location,
           time: { created: now++, updated: now },
         })
         sessions.set(id, created)
@@ -271,6 +393,16 @@ function makeHarness(options: HarnessOptions = {}) {
             delivery: input.delivery ?? "steer",
           }
           admissions.set(id, admission)
+          const session = sessions.get(input.sessionID)
+          if (options.onPrompt && session) {
+            await options.onPrompt({
+              sessionID: input.sessionID,
+              text: input.text,
+              id,
+              index: promptCalls.length - 1,
+              directory: session.location?.directory ?? repoDirectory,
+            })
+          }
           const list = messages.get(input.sessionID) ?? []
           list.push({ id, type: "user", text: input.text, time: { created: admission.time.created } })
           if (options.autoComplete !== false) {
@@ -422,6 +554,9 @@ function makeHarness(options: HarnessOptions = {}) {
     assertCalls,
     interruptCalls,
     compactCalls,
+    worktreeCreateCalls,
+    worktreeRemoveCalls,
+    worktreeEntries,
     hooks,
     emit,
     async callHook(name: string, input: unknown) {
@@ -527,6 +662,32 @@ function permissionAt(index: number): PermissionLike {
     sessionID: "ses_1",
     action: "shell",
     resources: [`echo ${index}`],
+  }
+}
+
+async function makeTempRepo(): Promise<{
+  directory: string
+  base: string
+  cleanup: () => Promise<void>
+}> {
+  const directory = await mkdtemp(path.join(tmpdir(), "session-bridge-repo-"))
+  const init = await runGit(["init", "-b", "main"], directory)
+  if (init.exitCode !== 0) {
+    await runGit(["init"], directory)
+    await runGit(["checkout", "-b", "main"], directory)
+  }
+  await runGit(["config", "user.name", "test"], directory)
+  await runGit(["config", "user.email", "test@localhost"], directory)
+  await writeFile(path.join(directory, "base.txt"), "base\n", "utf8")
+  await runGit(["add", "."], directory)
+  await runGit(["commit", "-m", "base"], directory)
+  const head = await runGit(["rev-parse", "HEAD"], directory)
+  return {
+    directory,
+    base: head.stdout.trim(),
+    cleanup: async () => {
+      await rm(directory, { recursive: true, force: true }).catch(() => undefined)
+    },
   }
 }
 
@@ -1037,7 +1198,7 @@ describe("sessions tools", () => {
   it("P1-1: open with an explicit model skips caller and default model lookups", async () => {
     const harness = makeHarness()
     await harness.execute("open", { prompt: "hi", model: "anthropic/claude#fast" })
-    expect(harness.state.sessionGetCalls).toBe(0)
+    expect(harness.state.sessionGetCalls).toBe(1)
     expect(harness.state.modelDefaultCalls).toBe(0)
     expect(harness.state.createInputs[0]?.model).toEqual({
       providerID: "anthropic",
@@ -2296,5 +2457,762 @@ describe("sessions tools", () => {
     // Code Mode requires a pure JSON value: no nested `undefined`.
     expect(JSON.parse(JSON.stringify(result.output))).toEqual(result.output)
     expect(JSON.stringify(result.output).length).toBeLessThanOrEqual(20_000)
+  })
+})
+
+const idleMessages = (prefix: string): MessageLike[] => [
+  { id: `${prefix}_user`, type: "user", text: "do it", time: { created: 1 } },
+  { id: `${prefix}_answer`, type: "assistant", content: [{ type: "text", text: "done" }], time: { created: 2 } },
+  { id: `${prefix}_idle`, type: "idle", outcome: "succeeded", time: { created: 3 } },
+]
+
+describe("orchestration tools", () => {
+  it("O-1: open({directory}) passes location and registers a worker", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const worktree = path.join(repo.directory, "wt-a")
+      await mkdir(worktree, { recursive: true })
+      const harness = makeHarness({ repoDirectory: repo.directory })
+      const result = await harness.executeRaw("open", {
+        prompt: "hi",
+        directory: worktree,
+      })
+      expect(harness.state.createInputs[0]?.location).toEqual({ directory: worktree })
+      const permissions = harness.state.createInputs[0]?.permissions as
+        | Array<{ action: string; effect: string }>
+        | undefined
+      expect(
+        permissions?.some(
+          (rule) => rule.action === "session_bridge.open" && rule.effect === "deny",
+        ),
+      ).toBe(true)
+      expect(result.output).toMatchObject({
+        directory: worktree,
+        role: "worker",
+        locationVerified: true,
+      })
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("O-1: aborts and cleans up when the host creates the session elsewhere", async () => {
+    const harness = makeHarness({ locationMismatch: true })
+    const result = await harness.executeRaw("open", { prompt: "hi" })
+    expect(result.output).toMatchObject({ state: "error" })
+    expect(harness.state.promptCalls).toHaveLength(0)
+    expect(harness.state.removeCalls).toContain("ses_new")
+  })
+
+  it("O-1: reusing a messageID in another directory is a conflict", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const first = path.join(repo.directory, "wt-a")
+      const second = path.join(repo.directory, "wt-b")
+      await mkdir(first, { recursive: true })
+      await mkdir(second, { recursive: true })
+      const harness = makeHarness({ repoDirectory: repo.directory })
+      await harness.execute("open", {
+        prompt: "hi",
+        messageID: "msg_same",
+        directory: first,
+      })
+      const result = await harness.executeRaw("open", {
+        prompt: "hi",
+        messageID: "msg_same",
+        directory: second,
+      })
+      expect(result.output).toMatchObject({ state: "error" })
+      expect(harness.state.createCalls).toBe(1)
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("O-1: applies permissions to a reused session instead of ignoring them", async () => {
+    const harness = makeHarness()
+    const result = await harness.executeRaw("open", {
+      sessionID: "ses_1",
+      prompt: "hi",
+      permissions: [{ action: "shell", resource: "echo *", effect: "deny" }],
+    })
+    expect(result.output).toMatchObject({ reused: true, permissionsApplied: true })
+    expect(harness.state.updateCalls.at(-1)?.permissions).toEqual([
+      { action: "shell", resource: "echo *", effect: "deny" },
+    ])
+  })
+
+  it("O-1: rejects a reused session whose location differs from the target", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const worktree = path.join(repo.directory, "wt-a")
+      await mkdir(worktree, { recursive: true })
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        sessions: [fakeSession("ses_1", { location: { directory: repo.directory } })],
+      })
+      const result = await harness.executeRaw("open", {
+        sessionID: "ses_1",
+        prompt: "hi",
+        directory: worktree,
+      })
+      expect(result.output).toMatchObject({ state: "error" })
+      expect(harness.state.promptCalls).toHaveLength(0)
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("O-0: the owner in main manages a worker in another directory", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const worktree = path.join(repo.directory, "wt-a")
+      await mkdir(worktree, { recursive: true })
+      const harness = makeHarness({ repoDirectory: repo.directory })
+      const opened = await harness.executeRaw("open", {
+        prompt: "hi",
+        directory: worktree,
+      })
+      const sessionID = String((opened.output as Record<string, unknown>).sessionID)
+      const reply = await harness.executeRaw("reply", {
+        sessionID,
+        requestID: "per_1",
+        decision: "once",
+      })
+      expect(reply.output).toMatchObject({ state: "ok" })
+      const status = await harness.executeRaw("status", { sessionID })
+      expect(status.output).toMatchObject({ sessionID, state: "idle" })
+      const read = await harness.executeRaw("read", { sessionID })
+      expect(read.output).toMatchObject({ sessionID, state: "ok" })
+      const wait = await harness.executeRaw("wait", { sessionID, timeoutMs: 100 })
+      expect(wait.output).toMatchObject({ sessionID, state: "idle" })
+      const listed = await harness.executeRaw("list", { directory: worktree })
+      expect(listed.output).toMatchObject({ directory: worktree, state: "ok" })
+      await harness.executeRaw("interrupt", { sessionID })
+      await harness.executeRaw("update", { sessionID, title: "renamed" })
+      expect(harness.state.interruptCalls).toHaveLength(1)
+      expect(harness.state.updateCalls.some((call) => call.sessionID === sessionID)).toBe(true)
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("O-0: a foreign caller cannot manage the worker", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const worktree = path.join(repo.directory, "wt-a")
+      await mkdir(worktree, { recursive: true })
+      const harness = makeHarness({ repoDirectory: repo.directory })
+      const opened = await harness.executeRaw("open", {
+        prompt: "hi",
+        directory: worktree,
+      })
+      const sessionID = String((opened.output as Record<string, unknown>).sessionID)
+      const denied = await harness.executeRaw(
+        "interrupt",
+        { sessionID },
+        { sessionID: "ses_other" },
+      )
+      expect(denied.output).toMatchObject({ state: "error" })
+      expect(harness.state.interruptCalls).toHaveLength(0)
+
+      const adoption = await harness.executeRaw(
+        "open",
+        { sessionID, prompt: "adopt" },
+        { sessionID: "ses_other" },
+      )
+      expect(adoption.output).toMatchObject({ state: "error" })
+      expect(
+        harness.state.promptCalls.filter((call) => call.text === "adopt"),
+      ).toHaveLength(0)
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("O-0: worker sessions cannot use orchestration tools", async () => {
+    const worker = {
+      sessionID: "ses_worker",
+      at: Date.now(),
+      targetDirectory: "C:/worktree-a",
+      role: "worker",
+    }
+    const deniedHarness = makeHarness({ initialWorkers: [worker] })
+    const denied = await deniedHarness.executeRaw("list", {}, { sessionID: "ses_worker" })
+    expect(denied.output).toMatchObject({ state: "error", worker: true })
+
+    const allowedHarness = makeHarness({
+      initialWorkers: [worker],
+      options: { allowWorkerOrchestration: true },
+    })
+    const allowed = await allowedHarness.executeRaw("list", {}, { sessionID: "ses_worker" })
+    expect(allowed.output).toMatchObject({ state: "ok" })
+  })
+
+  it("O-3: waitAll returns partial results, including permission", async () => {
+    const harness = makeHarness({
+      sessions: [fakeSession("ses_a"), fakeSession("ses_b"), fakeSession("ses_c")],
+      messages: {
+        ses_a: idleMessages("a"),
+        ses_b: idleMessages("b"),
+        ses_c: idleMessages("c"),
+      },
+      permissions: { ses_b: [permissionAt(2)] },
+    })
+    const started = Date.now()
+    const result = await harness.executeRaw("waitAny", {
+      sessionIDs: ["ses_a", "ses_b", "ses_c"],
+      mode: "all",
+      timeoutMs: 5_000,
+    })
+    const output = result.output as Record<string, unknown>
+    expect(output.state).toBe("permission")
+    expect((output.sessions as unknown[]).length).toBe(3)
+    expect(Date.now() - started).toBeLessThan(1_500)
+  })
+
+  it("O-3: waitAll keeps the sessions that finished when another times out", async () => {
+    const harness = makeHarness({
+      sessions: [fakeSession("ses_a"), fakeSession("ses_slow")],
+      messages: {
+        ses_a: idleMessages("a"),
+        ses_slow: [{ id: "slow_user", type: "user", text: "slow", time: { created: 1 } }],
+      },
+      autoComplete: false,
+      options: {
+        pollIntervalMs: 20,
+        maxPollIntervalMs: 100,
+        permissionPollMs: 1_000,
+      },
+    })
+    const result = await harness.executeRaw("waitAll", {
+      sessionIDs: ["ses_a", "ses_slow"],
+      timeoutMs: 150,
+    })
+    const output = result.output as Record<string, unknown>
+    expect(output.state).toBe("timeout")
+    const sessions = output.sessions as Array<Record<string, unknown>>
+    expect(sessions).toHaveLength(2)
+    expect(sessions.some((entry) => entry.state === "idle")).toBe(true)
+    expect(sessions.some((entry) => entry.state === "timeout")).toBe(true)
+  })
+
+  it("O-3: detects background work after the model idle", async () => {
+    const harness = makeHarness({
+      sessions: [fakeSession("ses_a")],
+      messages: { ses_a: idleMessages("a") },
+      enableLive: true,
+      options: { pollIntervalMs: 20, maxPollIntervalMs: 100 },
+    })
+    await harness.ready
+    await harness.callHook("experimental.idle", {
+      sessionID: "ses_a",
+      background: [
+        {
+          kind: "shell",
+          sessionID: "ses_a",
+          shellID: "sh_1",
+          command: "npm test",
+        },
+      ],
+    })
+    const result = await harness.executeRaw("waitAny", {
+      sessionIDs: ["ses_a"],
+      mode: "all",
+      timeoutMs: 1_000,
+    })
+    const output = result.output as Record<string, unknown>
+    expect(output.state).toBe("running")
+    const sessions = output.sessions as Array<Record<string, unknown>>
+    expect(sessions[0]?.state).toBe("running")
+    expect((sessions[0]?.background as unknown[]).length).toBe(1)
+  })
+
+  it("O-2/O-4/O-5: worktree race, snapshot, ranking, and cleanup", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        realWorktrees: true,
+        options: {
+          allowSnapshotCommits: true,
+          allowTestCommands: true,
+          allowWorktreeManagement: true,
+          allowApplyCandidates: true,
+          maxRaceCandidates: 4,
+          maxConcurrentSessions: 3,
+          gitTimeoutMs: 30_000,
+        },
+        onPrompt: async ({ directory, index }) => {
+          await writeFile(
+            path.join(directory, `feature-${index}.txt`),
+            `feature ${index}\n`,
+            "utf8",
+          )
+          if (index === 1) {
+            await writeFile(path.join(directory, "fail.marker"), "1\n", "utf8")
+          }
+        },
+      })
+
+      const result = await harness.executeRaw("bestOf", {
+        prompt: "implement it",
+        count: 3,
+        mode: "worktrees",
+        base: repo.base,
+        testCommand:
+          'node -e "process.exit(require(\'fs\').existsSync(\'fail.marker\')?1:0)"',
+        keepWorktrees: true,
+        timeoutMs: 30_000,
+      })
+      const output = result.output as Record<string, unknown>
+      const candidates = output.candidates as Array<Record<string, unknown>>
+      expect(candidates).toHaveLength(3)
+      for (const candidate of candidates) {
+        expect(candidate.commit).toEqual(expect.any(String))
+        expect((candidate.diffStats as Record<string, number>).additions).toBeGreaterThan(0)
+      }
+      const failed = candidates.filter(
+        (candidate) => (candidate.tests as Record<string, unknown>).passed === false,
+      )
+      expect(failed).toHaveLength(1)
+      expect(failed[0]?.verification).toBe("flagged")
+      expect(output.recommended).toEqual(expect.any(String))
+      expect(output.recommended).not.toBe(failed[0]?.candidateID)
+      expect(harness.state.worktreeCreateCalls).toHaveLength(3)
+
+      const cleanup = await harness.executeRaw("raceCleanup", {
+        raceID: String(output.raceID),
+        confirm: true,
+        force: true,
+      })
+      expect((cleanup.output as Record<string, unknown>).removed).toHaveLength(3)
+      expect(harness.state.worktreeRemoveCalls.length).toBeGreaterThanOrEqual(3)
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("O-5: applyCandidate dry-run, verification, idempotency, and push rejection", async () => {
+    const repo = await makeTempRepo()
+    try {
+      await writeFile(path.join(repo.directory, "feature.txt"), "feature\n", "utf8")
+      await runGit(["add", "."], repo.directory)
+      await runGit(["commit", "-m", "feature"], repo.directory)
+      const commit = (await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()
+      const patch = (await runGit(["diff", "--binary", repo.base, commit], repo.directory)).stdout
+      await runGit(["reset", "--hard", repo.base], repo.directory)
+
+      const race = {
+        raceID: "race_apply",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        targetDirectory: repo.directory,
+        mode: "worktrees",
+        prompt: "implement it",
+        base: repo.base,
+        keepWorktrees: false,
+        status: "completed",
+        worktrees: [],
+        candidates: [
+          {
+            candidateID: "candidate-1",
+            index: 0,
+            messageID: "msg_1",
+            directory: repo.directory,
+            strategy: "worktree",
+            base: repo.base,
+            branch: "main",
+            commit,
+            patch,
+            patchBytes: patch.length,
+            diffComplete: true,
+            snapshotSource: "git-commit",
+            files: [
+              {
+                file: "feature.txt",
+                status: "added",
+                additions: 1,
+                deletions: 0,
+                patch,
+              },
+            ],
+            diffStats: { files: 1, additions: 1, deletions: 0 },
+            testFilesChanged: false,
+            ciFilesChanged: false,
+            skippedTests: false,
+            verification: "trusted",
+            tests: { skipped: false, passed: true },
+            state: "idle",
+            elapsedMs: 10,
+            applyStrategy: "cherry-pick",
+          },
+        ],
+      }
+
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        worktreeMissing: true,
+        initialRaces: [race],
+        options: {
+          allowApplyCandidates: true,
+          allowWorktreeManagement: true,
+          allowPushCandidates: true,
+          gitTimeoutMs: 30_000,
+        },
+      })
+
+      const before = (await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()
+      const dry = await harness.executeRaw("applyCandidate", {
+        raceID: race.raceID,
+        candidateID: "candidate-1",
+        strategy: "cherry-pick",
+        verifyCommand: 'node -e "process.exit(0)"',
+        dryRun: true,
+        confirm: true,
+      })
+      expect(dry.output).toMatchObject({ applied: false, dryRun: true, state: "ok" })
+      expect((await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()).toBe(before)
+
+      const applied = await harness.executeRaw("applyCandidate", {
+        raceID: race.raceID,
+        candidateID: "candidate-1",
+        strategy: "cherry-pick",
+        verifyCommand: 'node -e "process.exit(0)"',
+        dryRun: false,
+        commit: true,
+        commitMessage: "apply candidate",
+        confirm: true,
+        push: true,
+      })
+      expect(applied.output).toMatchObject({
+        applied: true,
+        dryRun: false,
+        pushed: false,
+      })
+      expect(String((applied.output as Record<string, unknown>).pushError).length).toBeGreaterThan(0)
+      expect((await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()).not.toBe(before)
+
+      const second = await harness.executeRaw("applyCandidate", {
+        raceID: race.raceID,
+        candidateID: "candidate-1",
+        strategy: "cherry-pick",
+        dryRun: false,
+        confirm: true,
+      })
+      expect(second.output).toMatchObject({ alreadyApplied: true, applied: false })
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("O-5: dirty target and failed verification leave the target intact", async () => {
+    const repo = await makeTempRepo()
+    try {
+      await writeFile(path.join(repo.directory, "feature.txt"), "feature\n", "utf8")
+      await runGit(["add", "."], repo.directory)
+      await runGit(["commit", "-m", "feature"], repo.directory)
+      const commit = (await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()
+      await runGit(["reset", "--hard", repo.base], repo.directory)
+      const baseRace = {
+        raceID: "race_verify",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        targetDirectory: repo.directory,
+        mode: "worktrees",
+        prompt: "implement it",
+        base: repo.base,
+        keepWorktrees: false,
+        status: "completed",
+        worktrees: [],
+        candidates: [
+          {
+            candidateID: "candidate-1",
+            index: 0,
+            messageID: "msg_1",
+            directory: repo.directory,
+            strategy: "worktree",
+            base: repo.base,
+            commit,
+            patchBytes: 0,
+            diffComplete: false,
+            snapshotSource: "git-commit",
+            files: [],
+            diffStats: { files: 0, additions: 0, deletions: 0 },
+            testFilesChanged: false,
+            ciFilesChanged: false,
+            skippedTests: false,
+            verification: "flagged",
+            state: "idle",
+            elapsedMs: 10,
+            applyStrategy: "cherry-pick",
+          },
+        ],
+      }
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        worktreeMissing: true,
+        initialRaces: [baseRace],
+        options: {
+          allowApplyCandidates: true,
+          allowWorktreeManagement: true,
+          gitTimeoutMs: 30_000,
+        },
+      })
+      const before = (await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()
+
+      await writeFile(path.join(repo.directory, "dirty.txt"), "dirty\n", "utf8")
+      const dirty = await harness.executeRaw("applyCandidate", {
+        raceID: baseRace.raceID,
+        candidateID: "candidate-1",
+        strategy: "cherry-pick",
+        dryRun: false,
+        confirm: true,
+      })
+      expect(dirty.output).toMatchObject({ state: "error" })
+      expect((await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()).toBe(before)
+      await rm(path.join(repo.directory, "dirty.txt"), { force: true })
+
+      const failed = await harness.executeRaw("applyCandidate", {
+        raceID: baseRace.raceID,
+        candidateID: "candidate-1",
+        strategy: "cherry-pick",
+        verifyCommand: 'node -e "process.exit(1)"',
+        dryRun: false,
+        confirm: true,
+      })
+      expect(failed.output).toMatchObject({ state: "error", applied: false })
+      expect((await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()).toBe(before)
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("O-5: applies a candidate without a commit from a clone strategy using a patch", async () => {
+    const repo = await makeTempRepo()
+    try {
+      await writeFile(path.join(repo.directory, "feature.txt"), "feature\n", "utf8")
+      await runGit(["add", "."], repo.directory)
+      await runGit(["commit", "-m", "feature"], repo.directory)
+      const commit = (await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()
+      const patch = (await runGit(["diff", "--binary", repo.base, commit], repo.directory)).stdout
+      await runGit(["reset", "--hard", repo.base], repo.directory)
+
+      const race = {
+        raceID: "race_patch",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        targetDirectory: repo.directory,
+        mode: "worktrees",
+        prompt: "implement it",
+        base: repo.base,
+        keepWorktrees: false,
+        status: "completed",
+        worktrees: [],
+        candidates: [
+          {
+            candidateID: "candidate-1",
+            index: 0,
+            messageID: "msg_1",
+            directory: repo.directory,
+            strategy: "clone",
+            base: repo.base,
+            patch,
+            patchBytes: patch.length,
+            diffComplete: true,
+            snapshotSource: "git-patch",
+            files: [
+              {
+                file: "feature.txt",
+                status: "added",
+                additions: 1,
+                deletions: 0,
+                patch,
+              },
+            ],
+            diffStats: { files: 1, additions: 1, deletions: 0 },
+            testFilesChanged: false,
+            ciFilesChanged: false,
+            skippedTests: false,
+            verification: "unknown",
+            tests: { skipped: true, reason: "no test command" },
+            state: "idle",
+            elapsedMs: 10,
+            applyStrategy: "patch",
+          },
+        ],
+      }
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        worktreeMissing: true,
+        initialRaces: [race],
+        options: {
+          allowApplyCandidates: true,
+          allowWorktreeManagement: true,
+          gitTimeoutMs: 30_000,
+        },
+      })
+      const before = (await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()
+      const result = await harness.executeRaw("applyCandidate", {
+        raceID: race.raceID,
+        candidateID: "candidate-1",
+        strategy: "apply",
+        verifyCommand: 'node -e "process.exit(0)"',
+        dryRun: false,
+        commit: false,
+        confirm: true,
+      })
+      expect(result.output).toMatchObject({ applied: true, state: "ok" })
+      expect((await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()).toBe(before)
+      const status = await runGit(["status", "--porcelain=v1"], repo.directory)
+      expect(status.stdout).toContain("feature.txt")
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("O-5: a divergent target is not modified by a conflicting patch", async () => {
+    const repo = await makeTempRepo()
+    try {
+      await writeFile(path.join(repo.directory, "base.txt"), "candidate\n", "utf8")
+      await runGit(["add", "."], repo.directory)
+      await runGit(["commit", "-m", "candidate"], repo.directory)
+      const candidateCommit = (await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()
+      const patch = (
+        await runGit(["diff", "--binary", repo.base, candidateCommit], repo.directory)
+      ).stdout
+      await runGit(["reset", "--hard", repo.base], repo.directory)
+
+      // The target moves forward independently; the patch no longer applies.
+      await writeFile(path.join(repo.directory, "base.txt"), "target\n", "utf8")
+      await runGit(["add", "."], repo.directory)
+      await runGit(["commit", "-m", "target change"], repo.directory)
+      const targetHead = (await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()
+
+      const race = {
+        raceID: "race_conflict",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        targetDirectory: repo.directory,
+        mode: "worktrees",
+        prompt: "implement it",
+        base: repo.base,
+        keepWorktrees: false,
+        status: "completed",
+        worktrees: [],
+        candidates: [
+          {
+            candidateID: "candidate-1",
+            index: 0,
+            messageID: "msg_1",
+            directory: repo.directory,
+            strategy: "clone",
+            base: repo.base,
+            patch,
+            patchBytes: patch.length,
+            diffComplete: true,
+            snapshotSource: "git-patch",
+            files: [
+              {
+                file: "base.txt",
+                status: "modified",
+                additions: 1,
+                deletions: 1,
+                patch,
+              },
+            ],
+            diffStats: { files: 1, additions: 1, deletions: 1 },
+            testFilesChanged: false,
+            ciFilesChanged: false,
+            skippedTests: false,
+            verification: "unknown",
+            tests: { skipped: true, reason: "no test command" },
+            state: "idle",
+            elapsedMs: 10,
+            applyStrategy: "patch",
+          },
+        ],
+      }
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        worktreeMissing: true,
+        initialRaces: [race],
+        options: {
+          allowApplyCandidates: true,
+          allowWorktreeManagement: true,
+          gitTimeoutMs: 30_000,
+        },
+      })
+      const result = await harness.executeRaw("applyCandidate", {
+        raceID: race.raceID,
+        candidateID: "candidate-1",
+        strategy: "apply",
+        verifyCommand: 'node -e "process.exit(0)"',
+        dryRun: false,
+        confirm: true,
+      })
+      expect(result.output).toMatchObject({ state: "error", applied: false })
+      expect((await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()).toBe(targetHead)
+      expect(
+        (await runGit(["status", "--porcelain=v1"], repo.directory)).stdout.trim(),
+      ).toBe("")
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("O-2: worktrees create, list, and remove only tracked worktrees", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        realWorktrees: true,
+        options: {
+          allowWorktreeManagement: true,
+          maxWorktrees: 4,
+          gitTimeoutMs: 30_000,
+        },
+      })
+      const created = await harness.executeRaw("worktrees", {
+        action: "create",
+        count: 2,
+        base: repo.base,
+        runID: "run_wt",
+      })
+      const worktrees = (created.output as Record<string, unknown>).worktrees as Array<{
+        directory: string
+      }>
+      expect(worktrees).toHaveLength(2)
+
+      const listed = await harness.executeRaw("worktrees", { action: "list" })
+      expect(
+        (listed.output as Record<string, unknown>).worktrees as unknown[],
+      ).toHaveLength(2)
+
+      await writeFile(path.join(worktrees[0]!.directory, "dirty.txt"), "dirty\n", "utf8")
+      const kept = await harness.executeRaw("worktrees", {
+        action: "remove",
+        directories: [worktrees[0]!.directory],
+        confirm: true,
+        force: false,
+      })
+      const keptResults = (kept.output as Record<string, unknown>).removed as Array<{
+        removed: boolean
+      }>
+      expect(keptResults[0]?.removed).toBe(false)
+
+      const forced = await harness.executeRaw("worktrees", {
+        action: "remove",
+        directories: [worktrees[0]!.directory, worktrees[1]!.directory],
+        confirm: true,
+        force: true,
+      })
+      const forcedResults = (forced.output as Record<string, unknown>).removed as Array<{
+        removed: boolean
+      }>
+      expect(forcedResults.filter((entry) => entry.removed)).toHaveLength(2)
+    } finally {
+      await repo.cleanup()
+    }
   })
 })

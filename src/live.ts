@@ -17,12 +17,26 @@ export type LivePending = {
   source: "hook" | "inbox"
 }
 
+export type LiveBackground = {
+  kind: string
+  sessionID?: string
+  shellID?: string
+  childSessionID?: string
+  agent?: string
+  description?: string
+  command?: string
+  path?: string
+  model?: string
+}
+
 export type LiveSnapshot = {
   pending: LivePending[]
   status?: SessionStatusLike
   statusAt?: number
   lastOutcome?: string
   lastError?: string
+  background?: LiveBackground[]
+  backgroundAt?: number
 }
 
 export type LiveStateOptions = {
@@ -41,6 +55,7 @@ export type LiveStats = {
 
 export type LiveState = {
   notePrompt: (input: LivePromptInput) => void
+  noteIdleBackground: (sessionID: string, background: LiveBackground[]) => void
   applyEvent: (event: SessionEventLike) => void
   markDelivered: (sessionID: string, messageID: string) => void
   reconcile: (sessionID: string, messages: MessageLike[]) => void
@@ -56,6 +71,8 @@ type LiveSession = {
   statusAt?: number
   lastOutcome?: string
   lastError?: string
+  background?: LiveBackground[]
+  backgroundAt?: number
   at: number
 }
 
@@ -110,6 +127,14 @@ export function createLiveState(options: LiveStateOptions = {}): LiveState {
       session.status = undefined
       session.statusAt = undefined
     }
+    if (
+      session.backgroundAt !== undefined &&
+      ttlMs > 0 &&
+      now() - session.backgroundAt > ttlMs
+    ) {
+      session.background = undefined
+      session.backgroundAt = undefined
+    }
   }
 
   const addPending = (
@@ -134,7 +159,13 @@ export function createLiveState(options: LiveStateOptions = {}): LiveState {
     const session = sessions.get(sessionID)
     if (!session) return
     session.pending.delete(messageID)
-    if (session.pending.size === 0 && session.status === undefined) sessions.delete(sessionID)
+    if (
+      session.pending.size === 0 &&
+      session.status === undefined &&
+      !session.background?.length
+    ) {
+      sessions.delete(sessionID)
+    }
   }
 
   return {
@@ -145,6 +176,12 @@ export function createLiveState(options: LiveStateOptions = {}): LiveState {
         input.delivery ?? "steer",
         "hook",
       )
+    },
+    noteIdleBackground(sessionID, background) {
+      if (!sessionID) return
+      const session = touch(sessionID)
+      session.background = background.length ? [...background] : undefined
+      session.backgroundAt = now()
     },
     applyEvent(event) {
       const sessionID = event.data?.sessionID
@@ -243,20 +280,34 @@ export function createLiveState(options: LiveStateOptions = {}): LiveState {
       for (const messageID of session.pending.keys()) {
         if (seen.has(messageID)) session.pending.delete(messageID)
       }
-      if (session.pending.size === 0 && session.status === undefined) sessions.delete(sessionID)
+      if (
+        session.pending.size === 0 &&
+        session.status === undefined &&
+        !session.background?.length
+      ) {
+        sessions.delete(sessionID)
+      }
     },
     get(sessionID) {
       const session = sessions.get(sessionID)
       if (!session) return { pending: [] }
       pruneSession(session)
       const pending = [...session.pending.values()].sort((a, b) => a.at - b.at)
-      if (pending.length === 0 && session.status === undefined) sessions.delete(sessionID)
+      if (
+        pending.length === 0 &&
+        session.status === undefined &&
+        !session.background?.length
+      ) {
+        sessions.delete(sessionID)
+      }
       return {
         pending,
         status: session.status,
         statusAt: session.statusAt,
         lastOutcome: session.lastOutcome,
         lastError: session.lastError,
+        background: session.background,
+        backgroundAt: session.backgroundAt,
       }
     },
     stats() {

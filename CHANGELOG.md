@@ -6,6 +6,75 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### 2026-11-08 orchestration (O-0..O-5)
+
+#### Added
+
+- `open({ directory })` creates sessions in a validated project/worktree
+  directory, passes `location: { directory }` to `session.create`, verifies
+  `session.get().location.directory`, and aborts/cleans up on mismatch.
+- Cross-directory ownership: `ownerSessionID`, `runID`, `role`,
+  `ownerDirectory`, and `targetDirectory`. Owners and same-run orchestrators can
+  manage workers in other directories; legacy same-directory entries still work.
+- Persistent worker registry (global, immediate writes) and a wrapper gate that
+  denies every `sessions.*` orchestration tool to workers unless
+  `allowWorkerOrchestration: true`. Worker preset denies `session_bridge.*`,
+  `git push`/`git worktree`/`git checkout`/`switch`, `--force`, and
+  `external_directory`.
+- `open` mappings and in-flight keys include the target directory and run ID;
+  the same `messageID` in another directory is a conflict. Reused sessions
+  verify location/agent/model and apply (or reject) permissions instead of
+  ignoring them.
+- `sessions.worktrees` (`create`/`list`/`remove`) with explicit base/SHA,
+  bounded creation, partial-creation rollback, strategy detection, dirty/active
+  protection, session archiving before removal, and branch retention.
+- `sessions.waitAny` and `sessions.waitAll`: `any`/`all` modes, global and
+  per-session timeouts, partial results, quick permission return, idle
+  fast-path, isolated aborts, N cap, and background-work detection via the
+  `experimental.idle` hook.
+- `sessions.race` and `sessions.bestOf`: 2–8 candidates, worktrees or
+  same-directory, per-candidate models/agents, commit or patch snapshots
+  (including untracked files), binary/rename/mode/submodule/LFS flags,
+  test/CI/disabled-test detection, serialized E2E with allowlisted env and
+  redaction, bounded output, persistent race records, and a heuristic
+  `recommended`/`rankingReasons` (never an automatic winner).
+- `sessions.applyCandidate`: `apply`/`cherry-pick`, dry-run by default,
+  `allowApplyCandidates` + `confirm` + `permission.assert`, clean-target and
+  in-progress-operation checks, base-ancestor check, integration worktree +
+  `verifyCommand`, backup branch, rollback, idempotent `alreadyApplied`,
+  opt-in commit, and a separate opt-in non-force push.
+- `sessions.raceStatus`, `sessions.raceList`, and `sessions.raceCleanup` for
+  persisted races, orphan cleanup, and worktree lifecycle. `diagnostics` now
+  reports races, worktrees, workers, stream health, storage, and last cleanup.
+- New modules `src/directories.ts`, `src/git.ts`, `src/runtime.ts`,
+  `src/worktrees.ts`, `src/races.ts`, and `src/orchestration.ts`; real-git
+  integration tests for worktrees, race snapshots, and apply.
+
+#### Changed
+
+- `open` always passes an explicit `location` and registers its owner/target.
+  A worker created in another directory is managed by owner/run, not by
+  directory equality.
+- Worktree/race state is persisted globally (not per-directory) so a worker
+  location and recovered races are visible across plugin instances.
+- Race snapshots may create a local commit in the candidate worktree when
+  `allowSnapshotCommits: true` (default) and no secret-like paths are present.
+  The target is never touched by `race`/`bestOf`.
+
+#### Security / no-goals
+
+- No automatic candidate selection with an LLM, no automatic apply, commit, or
+  push. `applyCandidate` is dry-run by default; commit and push are separate
+  opt-ins and push never forces.
+- No shell fallback for worktree creation. `execFile` without a shell is used
+  only for explicit test/verification commands, with an env allowlist,
+  redaction, timeout, bounded output, and Windows process-tree kill.
+- E2E that needs local secrets/services is reported as `skipped`; it is never
+  claimed as passed. `same-directory` races are review-only (`applyStrategy:
+  none`) because candidates share one working tree.
+- Worktree removal never deletes the project root, untracked/dirty worktrees
+  without `force` + `confirm`, or branches with unmerged commits.
+
 ### 2026-11-08 hardening
 
 #### Fixed
@@ -77,9 +146,9 @@ All notable changes to this project are documented here. The format follows
 #### Security / no-goals
 
 - Foreign-session defaults are stricter for `remove`.
-- No worktree orchestration, `open({ directory })`, `waitAny`/`waitAll`,
-  `race`/`bestOf`, or `applyCandidate` in this release. There is no automatic
-  apply, commit, or push.
+- The hardening pass below did not include worktree orchestration. See the
+  O-0..O-5 section above for the new opt-in layer; apply/commit/push remain
+  non-automatic.
 
 This work is additive in tool names and fields, but it changes several
 security/behavior defaults. A strict SemVer reading requires a major release
