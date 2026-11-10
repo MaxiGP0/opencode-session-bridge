@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import plugin from "../index.ts"
@@ -670,7 +670,7 @@ async function makeTempRepo(): Promise<{
   base: string
   cleanup: () => Promise<void>
 }> {
-  const directory = await mkdtemp(path.join(tmpdir(), "session-bridge-repo-"))
+  const directory = await realpath(await mkdtemp(path.join(tmpdir(), "session-bridge-repo-")))
   const init = await runGit(["init", "-b", "main"], directory)
   if (init.exitCode !== 0) {
     await runGit(["init"], directory)

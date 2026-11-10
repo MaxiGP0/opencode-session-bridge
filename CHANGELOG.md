@@ -79,6 +79,10 @@ All notable changes to this project are documented here. The format follows
 
 #### Fixed
 
+- Directory containment checks canonicalize the project root and registered
+  worktrees before comparing them, so Windows short (8.3) paths and symlinked
+  roots do not reject valid targets. Tests resolve temporary roots before
+  comparing paths.
 - `retry.next` is an absolute epoch timestamp, not a duration. Content now
   shows the remaining seconds (`next in 0s` when already past), and
   `output.retry` adds `retryAt` (ISO) and `retryInMs`. The old tests using

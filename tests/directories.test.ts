@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
@@ -14,7 +14,7 @@ import {
 } from "../src/directories.ts"
 
 async function tempRoot(): Promise<string> {
-  return mkdtemp(path.join(tmpdir(), "session-bridge-dirs-"))
+  return realpath(await mkdtemp(path.join(tmpdir(), "session-bridge-dirs-")))
 }
 
 describe("directory helpers", () => {
@@ -55,6 +55,26 @@ describe("validateTargetDirectory", () => {
         expect(result.insideProject).toBe(true)
         expect(sameDirectory(result.realDirectory, child)).toBe(true)
       }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("canonicalizes a project root before checking containment", async () => {
+    const root = await tempRoot()
+    try {
+      const child = path.join(root, "child")
+      await mkdir(child, { recursive: true })
+      const alias = path.join(root, "root-link")
+      try {
+        await symlink(root, alias, process.platform === "win32" ? "junction" : "dir")
+      } catch {
+        // Creating symlinks may require privileges on Windows; skip in that case.
+        return
+      }
+      const result = await validateTargetDirectory(child, { projectCanonical: alias })
+      expect(result.ok).toBe(true)
+      if (result.ok) expect(result.insideProject).toBe(true)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

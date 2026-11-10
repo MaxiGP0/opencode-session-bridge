@@ -70,6 +70,14 @@ export type DirectoryValidation =
       error: string
     }
 
+async function canonicalPath(value: string): Promise<string> {
+  try {
+    return await realpath(value)
+  } catch {
+    return value
+  }
+}
+
 async function exists(value: string): Promise<boolean> {
   try {
     await access(value)
@@ -139,7 +147,8 @@ export async function validateTargetDirectory(
     (entry): entry is string => typeof entry === "string" && entry.length > 0,
   )
   for (const root of projectRoots) {
-    if (isPathInside(resolved, root)) {
+    const canonicalRoot = await canonicalPath(root)
+    if (isPathInside(resolved, canonicalRoot)) {
       return {
         ok: true,
         directory: resolved,
@@ -152,7 +161,8 @@ export async function validateTargetDirectory(
 
   const registered = options.registeredDirectories ?? []
   for (const candidate of registered) {
-    if (sameDirectory(candidate, resolved)) {
+    const canonicalCandidate = await canonicalPath(candidate)
+    if (sameDirectory(canonicalCandidate, resolved)) {
       return {
         ok: true,
         directory: resolved,
