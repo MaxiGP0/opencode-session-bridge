@@ -58,7 +58,7 @@ import {
   type RegistryPersistence,
   type WorkerSessions,
 } from "./registry.ts"
-import { assertPermission, throwIfAborted, withRequest } from "./runtime.ts"
+import { assertPermission, promptMessageID, throwIfAborted, withRequest } from "./runtime.ts"
 import type {
   Lang,
   MessageLike,
@@ -1208,7 +1208,12 @@ export async function runRace(
         }
         const admitted = await withRequest(signal, deps.options.requestTimeoutMs, (request) =>
           deps.ctx.session.prompt(
-            { sessionID: created.id, text: input.prompt, id: messageID, delivery: "steer" },
+            {
+              sessionID: created.id,
+              text: input.prompt,
+              id: promptMessageID(messageID, `race:${raceID}:${index + 1}`),
+              delivery: "steer",
+            },
             { signal: request },
           ),
         )
@@ -1259,9 +1264,11 @@ export async function runRace(
     }
 
     // Snapshot each candidate before running any tests. The diff is the
-    // authoritative artifact for apply; the display stays bounded.
+    // authoritative artifact for apply; the display stays bounded. A failed,
+    // timed-out, or permission-blocked candidate is not a finished tree and
+    // must not be committed or offered for apply.
     for (const candidate of candidates) {
-      if (!candidate.sessionID) continue
+      if (!candidate.sessionID || candidate.state !== "idle") continue
       try {
         await snapshotCandidate(
           deps,
@@ -1279,7 +1286,7 @@ export async function runRace(
 
     // E2E commands are serialized across candidates to avoid port/DB clashes.
     for (const candidate of candidates) {
-      if (!candidate.sessionID) continue
+      if (!candidate.sessionID || candidate.state !== "idle") continue
       const remaining = deadline - Date.now()
       if (remaining <= 0) {
         candidate.tests = { skipped: true, reason: "race wall clock exceeded" }

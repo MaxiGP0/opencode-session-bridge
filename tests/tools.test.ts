@@ -371,6 +371,9 @@ function makeHarness(options: HarnessOptions = {}) {
         id?: string
         delivery?: "steer" | "queue"
       }) => {
+        if (input.id && !input.id.startsWith("msg_")) {
+          throw new Error('Expected a string starting with "msg_"\n  at ["id"]')
+        }
         promptCalls.push({
           sessionID: input.sessionID,
           text: input.text,
@@ -728,6 +731,34 @@ describe("sessions tools", () => {
     expect(harness.state.promptCalls[0]?.id).toBe("msg_fixed")
     expect(content).toContain("Message ID: msg_fixed")
     expect(harness.state.contextCalls).toBeLessThanOrEqual(2)
+  })
+
+  it("derives msg_ prompt IDs from arbitrary idempotency keys", async () => {
+    const harness = makeHarness()
+    const first = await harness.executeRaw("open", {
+      prompt: "hi",
+      messageID: "custom-open-key",
+    })
+    expect(first.output).toMatchObject({ state: "idle" })
+    const firstID = harness.state.promptCalls[0]?.id
+    expect(firstID).toMatch(/^msg_/)
+    expect(firstID).not.toBe("custom-open-key")
+
+    const retry = await harness.executeRaw("open", {
+      prompt: "hi",
+      messageID: "custom-open-key",
+    })
+    expect(retry.output).toMatchObject({ state: "idle", reused: true })
+    expect(harness.state.promptCalls[1]?.id).toBe(firstID)
+
+    const sent = await harness.execute("send", {
+      sessionID: "ses_new",
+      prompt: "follow up",
+      messageID: "custom-send-key",
+    })
+    expect(sent).toContain("Message ID: msg_")
+    expect(harness.state.promptCalls.at(-1)?.id).toMatch(/^msg_/)
+    expect(harness.state.promptCalls.at(-1)?.id).not.toBe("custom-send-key")
   })
 
   it("send with queue waits for the exact queued turn", async () => {
@@ -2770,6 +2801,7 @@ describe("orchestration tools", () => {
       expect(candidates).toHaveLength(3)
       for (const candidate of candidates) {
         expect(candidate.commit).toEqual(expect.any(String))
+        expect(candidate.messageID).toMatch(/^msg_/)
         expect((candidate.diffStats as Record<string, number>).additions).toBeGreaterThan(0)
       }
       const failed = candidates.filter(
@@ -2788,6 +2820,48 @@ describe("orchestration tools", () => {
       })
       expect((cleanup.output as Record<string, unknown>).removed).toHaveLength(3)
       expect(harness.state.worktreeRemoveCalls.length).toBeGreaterThanOrEqual(3)
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("O-4: does not snapshot candidates whose admission failed", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        realWorktrees: true,
+        promptError: new Error("admission failed"),
+        options: {
+          allowSnapshotCommits: true,
+          allowWorktreeManagement: true,
+          maxRaceCandidates: 3,
+          maxConcurrentSessions: 2,
+          gitTimeoutMs: 30_000,
+        },
+      })
+      const result = await harness.executeRaw("bestOf", {
+        prompt: "implement it",
+        count: 2,
+        mode: "worktrees",
+        base: repo.base,
+        keepWorktrees: true,
+        timeoutMs: 30_000,
+      })
+      const output = result.output as Record<string, unknown>
+      await harness.executeRaw("raceCleanup", {
+        raceID: String(output.raceID),
+        confirm: true,
+        force: true,
+      })
+      const candidates = output.candidates as Array<Record<string, unknown>>
+      expect(candidates).toHaveLength(2)
+      for (const candidate of candidates) {
+        expect(candidate.state).toBe("error")
+        expect(candidate.commit).toBeUndefined()
+        expect((candidate.diffStats as Record<string, number>).files).toBe(0)
+      }
+      expect(output.recommended ?? null).toBeNull()
     } finally {
       await repo.cleanup()
     }

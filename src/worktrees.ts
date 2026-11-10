@@ -1,5 +1,5 @@
 import { sameDirectory, resolveGitDir } from "./directories.ts"
-import { runGit, type GitRunner } from "./git.ts"
+import { normalizeWorktreeLineEndings, runGit, type GitRunner } from "./git.ts"
 import type { LiveState } from "./live.ts"
 import type { BridgeOptions } from "./options.ts"
 import type { PluginContext } from "./types.ts"
@@ -276,6 +276,15 @@ export async function createWorktrees(
       const directory = result?.directory
       if (!directory) throw new Error("worktree.create did not return a directory")
       const gitDir = await resolveGitDir(directory)
+      if (gitDir) {
+        const normalized = await normalizeWorktreeLineEndings(deps.git, directory, {
+          timeoutMs: deps.options.gitTimeoutMs,
+          signal,
+        }).catch(() => false)
+        if (!normalized) {
+          throw new Error("failed to normalize the worktree line endings")
+        }
+      }
       const record: WorktreeRecord = {
         directory,
         runID: meta.runID,

@@ -1,5 +1,24 @@
+import { createHash } from "node:crypto"
 import { requestSignal } from "./wait.ts"
 import type { PluginContext, ToolExecuteContext } from "./types.ts"
+
+/**
+ * OpenCode's `session.prompt` requires a message ID with the `msg_` prefix.
+ * The tool-level `messageID` is an idempotency key and may be any bounded
+ * string, so derive a stable, valid API ID from the key and its scope while
+ * preserving IDs the caller already made API-valid.
+ */
+export function promptMessageID(key: string | undefined, scope: string): string | undefined {
+  if (!key) return undefined
+  if (key.startsWith("msg_")) return key
+  const digest = createHash("sha256")
+    .update(scope)
+    .update("\0")
+    .update(key)
+    .digest("hex")
+    .slice(0, 32)
+  return `msg_${digest}`
+}
 
 /**
  * Marker used to let host permission denials escape the tool wrapper. A denied

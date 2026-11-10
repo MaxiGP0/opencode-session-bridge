@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
+  normalizeWorktreeLineEndings,
   parseCommand,
   redactSecrets,
   runCommand,
+  runGit,
   safeEnvironment,
 } from "../src/git.ts"
 
@@ -99,6 +101,39 @@ describe("runCommand", () => {
       expect(result.durationMs).toBeLessThan(4_000)
     } finally {
       await rm(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("worktree line endings", () => {
+  it("rewrites a CRLF checkout from the index without conversion", async () => {
+    const repo = await mkdtemp(path.join(tmpdir(), "session-bridge-crlf-"))
+    const worktree = path.join(repo, "wt")
+    try {
+      await runGit(["init", "-b", "main"], repo)
+      await runGit(["config", "user.name", "test"], repo)
+      await runGit(["config", "user.email", "test@localhost"], repo)
+      await writeFile(path.join(repo, "base.txt"), "base\nsecond\n", "utf8")
+      await runGit(["add", "."], repo)
+      await runGit(["commit", "-m", "base"], repo)
+
+      const added = await runGit(
+        ["-c", "core.autocrlf=true", "worktree", "add", worktree, "-b", "crlf-wt", "HEAD"],
+        repo,
+        { timeoutMs: 30_000 },
+      )
+      expect(added.exitCode).toBe(0)
+      const before = await readFile(path.join(worktree, "base.txt"), "utf8")
+      expect(before).toContain("\r\n")
+
+      expect(await normalizeWorktreeLineEndings(runGit, worktree)).toBe(true)
+      const after = await readFile(path.join(worktree, "base.txt"), "utf8")
+      expect(after).toBe("base\nsecond\n")
+      const status = await runGit(["status", "--porcelain=v1"], worktree)
+      expect(status.stdout.trim()).toBe("")
+    } finally {
+      await runGit(["worktree", "remove", "--force", worktree], repo).catch(() => undefined)
+      await rm(repo, { recursive: true, force: true }).catch(() => undefined)
     }
   })
 })

@@ -396,6 +396,31 @@ export type GitRunner = (
   options?: Omit<RunCommandOptions, "cwd">,
 ) => Promise<CommandResult>
 
+/**
+ * Linked worktrees are checked out by the host, which may use the user's
+ * global `core.autocrlf=true`. The plugin's git runner deliberately uses raw
+ * bytes (`core.autocrlf=false`), so a CRLF checkout would make every file look
+ * modified and produce a huge line-ending-only snapshot. Rewrite the new
+ * worktree from its index with no conversion before workers touch it.
+ */
+export async function normalizeWorktreeLineEndings(
+  git: GitRunner,
+  directory: string,
+  options: Omit<RunCommandOptions, "cwd"> = {},
+): Promise<boolean> {
+  const inside = await git(["rev-parse", "--is-inside-work-tree"], directory, options)
+  if (inside.exitCode !== 0 || inside.stdout.trim() !== "true") return false
+  // This runs on a freshly created worktree, before any worker edits it.
+  // reset --hard rewrites the checkout with raw bytes and refreshes the index
+  // stat cache, avoiding line-ending-only `git status` entries.
+  const reset = await git(
+    ["-c", "core.autocrlf=false", "reset", "--hard", "HEAD"],
+    directory,
+    options,
+  )
+  return reset.exitCode === 0
+}
+
 export type TemporaryDirectory = {
   path: string
   cleanup: () => Promise<void>
