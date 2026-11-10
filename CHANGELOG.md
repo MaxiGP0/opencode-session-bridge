@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [3.0.1] - 2026-11-10
+
+### Fixed
+
+- `open`, `send`, and `race`/`bestOf` derive a stable, API-valid `msg_` ID from
+  arbitrary idempotency keys before calling `session.prompt`. Keys that already
+  start with `msg_` are preserved. This fixes real hosts rejecting IDs such as
+  `smoke-...` or `${raceID}:${n}` with `Expected a string starting with "msg_"`.
+- Worktrees created by the plugin are normalized to the repository's raw byte
+  checkout (`core.autocrlf=false`, `reset --hard HEAD`) before any worker starts.
+  On Windows this prevents line-ending-only snapshots that reported every file
+  as modified and produced multi-megabyte diffs.
+- `race`/`bestOf` do not snapshot or test candidates that failed admission,
+  timed out, or are blocked on permissions. Failed candidates no longer create
+  misleading commits or `diffStats`.
+
+### Tests
+
+- Added `promptMessageID` unit tests, arbitrary-key regression tests for
+  `open`/`send`, a CRLF worktree normalization test, and a regression test that
+  failed admissions are not snapshotted.
+
 ## [3.0.0] - 2026-11-10
 
 ### 2026-11-08 orchestration (O-0..O-5)

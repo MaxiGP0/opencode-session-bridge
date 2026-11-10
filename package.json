@@ -1,6 +1,6 @@
 {
   "name": "opencode-session-bridge",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "OpenCode plugin to open, interact with, monitor, read, wait for, and safely manage other OpenCode sessions.",
   "type": "module",
   "engines": {
