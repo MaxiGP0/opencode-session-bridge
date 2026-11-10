@@ -515,10 +515,18 @@ que las reglas `deny`/`ask` de OpenCode se aplican por encima:
 | `session_bridge.remove` | `remove` |
 | `session_bridge.interrupt` | `interrupt` |
 | `session_bridge.compact` | `compact` |
+| `session_bridge.worktrees` | `worktrees` |
+| `session_bridge.waitAny` | `waitAny`, `waitAll` |
+| `session_bridge.race` | `race` |
+| `session_bridge.bestOf` | `bestOf` |
+| `session_bridge.apply` | `applyCandidate` |
+| `session_bridge.push` | `applyCandidate({ push: true })` |
+| `session_bridge.raceCleanup` | `raceCleanup` |
 
 Las herramientas de solo lectura (`status`, `read`, `wait`, `list`,
-`permissions`, `language`, `diagnostics`) no piden permiso. Un rechazo del host se devuelve
-como error de herramienta y la acción no se ejecuta. Ejemplo conservador:
+`permissions`, `language`, `diagnostics`, `raceStatus`, `raceList`) no piden
+permiso. Un rechazo del host se devuelve como error de herramienta y la acción
+no se ejecuta. Ejemplo conservador:
 
 ```jsonc
 {
@@ -622,6 +630,44 @@ default.
   ]
 }
 ```
+
+### Orquestación opt-in
+
+Los worktrees, las carreras, los comandos de test y el apply están
+deshabilitados por defecto. Esta configuración habilita lo mínimo para crear
+worktrees, ejecutar tests y aplicar un candidato, y mantiene apagados el push
+de candidatos y la orquestación de workers:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "opencode-session-bridge",
+      "options": {
+        "allowWorktreeManagement": true,
+        "allowTestCommands": true,
+        "allowApplyCandidates": true,
+        "allowPushCandidates": false,
+        "allowTestChanges": false,
+        "allowWorkerOrchestration": false
+      }
+    }
+  ],
+  "permissions": [
+    { "action": "session_bridge.worktrees", "resource": "*", "effect": "ask" },
+    { "action": "session_bridge.race", "resource": "*", "effect": "ask" },
+    { "action": "session_bridge.bestOf", "resource": "*", "effect": "ask" },
+    { "action": "session_bridge.apply", "resource": "*", "effect": "ask" }
+  ]
+}
+```
+
+`allowPushCandidates` queda en `false` a propósito: `applyCandidate({ commit:
+true })` puede crear un commit local, pero el push sigue siendo un opt-in
+separado. Revisá el resultado y ejecutá `git push` manualmente si ese es tu
+flujo. `allowTestChanges` queda en `false` para que los candidatos que modifican
+tests o CI no se consideren confiables, y `allowWorkerOrchestration` queda en
+`false` para que los workers no puedan usar las tools de orquestación.
 
 ## Cómo funciona
 
@@ -751,13 +797,14 @@ modelo por defecto. Las variantes usan `provider/model#variant`.
   validación runtime. Las longitudes cuentan code points Unicode.
 - Una lectura parcial devuelve `partial: true`; vuelve a leer el mismo
   `afterMessageID` con un `maxOutputChars` mayor en vez de avanzar.
-- Esta versión **no** implementa orquestación de worktrees,
-  `open({ directory })`, `waitAny`/`waitAll`, `race`/`bestOf` ni
-  `applyCandidate`. No hay apply, commit ni push automáticos.
+- La orquestación de worktrees es opt-in y está deshabilitada por defecto:
+  `allowWorktreeManagement`, `allowTestCommands`, `allowApplyCandidates` y
+  `allowPushCandidates` son `false`. No hay selección automática de candidatos
+  con un LLM, ni apply, commit o push automáticos.
 - `localize` es un helper legacy deprecado. El código nuevo debe usar `t()`; el
   helper copia literalmente el contenido multilínea del asistente y las líneas
-  de herramientas que no son permisos. Su eliminación está prevista para
-  `3.0.0`.
+  de herramientas que no son permisos. Su eliminación está prevista para una
+  futura versión major.
 - El mapping de `open` expira a los 7 días y guarda como máximo 500 entradas por
   directorio. Las sesiones propias expiran a los 30 días. Usa un `sessionID`
   explícito si la ventana de reintento es mayor.
@@ -782,7 +829,7 @@ npm run pack:check
   `src/types.ts` contienen los helpers puros/de runtime.
 - `tests/` cubre i18n, formato, validación, espera event-driven, anclaje de
   cola, permisos, presupuestos y la superficie de tools con un contexto falso.
-- La CI ejecuta typecheck, tests y `npm pack --dry-run`.
+- La CI ejecuta typecheck, tests y `npm pack --dry-run` en Ubuntu y Windows.
 
 ## Licencia
 

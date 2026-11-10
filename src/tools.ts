@@ -273,7 +273,7 @@ const schema = (value: Record<string, unknown>): ToolDefinition["input"] =>
 const outputSchema = (value: Record<string, unknown>): ToolDefinition["output"] =>
   value as ToolDefinition["output"]
 
-const PLUGIN_VERSION = "2.0.0"
+const PLUGIN_VERSION = "3.0.0"
 
 function permissionRuleSchemaFor(deps: ToolDeps) {
   return {

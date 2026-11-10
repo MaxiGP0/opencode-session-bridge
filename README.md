@@ -506,10 +506,18 @@ rules apply on top:
 | `session_bridge.remove` | `remove` |
 | `session_bridge.interrupt` | `interrupt` |
 | `session_bridge.compact` | `compact` |
+| `session_bridge.worktrees` | `worktrees` |
+| `session_bridge.waitAny` | `waitAny`, `waitAll` |
+| `session_bridge.race` | `race` |
+| `session_bridge.bestOf` | `bestOf` |
+| `session_bridge.apply` | `applyCandidate` |
+| `session_bridge.push` | `applyCandidate({ push: true })` |
+| `session_bridge.raceCleanup` | `raceCleanup` |
 
 Read-only tools (`status`, `read`, `wait`, `list`, `permissions`, `language`,
-`diagnostics`) do not ask for permission. A host denial is returned as a tool error and the
-action is not executed. Example conservative configuration:
+`diagnostics`, `raceStatus`, `raceList`) do not ask for permission. A host
+denial is returned as a tool error and the action is not executed. Example
+conservative configuration:
 
 ```jsonc
 {
@@ -611,6 +619,44 @@ default.
   ]
 }
 ```
+
+### Orchestration opt-in
+
+Worktrees, races, test commands, and apply are disabled by default. This
+configuration enables the minimum needed to create worktrees, run test
+commands, and apply a candidate, while keeping candidate pushes and worker
+orchestration off:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "opencode-session-bridge",
+      "options": {
+        "allowWorktreeManagement": true,
+        "allowTestCommands": true,
+        "allowApplyCandidates": true,
+        "allowPushCandidates": false,
+        "allowTestChanges": false,
+        "allowWorkerOrchestration": false
+      }
+    }
+  ],
+  "permissions": [
+    { "action": "session_bridge.worktrees", "resource": "*", "effect": "ask" },
+    { "action": "session_bridge.race", "resource": "*", "effect": "ask" },
+    { "action": "session_bridge.bestOf", "resource": "*", "effect": "ask" },
+    { "action": "session_bridge.apply", "resource": "*", "effect": "ask" }
+  ]
+}
+```
+
+`allowPushCandidates` is intentionally `false`: `applyCandidate({ commit: true
+})` can create a local commit, but pushing remains a separate opt-in. Review
+the result and run `git push` manually if that is your workflow.
+`allowTestChanges` stays `false` so candidates that modify tests or CI are not
+treated as trusted, and `allowWorkerOrchestration` stays `false` so workers
+cannot use orchestration tools.
 
 ## How it works
 
@@ -734,12 +780,13 @@ variants use `provider/model#variant`.
   validation. Lengths count Unicode code points.
 - A partial transcript read returns `partial: true`; re-read the same
   `afterMessageID` with a larger `maxOutputChars` instead of advancing.
-- This release does **not** implement worktree orchestration,
-  `open({ directory })`, `waitAny`/`waitAll`, `race`/`bestOf`, or
-  `applyCandidate`. There is no automatic apply, commit, or push.
+- Worktree orchestration is opt-in and disabled by default:
+  `allowWorktreeManagement`, `allowTestCommands`, `allowApplyCandidates`, and
+  `allowPushCandidates` are `false`. There is no automatic candidate selection
+  with an LLM, and no automatic apply, commit, or push.
 - `localize` is a deprecated legacy helper. New code should use `t()`; the
   helper copies multiline assistant content and non-permission tool lines
-  verbatim. Removal is planned for `3.0.0`.
+  verbatim. Removal is planned for a future major release.
 - The `open` mapping expires after 7 days and stores at most 500 entries per
   directory. Owned sessions expire after 30 days. Use an explicit `sessionID`
   when the retry window is longer.
@@ -763,7 +810,7 @@ npm run pack:check
   `src/types.ts` contain the pure/runtime helpers.
 - `tests/` covers i18n, formatting, validation, event-driven waiting, queue
   anchoring, permissions, budgets, and the tool surface with a fake context.
-- CI runs typecheck, tests, and `npm pack --dry-run`.
+- CI runs typecheck, tests, and `npm pack --dry-run` on Ubuntu and Windows.
 
 ## License
 

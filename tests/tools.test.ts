@@ -2447,7 +2447,7 @@ describe("sessions tools", () => {
     await harness.executeRaw("open", { prompt: "hi" })
     const result = await harness.executeRaw("diagnostics", {})
     expect(result.output).toMatchObject({
-      version: "2.0.0",
+      version: "3.0.0",
       state: "ok",
       capabilities: expect.any(Object),
       registry: expect.any(Object),

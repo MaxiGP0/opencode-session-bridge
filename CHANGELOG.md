@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [3.0.0] - 2026-11-10
 
 ### 2026-11-08 orchestration (O-0..O-5)
 
@@ -142,6 +142,8 @@ All notable changes to this project are documented here. The format follows
   preflight permission list is reused, and at most two `permission.list` calls
   are made in the timeout path.
 - `update.title` is sanitized before `session.update`, matching `open`.
+- CI runs typecheck, tests, and `npm pack --dry-run` on Ubuntu and Windows with
+  `fail-fast: false` and a 20-minute timeout.
 
 #### Security / no-goals
 
@@ -153,10 +155,8 @@ All notable changes to this project are documented here. The format follows
 This work is additive in tool names and fields, but it changes several
 security/behavior defaults. A strict SemVer reading requires a major release
 (`3.0.0`) because `interrupt`/`update` now reject foreign sessions by default
-and `list` only includes `cost`/`tokens` with `verbose: true`. If those changes
-are accepted as a security correction, a minor (`2.2.0`) is also defensible;
-the package version is intentionally not bumped here. The `read`/`status`/
-`wait` behavior corrections are documented because callers may observe
+and `list` only includes `cost`/`tokens` with `verbose: true`. The `read`/
+`status`/`wait` behavior corrections are documented because callers may observe
 different results.
 
 ### Breaking (security/behavior)
