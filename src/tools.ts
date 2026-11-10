@@ -96,6 +96,7 @@ import {
   type WorktreeRegistry,
 } from "./worktrees.ts"
 import { refreshRetry, retryInfo, retryRemainingMs } from "./retry.ts"
+import { PLUGIN_VERSION } from "./version.ts"
 import type {
   Lang,
   PluginContext,
@@ -273,8 +274,6 @@ const schema = (value: Record<string, unknown>): ToolDefinition["input"] =>
 
 const outputSchema = (value: Record<string, unknown>): ToolDefinition["output"] =>
   value as ToolDefinition["output"]
-
-const PLUGIN_VERSION = "3.0.0"
 
 function permissionRuleSchemaFor(deps: ToolDeps) {
   return {

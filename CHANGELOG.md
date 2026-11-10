@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [3.0.2] - 2026-11-10
+
+### Fixed
+
+- `sessions.diagnostics` now reports the real plugin version from
+  `src/version.ts`. The previous release kept a hardcoded `3.0.0` constant in
+  `src/tools.ts`, so a restarted host still reported the wrong version even
+  after `package.json` was bumped. A test now guards `PLUGIN_VERSION` against
+  `package.json`.
+
 ## [3.0.1] - 2026-11-10
 
 ### Fixed

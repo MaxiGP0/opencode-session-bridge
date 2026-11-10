@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import plugin from "../index.ts"
 import { runGit } from "../src/git.ts"
+import { PLUGIN_VERSION } from "../src/version.ts"
 import type { DirectoryValidator } from "../src/orchestration.ts"
 import type { GitRunner } from "../src/git.ts"
 import type {
@@ -2478,7 +2479,7 @@ describe("sessions tools", () => {
     await harness.executeRaw("open", { prompt: "hi" })
     const result = await harness.executeRaw("diagnostics", {})
     expect(result.output).toMatchObject({
-      version: "3.0.0",
+      version: PLUGIN_VERSION,
       state: "ok",
       capabilities: expect.any(Object),
       registry: expect.any(Object),
