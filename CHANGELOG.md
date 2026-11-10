@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [3.0.3] - 2026-11-10
+
+### Fixed
+
+- `permission.assert` no longer sends `metadata: undefined` or `source:
+  undefined` to the host. Real hosts reject an optional object field when it is
+  present but `undefined`, which made `applyCandidate` and the push opt-in fail
+  with `Expected object at ["metadata"]` before touching the target.
+
 ## [3.0.2] - 2026-11-10
 
 ### Fixed

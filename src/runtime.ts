@@ -105,11 +105,11 @@ export async function assertPermission(
   try {
     await ctx.permission.assert({
       sessionID: context.sessionID,
-      agent: context.agent,
+      ...(context.agent ? { agent: context.agent } : {}),
       action,
       resources,
-      metadata,
-      source,
+      ...(metadata !== undefined ? { metadata } : {}),
+      ...(source ? { source } : {}),
     })
   } catch (error) {
     throw new PermissionDenied(error)
