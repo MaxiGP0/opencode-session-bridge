@@ -58,7 +58,7 @@ import {
 } from "./orchestration.ts"
 import { rankCandidates, shapeCandidate, shapeRace } from "./races.ts"
 import { createRaceID } from "./races.ts"
-import type { RaceRegistry } from "./races.ts"
+import type { RacePersistence, RaceRegistry } from "./races.ts"
 import {
   forgetOpenSessionsBySessionID,
   forgetOwnedSession,
@@ -217,6 +217,7 @@ export type ToolDeps = {
   workerSessions?: WorkerSessions
   worktrees?: WorktreeRegistry
   races?: RaceRegistry
+  racePersistence?: RacePersistence
   git?: GitRunner
   validateDirectory?: DirectoryValidator
   refreshWorkers?: () => Promise<void>
@@ -234,6 +235,7 @@ function orchestrationDeps(deps: ToolDeps): OrchestrationDeps {
     workerSessions: deps.workerSessions ?? getProcessWorkerSessions(),
     worktrees: deps.worktrees ?? new Map(),
     races: deps.races ?? new Map(),
+    racePersistence: deps.racePersistence,
     liveState: deps.liveState,
     registry: deps.registry,
     git: deps.git ?? runGit,

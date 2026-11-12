@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { codePointLength, compact, truncateCodePoints } from "./format.ts"
 import type { BridgeOptions } from "./options.ts"
 import type { PluginContext } from "./types.ts"
@@ -84,6 +85,7 @@ export type CandidateRecord = {
   commit?: string
   patch?: string
   patchFile?: string
+  patchHash?: string
   patchBytes: number
   diffComplete: boolean
   snapshotSource: "git-commit" | "git-patch" | "vcs" | "none"
@@ -127,6 +129,9 @@ export type RaceRecord = {
   targetDirectory: string
   mode: RaceMode
   prompt: string
+  /** SHA-256 of the full prompt; the stored prompt may be truncated. */
+  promptHash?: string
+  promptTruncated?: boolean
   base?: string
   keepWorktrees: boolean
   status: RaceStatus
@@ -196,9 +201,135 @@ export async function loadRaces(ctx: PluginContext): Promise<RaceRegistry> {
 
 export async function persistRaces(ctx: PluginContext, races: RaceRegistry): Promise<void> {
   try {
-    await ctx.storage?.set(RACES_KEY, [...races.values()])
+    await ctx.storage?.set(RACES_KEY, [...races.values()].map(storedRace))
   } catch {
     // Storage is optional.
+  }
+}
+
+const STORED_PROMPT_CHARS = 2_000
+
+/**
+ * Storage keeps a bounded prompt preview and moves large patches to their
+ * `patchFile`. In-memory records remain complete for the current process; after
+ * a reload `applyCandidate` reads the patch file and the display uses the file
+ * summary instead of persisting megabytes again.
+ */
+function storedRace(race: RaceRecord): RaceRecord {
+  const prompt = race.prompt ?? ""
+  const promptHash = createHash("sha256").update(prompt).digest("hex")
+  const promptTruncated = codePointLength(prompt) > STORED_PROMPT_CHARS
+  return {
+    ...race,
+    prompt: promptTruncated
+      ? truncateCodePoints(prompt, STORED_PROMPT_CHARS, "…")
+      : prompt,
+    promptHash,
+    ...(promptTruncated ? { promptTruncated: true } : {}),
+    candidates: race.candidates.map((candidate) => {
+      const files = candidate.files.map((file) => ({
+        ...file,
+        ...(candidate.patchFile
+          ? { patch: undefined, patchTruncated: true }
+          : {}),
+      }))
+      return {
+        ...candidate,
+        ...(candidate.patchFile ? { patch: undefined } : {}),
+        files,
+      }
+    }),
+  }
+}
+
+export type RacePersistenceStats = {
+  races: number
+  dirty: boolean
+  flushPending: boolean
+  writes: number
+  lastFlushAt?: number
+}
+
+export type RacePersistence = {
+  remember: (race: RaceRecord) => void
+  flush: () => Promise<void>
+  stats: () => RacePersistenceStats
+  dispose: () => Promise<void>
+}
+
+/** Coalesces race writes; callers flush before returning a race to the user. */
+export function createRacePersistence(
+  ctx: PluginContext,
+  races: RaceRegistry,
+  options: { flushDelayMs?: number } = {},
+): RacePersistence {
+  const flushDelayMs = Math.max(1, options.flushDelayMs ?? 300)
+  let dirty = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let flushing: Promise<void> | undefined
+  let writes = 0
+  let lastFlushAt: number | undefined
+
+  async function flush(): Promise<void> {
+    while (flushing) {
+      try {
+        await flushing
+      } catch {
+        // persistRaces swallows storage errors.
+      }
+    }
+    if (!dirty) return
+    dirty = false
+    const current = (async () => {
+      await persistRaces(ctx, races)
+      writes++
+      lastFlushAt = Date.now()
+    })()
+    flushing = current
+    try {
+      await current
+    } finally {
+      if (flushing === current) flushing = undefined
+      if (dirty) schedule()
+    }
+  }
+
+  function schedule(): void {
+    if (timer !== undefined) return
+    timer = setTimeout(() => {
+      timer = undefined
+      void flush()
+    }, flushDelayMs)
+    const handle = timer as unknown as { unref?: () => void }
+    if (typeof handle.unref === "function") handle.unref()
+  }
+
+  return {
+    remember(race) {
+      races.set(race.raceID, race)
+      processRaces.set(race.raceID, race)
+      pruneRaces(races)
+      pruneRaces(processRaces)
+      dirty = true
+      schedule()
+    },
+    flush,
+    stats() {
+      return {
+        races: races.size,
+        dirty,
+        flushPending: flushing !== undefined,
+        writes,
+        lastFlushAt,
+      }
+    },
+    async dispose() {
+      if (timer !== undefined) {
+        clearTimeout(timer)
+        timer = undefined
+      }
+      await flush()
+    },
   }
 }
 

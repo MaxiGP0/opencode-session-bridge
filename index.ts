@@ -2,7 +2,7 @@ import { Plugin } from "@opencode/plugin"
 import { runGit } from "./src/git.ts"
 import { createLiveState, type LiveBackground, type LiveState } from "./src/live.ts"
 import { parseOptions } from "./src/options.ts"
-import { loadRaces, persistRaces } from "./src/races.ts"
+import { loadRaces, createRacePersistence } from "./src/races.ts"
 import {
   createRegistryPersistence,
   getProcessWorkerSessions,
@@ -91,6 +91,7 @@ export default Plugin.define({
     const workerSessions = await loadWorkerSessions(ctx)
     const worktrees = await loadWorktrees(ctx)
     const races = await loadRaces(ctx)
+    const racePersistence = createRacePersistence(ctx, races)
     const registry = createRegistryPersistence(ctx, ownedSessions, openSessions)
     const inFlightOpens = new Map<string, OpenInflight>()
     const inFlightSends = new Map<string, SendInflight>()
@@ -182,6 +183,7 @@ export default Plugin.define({
         workerSessions,
         worktrees,
         races,
+        racePersistence,
         git: runGit,
         refreshWorkers,
         persistWorkers: () => persistWorkerSessions(ctx, workerSessions),
@@ -205,7 +207,7 @@ export default Plugin.define({
       await Promise.allSettled([
         persistWorkerSessions(ctx, workerSessions),
         persistWorktrees(ctx, worktrees),
-        persistRaces(ctx, races),
+        racePersistence.dispose(),
       ])
       liveState.clear()
     }

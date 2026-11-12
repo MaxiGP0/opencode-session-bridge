@@ -1,4 +1,5 @@
 import path from "node:path"
+import { createHash } from "node:crypto"
 import { access, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import {
@@ -44,6 +45,7 @@ import {
   type CandidateTests,
   type CommandSummary,
   type RaceCleanup,
+  type RacePersistence,
   type RaceRecord,
   type RaceRegistry,
   type SnapshotMode,
@@ -82,6 +84,7 @@ export type OrchestrationDeps = {
   workerSessions: WorkerSessions
   worktrees: WorktreeRegistry
   races: RaceRegistry
+  racePersistence?: RacePersistence
   liveState?: LiveState
   registry?: RegistryPersistence
   git: GitRunner
@@ -130,6 +133,8 @@ export type WaitManyResult = {
 }
 
 const HARD_PATCH_LIMIT = 2_000_000
+/** Patches above this size always live in a temp file, never in storage. */
+const STORED_PATCH_LIMIT = 32_768
 
 function summarize(
   turn: TurnResult,
@@ -550,6 +555,21 @@ function gitOk(result: CommandResult): boolean {
   return result.exitCode === 0 && !result.error && !result.timedOut
 }
 
+async function rememberRaceRecord(
+  deps: OrchestrationDeps,
+  race: RaceRecord,
+): Promise<void> {
+  if (deps.racePersistence) {
+    deps.racePersistence.remember(race)
+    return
+  }
+  await rememberRaceRecord(deps, race)
+}
+
+async function flushRaces(deps: OrchestrationDeps): Promise<void> {
+  await deps.racePersistence?.flush()
+}
+
 async function resolveCommit(
   deps: OrchestrationDeps,
   directory: string,
@@ -786,6 +806,7 @@ async function snapshotCandidate(
     candidate.base = base
     candidate.patch = undefined
     candidate.patchFile = undefined
+    candidate.patchHash = undefined
     candidate.patchBytes = 0
     candidate.diffComplete = false
     candidate.snapshotSource = "none"
@@ -897,15 +918,18 @@ async function snapshotCandidate(
   const files = fallbackFiles.length ? fallbackFiles : parsePatchFiles(patch)
   const analysis = analyzeDiffs(files, patch, input.maxDiffBytes)
   const patchBytes = Buffer.byteLength(patch, "utf8")
+  const patchHash = patch
+    ? createHash("sha256").update(patch).digest("hex")
+    : undefined
   let patchFile: string | undefined
   let storedPatch: string | undefined = patch
-  if (patchBytes > HARD_PATCH_LIMIT) {
+  if (patchBytes > STORED_PATCH_LIMIT) {
     try {
       patchFile = await writePatchFile(race.raceID, candidate.candidateID, patch)
       storedPatch = undefined
     } catch {
       complete = false
-      storedPatch = patch.slice(0, HARD_PATCH_LIMIT)
+      storedPatch = patch.slice(0, STORED_PATCH_LIMIT)
     }
   }
 
@@ -915,6 +939,7 @@ async function snapshotCandidate(
   candidate.base = base
   candidate.patch = storedPatch
   candidate.patchFile = patchFile
+  candidate.patchHash = patchHash
   candidate.patchBytes = patchBytes
   candidate.diffComplete = complete
   candidate.snapshotSource = source
@@ -1253,7 +1278,7 @@ async function runRaceBody(
     ...(context.sessionID ? { ownerSessionID: context.sessionID } : {}),
     ownerDirectory: targetDirectory,
   }
-  await rememberRace(deps.ctx, deps.races, race)
+  await rememberRaceRecord(deps, race)
 
   if (context.sessionID) {
     await rememberOwnedSession(
@@ -1434,7 +1459,7 @@ async function runRaceBody(
       candidates.push(candidate)
     }
     race.candidates = candidates
-    await rememberRace(deps.ctx, deps.races, race)
+    await rememberRaceRecord(deps, race)
 
     await runWithConcurrency(candidates, deps.options.maxConcurrentSessions, async (candidate) => {
       if (!candidate.sessionID || candidate.state === "error") return
@@ -1464,7 +1489,7 @@ async function runRaceBody(
       candidate.background = result.background
     })
     race.candidates = candidates
-    await rememberRace(deps.ctx, deps.races, race)
+    await rememberRaceRecord(deps, race)
 
     for (const candidate of candidates) {
       if (!candidate.sessionID) continue
@@ -1556,7 +1581,7 @@ async function runRaceBody(
     const idle = candidates.filter((candidate) => candidate.state === "idle").length
     race.status = idle === candidates.length ? "completed" : idle > 0 ? "partial" : "failed"
     race.updatedAt = Date.now()
-    await rememberRace(deps.ctx, deps.races, race)
+    await rememberRaceRecord(deps, race)
 
     if (!input.keepWorktrees && race.worktrees.length) {
       const cleanupController = new AbortController()
@@ -1581,10 +1606,11 @@ async function runRaceBody(
           .map((entry) => entry.directory),
       }
       race.cleanup = cleanup
-      await rememberRace(deps.ctx, deps.races, race)
+      await rememberRaceRecord(deps, race)
     }
 
     const ranking = rankCandidates(candidates)
+    await flushRaces(deps)
     return { race, ranking }
   } catch (error) {
     for (const candidate of candidates) {
@@ -1602,7 +1628,7 @@ async function runRaceBody(
     race.worktrees = [...deps.worktrees.values()]
       .filter((record) => record.runID === race.raceID && record.state !== "removed")
       .map((record) => record.directory)
-    await rememberRace(deps.ctx, deps.races, race).catch(() => undefined)
+    await rememberRaceRecord(deps, race).catch(() => undefined)
     if (worktrees.length && !input.keepWorktrees) {
       const cleanup = new AbortController()
       await removeWorktrees(
@@ -1622,9 +1648,11 @@ async function runRaceBody(
       const idle = candidates.filter((candidate) => candidate.state === "idle").length
       race.status = idle === candidates.length ? "completed" : idle > 0 ? "partial" : "failed"
       race.updatedAt = Date.now()
-      await rememberRace(deps.ctx, deps.races, race).catch(() => undefined)
+      await rememberRaceRecord(deps, race).catch(() => undefined)
+      await flushRaces(deps)
       return { race, ranking: rankCandidates(candidates) }
     }
+    await flushRaces(deps)
     throw error
   }
 }
@@ -2325,8 +2353,9 @@ export async function raceCleanup(
   if (!race.worktrees.length) {
     const cleanup: RaceCleanup = { at: Date.now(), removed: [], orphans: [], kept: [] }
     race.cleanup = cleanup
-    await rememberRace(deps.ctx, deps.races, race)
+    await rememberRaceRecord(deps, race)
     await removeRacePatches(race.raceID)
+    await flushRaces(deps)
     return { race, cleanup }
   }
   const results = await removeWorktrees(
@@ -2348,10 +2377,11 @@ export async function raceCleanup(
     kept: results.filter((entry) => !entry.removed && !entry.orphan).map((entry) => entry.directory),
   }
   race.cleanup = cleanup
-  await rememberRace(deps.ctx, deps.races, race)
+  await rememberRaceRecord(deps, race)
   if (!cleanup.orphans.length && !(cleanup.kept?.length ?? 0)) {
     await removeRacePatches(race.raceID)
   }
+  await flushRaces(deps)
   return { race, cleanup }
 }
 

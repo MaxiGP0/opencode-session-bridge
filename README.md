@@ -305,6 +305,13 @@ const run = await tools.sessions.bestOf({
 - `bestOf` is a heuristic recommendation, not an absolute winner. If no
   candidate has passing, trusted tests, `recommended` is `null`. Candidate
   output also includes bounded `cost`/`tokens` when the host reports them.
+- Race persistence is coalesced (300 ms debounce) and flushed before a race or
+  cleanup returns. The stored prompt is a 2 000-character preview plus
+  `promptHash`/`promptTruncated`. Patches larger than 32 KB are always written to
+  `patchFile`; storage keeps `patchFile`, `patchHash`, `patchBytes`, and file
+  summaries instead of the full patch or `files[].patch`. `applyCandidate`
+  reads the patch file. Worktree registry writes are batched per
+  create/remove operation.
 
 ### Apply
 

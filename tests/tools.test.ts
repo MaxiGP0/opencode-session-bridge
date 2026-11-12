@@ -147,6 +147,7 @@ function makeHarness(options: HarnessOptions = {}) {
   const permissions = new Map<string, PermissionLike[]>()
   const storage = new Map<string, unknown>()
   const storageGets = new Map<string, number>()
+  const storageSets = new Map<string, number>()
   if (options.initialRaces) storage.set("session-bridge:races", options.initialRaces)
   if (options.initialWorktrees) storage.set("session-bridge:worktrees", options.initialWorktrees)
   if (options.initialWorkers) storage.set("session-bridge:workers", options.initialWorkers)
@@ -242,6 +243,7 @@ function makeHarness(options: HarnessOptions = {}) {
         return storage.get(key)
       },
       set: async (key: string, value: unknown) => {
+        storageSets.set(key, (storageSets.get(key) ?? 0) + 1)
         storage.set(key, value)
       },
       remove: async (key: string) => {
@@ -555,6 +557,7 @@ function makeHarness(options: HarnessOptions = {}) {
     permissions,
     storage,
     storageGets,
+    storageSets,
     promptCalls,
     admissions,
     updateCalls,
@@ -2800,6 +2803,94 @@ describe("orchestration tools", () => {
       expect((output.candidates as Array<Record<string, unknown>>).some((entry) =>
         entry.state === "timeout" || entry.state === "aborted",
       )).toBe(true)
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("P1-9: coalesces race writes and keeps large patches and prompts out of storage", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const bigLine = "x".repeat(70_000)
+      const prompt = "p".repeat(5_000)
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        realWorktrees: true,
+        options: {
+          allowSnapshotCommits: true,
+          maxRaceCandidates: 2,
+          gitTimeoutMs: 30_000,
+        },
+        onPrompt: async ({ directory }) => {
+          await writeFile(path.join(directory, "big.txt"), `${bigLine}\n`, "utf8")
+        },
+      })
+      const result = await harness.executeRaw("race", {
+        prompt,
+        count: 2,
+        mode: "worktrees",
+        base: repo.base,
+        keepWorktrees: false,
+        timeoutMs: 30_000,
+      })
+      const output = result.output as Record<string, unknown>
+      const raceID = String(output.raceID)
+      const writes = harness.state.storageSets.get("session-bridge:races") ?? 0
+      expect(writes).toBeGreaterThanOrEqual(1)
+      expect(writes).toBeLessThanOrEqual(4)
+
+      const stored = (harness.state.storage.get("session-bridge:races") as Array<
+        Record<string, unknown>
+      >).find((race) => race.raceID === raceID)!
+      expect(String(stored.prompt).length).toBeLessThanOrEqual(2_001)
+      expect(stored.promptHash).toMatch(/^[0-9a-f]{64}$/)
+      expect(stored.promptTruncated).toBe(true)
+      const storedCandidates = stored.candidates as Array<Record<string, unknown>>
+      expect(storedCandidates).toHaveLength(2)
+      for (const candidate of storedCandidates) {
+        expect(candidate.patchFile).toEqual(expect.any(String))
+        expect(candidate.patch).toBeUndefined()
+        expect(candidate.patchHash).toMatch(/^[0-9a-f]{64}$/)
+        for (const file of candidate.files as Array<Record<string, unknown>>) {
+          expect(file.patch).toBeUndefined()
+        }
+      }
+      expect(JSON.stringify(stored).length).toBeLessThan(200_000)
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("P1-9: batches worktree registry writes", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        options: {
+          allowWorktreeManagement: true,
+          maxWorktrees: 4,
+          gitTimeoutMs: 30_000,
+        },
+      })
+      const created = await harness.executeRaw("worktrees", {
+        action: "create",
+        count: 3,
+        base: repo.base,
+        runID: "run_batch",
+      })
+      expect(
+        (created.output as Record<string, unknown>).worktrees as unknown[],
+      ).toHaveLength(3)
+      expect(harness.state.storageSets.get("session-bridge:worktrees") ?? 0).toBeLessThanOrEqual(2)
+      const directories = (
+        (created.output as Record<string, unknown>).worktrees as Array<{ directory: string }>
+      ).map((record) => record.directory)
+      await harness.executeRaw("worktrees", {
+        action: "remove",
+        directories,
+        confirm: true,
+        force: true,
+      })
     } finally {
       await repo.cleanup()
     }

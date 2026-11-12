@@ -164,11 +164,18 @@ export async function rememberWorktree(
   records: WorktreeRegistry,
   record: WorktreeRecord,
 ): Promise<void> {
+  rememberWorktreeInMemory(records, record)
+  await persistWorktrees(ctx, records)
+}
+
+function rememberWorktreeInMemory(
+  records: WorktreeRegistry,
+  record: WorktreeRecord,
+): void {
   records.set(recordKey(record.directory), record)
   processWorktrees.set(recordKey(record.directory), record)
   pruneWorktrees(records)
   pruneWorktrees(processWorktrees)
-  await persistWorktrees(ctx, records)
 }
 
 function projectIDOf(ctx: PluginContext): string {
@@ -301,7 +308,7 @@ export async function createWorktrees(
       const branch = await branchOf(deps, directory, signal)
       if (branch) record.branch = branch
       created.push(record)
-      await rememberWorktree(deps.ctx, deps.worktrees, record)
+      rememberWorktreeInMemory(deps.worktrees, record)
     } catch (error) {
       failures.push(String((error as { message?: string })?.message ?? error))
     }
@@ -318,6 +325,7 @@ export async function createWorktrees(
     }
   })
   await Promise.all(workers)
+  await persistWorktrees(deps.ctx, deps.worktrees)
 
   if (failures.length) {
     // Roll back only what this run created. The host may leave a directory
@@ -330,13 +338,14 @@ export async function createWorktrees(
           { signal: signal ?? new AbortController().signal },
         )
         record.state = "removed"
-        await rememberWorktree(deps.ctx, deps.worktrees, record)
+        rememberWorktreeInMemory(deps.worktrees, record)
       } catch {
         record.state = "orphan"
         orphans.push(record.directory)
-        await rememberWorktree(deps.ctx, deps.worktrees, record)
+        rememberWorktreeInMemory(deps.worktrees, record)
       }
     }
+    await persistWorktrees(deps.ctx, deps.worktrees)
     throw new WorktreeCapabilityError(
       `worktree creation failed after ${created.length}/${count}: ${failures[0]}${
         orphans.length ? `; orphans: ${orphans.join(", ")}` : ""
@@ -351,12 +360,17 @@ export async function createWorktrees(
         { projectID },
         { signal: signal ?? new AbortController().signal },
       )
+      let changed = false
       for (const record of created) {
         const found = inventory.find((entry) => sameDirectory(entry.directory, record.directory))
         const strategy = strategyFrom(found?.strategy)
-        if (strategy) record.strategy = strategy
-        await rememberWorktree(deps.ctx, deps.worktrees, record)
+        if (strategy && strategy !== record.strategy) {
+          record.strategy = strategy
+          changed = true
+        }
+        rememberWorktreeInMemory(deps.worktrees, record)
       }
+      if (changed) await persistWorktrees(deps.ctx, deps.worktrees)
     } catch {
       // Strategy detection is best effort.
     }
@@ -527,13 +541,13 @@ export async function removeWorktrees(
         { signal: signal ?? new AbortController().signal },
       )
       record.state = "removed"
-      await rememberWorktree(deps.ctx, deps.worktrees, record)
+      rememberWorktreeInMemory(deps.worktrees, record)
       results.push({ directory, removed: true, dirty: dirty.dirty, archivedSessions })
     } catch (error) {
       const message = String((error as { message?: string })?.message ?? error)
       const forceRequired = /force|dirty|modified|untracked/i.test(message)
       if (forceRequired) record.state = "orphan"
-      await rememberWorktree(deps.ctx, deps.worktrees, record)
+      rememberWorktreeInMemory(deps.worktrees, record)
       results.push({
         directory,
         removed: false,
@@ -543,6 +557,7 @@ export async function removeWorktrees(
       })
     }
   }
+  await persistWorktrees(deps.ctx, deps.worktrees)
   return results
 }
 

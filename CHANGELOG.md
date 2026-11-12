@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Performance
 
+- P1-9: race writes are coalesced and flushed before returning. Stored prompts
+  are a 2 000-character preview plus a SHA-256 hash, large patches (>32 KB) live
+  only in `patchFile` with `patchHash`/`patchBytes` and no `files[].patch` in
+  storage, and worktree create/remove persist once instead of per record.
+
 - P1-8: worker storage is no longer read on every tool call. Refreshes are
   throttled to one per 2 seconds, skipped for known orchestrator sessions, and
   same-process worker registrations are visible immediately. `diagnostics`

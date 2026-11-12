@@ -315,6 +315,13 @@ const run = await tools.sessions.bestOf({
   candidato tiene tests pasados y confiables, `recommended` es `null`. La salida
   de cada candidato también incluye `cost`/`tokens` acotados cuando el host los
   reporta.
+- La persistencia de races se coalesce (debounce 300 ms) y se vuelca antes de
+  devolver una race o su limpieza. El prompt guardado es un preview de 2 000
+  caracteres más `promptHash`/`promptTruncated`. Los parches mayores de 32 KB
+  siempre van a `patchFile`; el storage guarda `patchFile`, `patchHash`,
+  `patchBytes` y resúmenes de archivos, no el parche completo ni
+  `files[].patch`. `applyCandidate` lee el patch file. Las escrituras del
+  registro de worktrees se agrupan por operación de create/remove.
 
 ### Apply
 
