@@ -263,6 +263,10 @@ const run = await tools.sessions.bestOf({
   such a candidate is never recommended.
 - E2E commands use `execFile` without a shell, an allowlisted environment,
   redacted output, timeouts, bounded buffers, and Windows process-tree kill.
+  `maxBuffer`/`maxTestOutputChars` truncate the displayed stdout/stderr and set
+  `stdoutTruncated`/`stderrTruncated`; they do not kill a passing test. Output is
+  decoded as UTF-8 across chunk boundaries. On POSIX the child runs in its own
+  process group so timeout/abort also stops servers it spawned.
   Tests run serially per candidate. If a command needs secrets or services that
   do not exist locally, the result is `tests: { skipped: true, reason }`; the
   plugin never claims the E2E passed.

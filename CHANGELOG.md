@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- P1-3: `runCommand` no longer kills a process when stdout/stderr exceed
+  `maxBuffer`; it truncates the displayed output and sets the truncation flags.
+  Callers can opt into `killOnOverflow: true`. Output is decoded as UTF-8 across
+  chunk boundaries and POSIX children run in their own process group so timeout
+  and abort also terminate grandchildren.
+
 - P1-2: `wait` no longer returns `idle` while `session.get` reports `busy` and
   the newest visible user message predates `session.time.busy`. It waits for the
   next turn and reports `anchorStale`/`waitingFor: "next-turn"`. Explicit

@@ -272,10 +272,14 @@ const run = await tools.sessions.bestOf({
   `skippedTests` y `verification: "flagged"`. Con `allowTestChanges: false` ese
   candidato nunca se recomienda.
 - Los comandos E2E usan `execFile` sin shell, entorno allowlist, salida
-  redactada, timeout, buffer acotado y kill del árbol en Windows. Los tests se
-  ejecutan en serie por candidato. Si un comando necesita secretos o servicios
-  que no existen localmente: `tests: { skipped: true, reason }`; el plugin nunca
-  afirma que el E2E pasó.
+  redactada, timeout, buffer acotado y kill del árbol en Windows.
+  `maxBuffer`/`maxTestOutputChars` truncan el stdout/stderr mostrado y activan
+  `stdoutTruncated`/`stderrTruncated`; no matan un test que pasa. La salida se
+  decodifica como UTF-8 entre chunks. En POSIX el hijo corre en su propio grupo
+  de procesos, así que timeout/abort también detiene servidores que haya
+  lanzado. Los tests se ejecutan en serie por candidato. Si un comando necesita
+  secretos o servicios que no existen localmente: `tests: { skipped: true,
+  reason }`; el plugin nunca afirma que el E2E pasó.
 - `same-directory` sirve para comparar respuestas, no para apply seguro: los
   candidatos comparten un solo árbol, así que los snapshots se marcan
   incompletos y `applyStrategy` es `none`.

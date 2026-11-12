@@ -67,6 +67,54 @@ describe("environment and redaction", () => {
 })
 
 describe("runCommand", () => {
+  it("truncates overflowing output without killing the process", async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "session-bridge-cmd-"))
+    try {
+      const started = Date.now()
+      const result = await runCommand(
+        'node -e "process.stdout.write(\'x\'.repeat(200000)); setTimeout(() => process.exit(0), 300)"',
+        { cwd, timeoutMs: 10_000, maxBuffer: 1_000 },
+      )
+      expect(result.exitCode).toBe(0)
+      expect(result.killed).toBe(false)
+      expect(result.stdoutTruncated).toBe(true)
+      expect(result.stdout.length).toBeLessThanOrEqual(1_000)
+      expect(Date.now() - started).toBeGreaterThanOrEqual(250)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it("decodes UTF-8 split across chunks without replacement characters", async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "session-bridge-cmd-"))
+    try {
+      const result = await runCommand(
+        'node -e "process.stdout.write(Buffer.from([0xe2])); setTimeout(() => process.stdout.write(Buffer.from([0x82,0xac])), 20)"',
+        { cwd, timeoutMs: 10_000, maxBuffer: 1_000 },
+      )
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout).toBe("€")
+      expect(result.stdout).not.toContain("\uFFFD")
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it("can still kill on overflow when the caller opts in", async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "session-bridge-cmd-"))
+    try {
+      const result = await runCommand(
+        'node -e "process.stdout.write(\'x\'.repeat(200000)); setTimeout(() => process.exit(0), 5000)"',
+        { cwd, timeoutMs: 10_000, maxBuffer: 1_000, killOnOverflow: true },
+      )
+      expect(result.killed).toBe(true)
+      expect(result.stdoutTruncated).toBe(true)
+      expect(result.durationMs).toBeLessThan(4_000)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
   it("runs without a shell and caps output", async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "session-bridge-cmd-"))
     try {
@@ -90,6 +138,26 @@ describe("runCommand", () => {
       await rm(cwd, { recursive: true, force: true })
     }
   })
+
+  it.skipIf(process.platform === "win32")(
+    "kills the POSIX process group on timeout",
+    async () => {
+      const cwd = await mkdtemp(path.join(tmpdir(), "session-bridge-cmd-"))
+      try {
+        const result = await runCommand(
+          'node -e "const {spawn}=require(\'child_process\'); const c=spawn(process.execPath,[\'-e\',\'setTimeout(()=>{},30000)\']); require(\'fs\').writeFileSync(\'child.pid\',String(c.pid)); setTimeout(()=>{},30000)"',
+          { cwd, timeoutMs: 300, maxBuffer: 10_000 },
+        )
+        expect(result.timedOut).toBe(true)
+        const pid = Number((await readFile(path.join(cwd, "child.pid"), "utf8")).trim())
+        expect(Number.isInteger(pid)).toBe(true)
+        await new Promise((resolve) => setTimeout(resolve, 200))
+        expect(() => process.kill(pid, 0)).toThrow()
+      } finally {
+        await rm(cwd, { recursive: true, force: true })
+      }
+    },
+  )
 
   it("times out and kills the process", async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "session-bridge-cmd-"))

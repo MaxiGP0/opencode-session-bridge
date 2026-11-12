@@ -79,6 +79,12 @@ export type RunCommandOptions = {
   env?: Record<string, string>
   signal?: AbortSignal
   redact?: boolean
+  /**
+   * Kill the process when its output exceeds `maxBuffer`. Defaults to false:
+   * the buffer is a display limit, not an execution limit, so verbose tests
+   * that pass are not reported as failures.
+   */
+  killOnOverflow?: boolean
 }
 
 export type ParsedCommand =
@@ -204,7 +210,7 @@ export function redactSecrets(text: string, env: Record<string, string> = {}): s
   return result
 }
 
-function killTree(pid: number | undefined): void {
+function killTree(pid: number | undefined, group = !WINDOWS): void {
   if (!pid) return
   if (WINDOWS) {
     try {
@@ -221,9 +227,15 @@ function killTree(pid: number | undefined): void {
     }
   }
   try {
-    process.kill(pid, "SIGKILL")
+    // POSIX children are started in their own process group (detached), so a
+    // negative PID kills the child and any server/subagent it spawned.
+    process.kill(group ? -pid : pid, "SIGKILL")
   } catch {
-    // The process may already be gone.
+    try {
+      process.kill(pid, "SIGKILL")
+    } catch {
+      // The process may already be gone.
+    }
   }
 }
 
@@ -255,7 +267,12 @@ async function spawnProcess(
       env,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
+      // A POSIX process group lets timeout/abort kill grandchildren too. On
+      // Windows `taskkill /T` already walks the tree.
+      detached: !WINDOWS,
     })
+    child.stdout?.setEncoding("utf8")
+    child.stderr?.setEncoding("utf8")
 
     const finish = (exitCode: number | null, signal: NodeJS.Signals | null) => {
       if (settled) return
@@ -286,7 +303,14 @@ async function spawnProcess(
     const kill = () => {
       if (settled) return
       killed = true
-      killTree(child.pid)
+      killTree(child.pid, !WINDOWS)
+    }
+
+    let overflowKilled = false
+    const killForOverflow = () => {
+      if (!options.killOnOverflow || overflowKilled) return
+      overflowKilled = true
+      kill()
     }
 
     const onAbort = () => kill()
@@ -308,30 +332,36 @@ async function spawnProcess(
     })
 
     child.stdout?.on("data", (chunk: Buffer | string) => {
+      const value = typeof chunk === "string" ? chunk : chunk.toString("utf8")
       if (stdout.length >= maxBuffer) {
         stdoutTruncated = true
-        kill()
+        killForOverflow()
         return
       }
-      stdout += chunk.toString()
-      if (stdout.length > maxBuffer) {
-        stdout = stdout.slice(0, maxBuffer)
+      const remaining = maxBuffer - stdout.length
+      if (value.length > remaining) {
+        stdout += value.slice(0, remaining)
         stdoutTruncated = true
-        kill()
+        killForOverflow()
+        return
       }
+      stdout += value
     })
     child.stderr?.on("data", (chunk: Buffer | string) => {
+      const value = typeof chunk === "string" ? chunk : chunk.toString("utf8")
       if (stderr.length >= maxBuffer) {
         stderrTruncated = true
-        kill()
+        killForOverflow()
         return
       }
-      stderr += chunk.toString()
-      if (stderr.length > maxBuffer) {
-        stderr = stderr.slice(0, maxBuffer)
+      const remaining = maxBuffer - stderr.length
+      if (value.length > remaining) {
+        stderr += value.slice(0, remaining)
         stderrTruncated = true
-        kill()
+        killForOverflow()
+        return
       }
+      stderr += value
     })
 
     child.on("close", (code, signal) => finish(code, signal))
