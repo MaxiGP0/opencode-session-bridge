@@ -742,6 +742,12 @@ modelo por defecto. Las variantes usan `provider/model#variant`.
   que una sesión en segundo plano ejecute shell/edición sin revisión humana. Es
   una superficie real de prompt injection: revisa cada regla y prefiere
   `ask`/`deny`.
+- Las sesiones worker reciben un preset de denegaciones después de todas las
+  reglas del llamador: la última regla coincidente para `session_bridge.*`,
+  `session_bridge.waitAny`, patrones peligrosos de git y `external_directory`
+  siempre es `deny`. Los `permissions` del llamador son reglas adicionales de
+  `deny`/`ask` y nunca amplían el preset del worker, ni siquiera con
+  `allowPermissionRules: true`.
 - `decision: "always"` guarda un permiso y requiere
   `allowPersistentPermissions: true`. `once` también es una aprobación; no es
   una acción inocua.

@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- P0-1: worker permission rules now append the deny preset after every
+  caller-provided rule (OpenCode uses the last matching rule), filter caller
+  `allow` rules for protected actions/resources, and deny
+  `session_bridge.waitAny`/`waitAll`. Caller permissions can only add
+  `deny`/`ask`; they can no longer widen a worker preset.
+
 ## [3.0.3] - 2026-11-10
 
 ### Fixed

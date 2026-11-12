@@ -727,6 +727,11 @@ variants use `provider/model#variant`.
   Allowing arbitrary actions lets a background session execute shell/edit
   actions without human review. This is a real prompt-injection surface: review
   every rule and prefer `ask`/`deny`.
+- Worker sessions receive a fixed deny preset after every caller rule: the last
+  matching rule for `session_bridge.*`, `session_bridge.waitAny`, dangerous git
+  shell patterns, and `external_directory` is always `deny`. Caller
+  `permissions` act as additional `deny`/`ask` rules and can never widen the
+  worker preset, even with `allowPermissionRules: true`.
 - `decision: "always"` saves a permission and requires
   `allowPersistentPermissions: true`. `once` is still an approval; it is not an
   innocuous action.

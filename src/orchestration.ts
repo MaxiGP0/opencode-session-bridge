@@ -949,52 +949,73 @@ export type WorkerPermissionRule = {
   effect: "allow" | "deny" | "ask"
 }
 
+const WORKER_PROTECTED_ACTIONS = [
+  "session_bridge.open",
+  "session_bridge.send",
+  "session_bridge.reply",
+  "session_bridge.interrupt",
+  "session_bridge.update",
+  "session_bridge.remove",
+  "session_bridge.list",
+  "session_bridge.read",
+  "session_bridge.status",
+  "session_bridge.wait",
+  "session_bridge.waitAny",
+  "session_bridge.waitAll",
+  "session_bridge.permissions",
+  "session_bridge.language",
+  "session_bridge.compact",
+  "session_bridge.diagnostics",
+  "session_bridge.worktrees",
+  "session_bridge.race",
+  "session_bridge.bestOf",
+  "session_bridge.applyCandidate",
+  "session_bridge.apply",
+  "session_bridge.push",
+  "session_bridge.raceStatus",
+  "session_bridge.raceList",
+  "session_bridge.raceCleanup",
+]
+
+const WORKER_PROTECTED_RESOURCES = [
+  "*git push*",
+  "*git worktree*",
+  "*git checkout*",
+  "*git switch*",
+  "*--force*",
+]
+
+/** Caller-provided allow rules must never widen the worker preset. */
+function isProtectedAllowRule(rule: WorkerPermissionRule): boolean {
+  if (rule.effect !== "allow") return false
+  if (rule.action === "external_directory") return true
+  if (rule.action.startsWith("session_bridge.")) return true
+  return WORKER_PROTECTED_RESOURCES.some((pattern) => {
+    const escaped = pattern
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*/g, ".*")
+    return new RegExp(`^${escaped}$`, "i").test(rule.resource)
+  })
+}
+
 export function workerPermissionRules(
   options: BridgeOptions,
   inputPermissions?: WorkerPermissionRule[],
 ): WorkerPermissionRule[] {
   const denials: WorkerPermissionRule[] = []
-  const actions = [
-    "session_bridge.open",
-    "session_bridge.send",
-    "session_bridge.reply",
-    "session_bridge.interrupt",
-    "session_bridge.update",
-    "session_bridge.remove",
-    "session_bridge.list",
-    "session_bridge.read",
-    "session_bridge.status",
-    "session_bridge.wait",
-    "session_bridge.permissions",
-    "session_bridge.language",
-    "session_bridge.compact",
-    "session_bridge.diagnostics",
-    "session_bridge.worktrees",
-    "session_bridge.race",
-    "session_bridge.bestOf",
-    "session_bridge.applyCandidate",
-    "session_bridge.apply",
-    "session_bridge.push",
-    "session_bridge.raceStatus",
-    "session_bridge.raceList",
-    "session_bridge.raceCleanup",
-  ]
-  for (const action of actions) denials.push({ action, resource: "*", effect: "deny" })
-  for (const resource of [
-    "*git push*",
-    "*git worktree*",
-    "*git checkout*",
-    "*git switch*",
-    "*--force*",
-  ]) {
+  for (const action of WORKER_PROTECTED_ACTIONS) {
+    denials.push({ action, resource: "*", effect: "deny" })
+  }
+  for (const resource of WORKER_PROTECTED_RESOURCES) {
     denials.push({ action: "shell", resource, effect: "deny" })
   }
   denials.push({ action: "external_directory", resource: "*", effect: "deny" })
-  const extra = inputPermissions ?? []
-  if (options.allowPermissionRules) {
-    return [...denials, ...extra]
-  }
-  return [...denials, ...extra.filter((rule) => rule.effect !== "allow")]
+  const extra = (inputPermissions ?? []).filter(
+    (rule) => options.allowPermissionRules || rule.effect !== "allow",
+  )
+  // OpenCode evaluates rules in order and the last matching rule wins.
+  // Denials must therefore be appended after every caller rule.
+  return [...extra.filter((rule) => !isProtectedAllowRule(rule)), ...denials]
 }
 
 async function runWithConcurrency<T>(
