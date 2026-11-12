@@ -1470,7 +1470,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
                     sessionID: createdSessionID,
                     text: data.prompt,
                     delivery: data.delivery,
-                    id: promptMessageID(data.messageID, `open:${targetDirectory}`),
+                    id: promptMessageID(data.messageID, `open:${normalizeDirectory(targetDirectory)}`),
                   },
                   { signal: request },
                 ),

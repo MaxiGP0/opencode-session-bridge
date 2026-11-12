@@ -29,6 +29,21 @@ describe("directory helpers", () => {
     }
   })
 
+  it("P1-5: removes trailing separators before comparing directories", () => {
+    if (process.platform === "win32") {
+      expect(sameDirectory("C:\\foo", "C:\\foo\\")).toBe(true)
+      expect(normalizeDirectory("C:\\Foo\\")).toBe("c:\\foo")
+      expect(normalizeDirectory("C:\\")).toBe("c:\\")
+    } else {
+      expect(sameDirectory("/foo", "/foo/")).toBe(true)
+      expect(normalizeDirectory("/foo/")).toBe("/foo")
+      expect(normalizeDirectory("/")).toBe("/")
+    }
+    expect(normalizeDirectory("C:/foo/../foo/")).toBe(
+      process.platform === "win32" ? "c:\\foo" : "C:/foo",
+    )
+  })
+
   it("detects containment and parent segments", () => {
     const root = process.platform === "win32" ? "C:\\repo" : "/repo"
     const child = path.join(root, "src")

@@ -106,6 +106,16 @@ describe("session registry", () => {
     expect(loaded.has("msg_other")).toBe(false)
   })
 
+  it("P1-5: shares the storage namespace across equivalent directory spellings", async () => {
+    const shared = new Map<string, unknown>()
+    const writer = makeContext("C:/repo/", shared)
+    const reader = makeContext("C:/repo", shared)
+    const sessions: OwnedSessions = new Map()
+    await rememberOwnedSession(writer.ctx, sessions, "ses_trailing", "C:/repo/")
+    const loaded = await loadOwnedSessions(reader.ctx)
+    expect(loaded.has("ses_trailing")).toBe(true)
+  })
+
   it("P0-4: keeps the worker role beyond the old TTL and touches it cheaply", async () => {
     const { ctx } = makeContext("C:/repo")
     const workers: WorkerSessions = new Map()

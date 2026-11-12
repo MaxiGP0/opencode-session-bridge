@@ -1,4 +1,4 @@
-import { sameDirectory, resolveGitDir } from "./directories.ts"
+import { normalizeDirectory, sameDirectory, resolveGitDir } from "./directories.ts"
 import { normalizeWorktreeLineEndings, runGit, type GitRunner } from "./git.ts"
 import type { LiveState } from "./live.ts"
 import type { BridgeOptions } from "./options.ts"
@@ -90,7 +90,7 @@ function pruneWorktrees(records: WorktreeRegistry, now = Date.now()): void {
 }
 
 function recordKey(directory: string): string {
-  return directory
+  return normalizeDirectory(directory)
 }
 
 export function worktreeFor(

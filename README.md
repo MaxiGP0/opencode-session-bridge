@@ -211,6 +211,11 @@ pushed automatically.
 - `open({ messageID })` includes the target directory in the mapping and the
   in-flight key. The same `messageID` in another directory is a conflict, not a
   silent reuse.
+- Directory identity ignores a trailing separator and, on Windows, case. Storage
+  namespaces, open mappings, ownership, worktree lookups, and derived prompt IDs
+  all use the normalized form, so `C:\foo`, `C:\foo\`, and `c:/FOO` identify the
+  same directory on Windows (and `/foo`/`/foo/` on POSIX). Symlinks are still
+  resolved only by `validateTargetDirectory` for security checks.
 
 ### Worktrees
 

@@ -1,4 +1,4 @@
-import { sameDirectory } from "./directories.ts"
+import { normalizeDirectory, sameDirectory } from "./directories.ts"
 import type { PluginContext } from "./types.ts"
 
 const OWNED_KEY = "session-bridge:owned-sessions"
@@ -79,9 +79,10 @@ function directoryOf(ctx: PluginContext): string | undefined {
  * namespace per directory. It is not a security primitive.
  */
 function directoryNamespace(directory: string): string {
+  const normalized = normalizeDirectory(directory)
   let hash = 0x811c9dc5
-  for (let index = 0; index < directory.length; index++) {
-    hash ^= directory.charCodeAt(index)
+  for (let index = 0; index < normalized.length; index++) {
+    hash ^= normalized.charCodeAt(index)
     hash = Math.imul(hash, 0x01000193)
   }
   return (hash >>> 0).toString(16).padStart(8, "0")
@@ -141,7 +142,7 @@ function ownedEntryFromRecord(
     !ownerSessionID &&
     !runID &&
     currentDirectory &&
-    legacyDirectory !== currentDirectory
+    !sameDirectory(legacyDirectory, currentDirectory)
   ) {
     return undefined
   }
@@ -501,7 +502,7 @@ export async function loadOpenSessions(ctx: PluginContext): Promise<OpenSessionM
         !ownerSessionID &&
         !runID &&
         directory &&
-        legacyDirectory !== directory
+        !sameDirectory(legacyDirectory, directory)
       ) {
         continue
       }

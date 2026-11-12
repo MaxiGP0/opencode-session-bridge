@@ -17,7 +17,17 @@ export function stripLongPathPrefix(value: string): string {
 
 /** Normalizes a directory for identity comparisons, not for filesystem use. */
 export function normalizeDirectory(value: string): string {
-  const normalized = path.normalize(stripLongPathPrefix(value.trim()))
+  let normalized = path.normalize(stripLongPathPrefix(value.trim()))
+  const root = path.parse(normalized).root
+  // `path.normalize` keeps a trailing separator (except at the root). Two
+  // spellings of the same directory must share ownership, mappings, and the
+  // storage namespace.
+  while (
+    normalized.length > root.length &&
+    (normalized.endsWith(path.sep) || normalized.endsWith("/"))
+  ) {
+    normalized = normalized.slice(0, -1)
+  }
   return WINDOWS ? normalized.toLowerCase() : normalized
 }
 

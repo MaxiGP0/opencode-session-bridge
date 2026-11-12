@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- P1-5: directory identity drops trailing separators (except filesystem roots)
+  and lowercases on Windows. The storage namespace, open mappings, legacy
+  comparisons, worktree registry keys, and derived `msg_` prompt IDs now use the
+  normalized form.
+
 - P1-4: `parseCommand` is platform-aware on Windows: backslashes are literal
   path separators, so quoted `C:\Program Files\...` paths survive, and `%`/`!`
   are rejected instead of being silently expanded by `cmd`. POSIX escaping is

@@ -220,6 +220,12 @@ pushea automáticamente.
 - `open({ messageID })` incluye el directorio target en el mapping y en la clave
   in-flight. El mismo `messageID` en otro directorio es un conflicto, no una
   reutilización silenciosa.
+- La identidad de directorio ignora un separador final y, en Windows, el case.
+  Los namespaces de storage, mappings de open, ownership, búsquedas de worktrees
+  y los IDs de prompt derivados usan la forma normalizada, así que `C:\foo`,
+  `C:\foo\` y `c:/FOO` identifican el mismo directorio en Windows (y
+  `/foo`/`/foo/` en POSIX). Los symlinks solo se resuelven en
+  `validateTargetDirectory` para las comprobaciones de seguridad.
 
 ### Worktrees
 
