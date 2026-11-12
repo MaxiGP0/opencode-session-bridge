@@ -24,6 +24,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- P1-11: `jsonSafe` now tracks arrays as well as objects, so a self-referencing
+  array becomes `"[Circular]"` instead of overflowing the stack. Sibling arrays
+  and repeated non-circular references are preserved.
+
 - P1-7: `applyCandidate` checks idempotency before requiring a clean target.
   Retrying an already applied candidate, including one applied with
   `commit: false`, returns `alreadyApplied: true`/`applied: false` with
