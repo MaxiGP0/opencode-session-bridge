@@ -312,6 +312,12 @@ const run = await tools.sessions.bestOf({
   summaries instead of the full patch or `files[].patch`. `applyCandidate`
   reads the patch file. Worktree registry writes are batched per
   create/remove operation.
+- Worktree `list` checks dirty state/branch with bounded concurrency (2–4,
+  derived from `maxConcurrentSessions`), and `remove` processes independent
+  directories in parallel while preserving result order. Race candidates are
+  created with `maxConcurrentSessions`; snapshots for worktree candidates use
+  the same bound, while tests stay serial. In `same-directory` mode snapshots
+  remain serial because they share one git index.
 
 ### Apply
 

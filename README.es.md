@@ -322,6 +322,13 @@ const run = await tools.sessions.bestOf({
   `patchBytes` y resúmenes de archivos, no el parche completo ni
   `files[].patch`. `applyCandidate` lee el patch file. Las escrituras del
   registro de worktrees se agrupan por operación de create/remove.
+- `worktrees` `list` consulta dirty/branch con concurrencia acotada (2–4,
+  derivada de `maxConcurrentSessions`) y `remove` procesa directorios
+  independientes en paralelo preservando el orden. Los candidatos de race se
+  crean con `maxConcurrentSessions`; los snapshots de candidatos en worktrees
+  usan el mismo límite, mientras los tests siguen siendo seriales. En
+  `same-directory` los snapshots siguen siendo seriales porque comparten un
+  único índice git.
 
 ### Apply
 

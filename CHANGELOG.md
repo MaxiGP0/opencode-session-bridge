@@ -8,6 +8,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Performance
 
+- P1-10: worktree list/remove and race candidate creation/snapshots use bounded
+  concurrency derived from `maxConcurrentSessions` (2–4). Result order is
+  preserved and E2E tests remain serial.
+
 - P1-9: race writes are coalesced and flushed before returning. Stored prompts
   are a 2 000-character preview plus a SHA-256 hash, large patches (>32 KB) live
   only in `patchFile` with `patchHash`/`patchBytes` and no `files[].patch` in

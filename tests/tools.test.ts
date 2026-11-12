@@ -116,6 +116,8 @@ type HarnessOptions = {
   vcsFiles?: unknown[]
   repoDirectory?: string
   realWorktrees?: boolean
+  vcsStatusDelayMs?: number
+  worktreeRemoveDelayMs?: number
   onPrompt?: (input: {
     sessionID: string
     text: string
@@ -168,6 +170,12 @@ function makeHarness(options: HarnessOptions = {}) {
   let modelDefaultCalls = 0
   let promptCounter = 0
   let now = 1_000
+  let vcsStatusActive = 0
+  let vcsStatusMaxActive = 0
+  let worktreeRemoveActive = 0
+  let worktreeRemoveMaxActive = 0
+  let createActive = 0
+  let createMaxActive = 0
   const hooks = new Map<string, (input: unknown) => void | Promise<void>>()
   const eventItems: SessionEventLike[] = []
   let eventWake: (() => void) | undefined
@@ -260,8 +268,12 @@ function makeHarness(options: HarnessOptions = {}) {
     vcs: {
       status: async (input: { location?: { directory?: string } }) => {
         const directory = input?.location?.directory ?? repoDirectory
+        vcsStatusActive++
+        vcsStatusMaxActive = Math.max(vcsStatusMaxActive, vcsStatusActive)
+        if (options.vcsStatusDelayMs) await delay(options.vcsStatusDelayMs)
         if (options.realWorktrees && directory) {
           const result = await runGit(["status", "--porcelain=v1"], directory)
+          vcsStatusActive--
           const data = result.stdout
             .split(/\r?\n/)
             .filter(Boolean)
@@ -273,6 +285,7 @@ function makeHarness(options: HarnessOptions = {}) {
             }))
           return { location: { directory }, data }
         }
+        vcsStatusActive--
         return {
           location: { directory },
           data: options.worktreeDirty
@@ -316,10 +329,14 @@ function makeHarness(options: HarnessOptions = {}) {
           list: async () => [...worktreeEntries.values()],
           remove: async (input: { directory: string; force?: boolean }) => {
             worktreeRemoveCalls.push(input as Record<string, unknown>)
+            worktreeRemoveActive++
+            worktreeRemoveMaxActive = Math.max(worktreeRemoveMaxActive, worktreeRemoveActive)
+            if (options.worktreeRemoveDelayMs) await delay(options.worktreeRemoveDelayMs)
             if (options.realWorktrees) {
               await runGit(["worktree", "remove", "--force", input.directory], repoDirectory)
             }
             worktreeEntries.delete(input.directory)
+            worktreeRemoveActive--
           },
         },
     session: {
@@ -344,8 +361,14 @@ function makeHarness(options: HarnessOptions = {}) {
       }, requestOptions?: { signal?: AbortSignal }) => {
         createCalls++
         createInputs.push(input as Record<string, unknown>)
+        createActive++
+        createMaxActive = Math.max(createMaxActive, createActive)
         if (options.createDelayMs) {
-          await delayWithSignal(options.createDelayMs, requestOptions?.signal)
+          await delayWithSignal(options.createDelayMs, requestOptions?.signal).finally(() => {
+            createActive--
+          })
+        } else {
+          createActive--
         }
         if (options.createGate) await options.createGate
         const location = options.locationMismatch
@@ -596,6 +619,15 @@ function makeHarness(options: HarnessOptions = {}) {
     },
     get permissionCalls() {
       return permissionCalls
+    },
+    get vcsStatusMaxActive() {
+      return vcsStatusMaxActive
+    },
+    get worktreeRemoveMaxActive() {
+      return worktreeRemoveMaxActive
+    },
+    get createMaxActive() {
+      return createMaxActive
     },
   }
 
@@ -2891,6 +2923,74 @@ describe("orchestration tools", () => {
         confirm: true,
         force: true,
       })
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("P1-10: lists and removes worktrees with bounded concurrency", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        realWorktrees: true,
+        options: {
+          allowWorktreeManagement: true,
+          maxWorktrees: 4,
+          maxConcurrentSessions: 4,
+          gitTimeoutMs: 30_000,
+        },
+        vcsStatusDelayMs: 40,
+        worktreeRemoveDelayMs: 40,
+      })
+      const created = await harness.executeRaw("worktrees", {
+        action: "create",
+        count: 3,
+        base: repo.base,
+        runID: "run_concurrent",
+      })
+      const directories = (
+        (created.output as Record<string, unknown>).worktrees as Array<{ directory: string }>
+      ).map((record) => record.directory)
+      await harness.executeRaw("worktrees", { action: "list" })
+      expect(harness.state.vcsStatusMaxActive).toBeGreaterThanOrEqual(2)
+
+      await harness.executeRaw("worktrees", {
+        action: "remove",
+        directories,
+        confirm: true,
+        force: true,
+      })
+      expect(harness.state.worktreeRemoveMaxActive).toBeGreaterThanOrEqual(2)
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("P1-10: creates race candidates concurrently up to maxConcurrentSessions", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        options: {
+          maxRaceCandidates: 3,
+          maxConcurrentSessions: 3,
+          pollIntervalMs: 20,
+          permissionPollMs: 1_000,
+          gitTimeoutMs: 30_000,
+        },
+        createDelayMs: 120,
+      })
+      const result = await harness.executeRaw("race", {
+        prompt: "implement it",
+        count: 3,
+        mode: "same-directory",
+        keepWorktrees: false,
+        timeoutMs: 10_000,
+      })
+      expect((result.output as Record<string, unknown>).state).toBe("ok")
+      expect(harness.state.createMaxActive).toBeGreaterThanOrEqual(2)
+      expect(harness.state.createMaxActive).toBeLessThanOrEqual(3)
     } finally {
       await repo.cleanup()
     }

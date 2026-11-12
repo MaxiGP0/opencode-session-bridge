@@ -1327,8 +1327,11 @@ async function runRaceBody(
       ? await deps.ctx.session.get({ sessionID: context.sessionID }, { signal }).catch(() => undefined)
       : undefined
     const permissions = workerPermissionRules(deps.options, input.permissions)
-    candidates = []
-    for (let index = 0; index < input.count; index++) {
+    const slots: Array<CandidateRecord | undefined> = new Array(input.count)
+    await runWithConcurrency(
+      Array.from({ length: input.count }, (_, index) => index),
+      deps.options.maxConcurrentSessions,
+      async (index) => {
       const directory = worktrees[index]?.directory ?? targetDirectory
       const messageID = `${raceID}:${index + 1}`
       const agent = pick(input.agents, index) ?? caller?.agent ?? "build"
@@ -1368,8 +1371,8 @@ async function runRaceBody(
           : "race aborted before this candidate started"
         candidate.verification = "unknown"
         candidate.applyStrategy = "none"
-        candidates.push(candidate)
-        continue
+        slots[index] = candidate
+        return
       }
       try {
         const created = await withRequest(signal, deps.options.requestTimeoutMs, (request) =>
@@ -1456,8 +1459,12 @@ async function runRaceBody(
           : "error"
         candidate.error = formatError(error)
       }
-      candidates.push(candidate)
-    }
+      slots[index] = candidate
+      },
+    )
+    candidates = slots.filter(
+      (candidate): candidate is CandidateRecord => candidate !== undefined,
+    )
     race.candidates = candidates
     await rememberRaceRecord(deps, race)
 
@@ -1491,24 +1498,30 @@ async function runRaceBody(
     race.candidates = candidates
     await rememberRaceRecord(deps, race)
 
-    for (const candidate of candidates) {
-      if (!candidate.sessionID) continue
-      if (signal.aborted || Date.now() >= deadline) break
-      try {
-        const info = await deps.ctx.session.get({ sessionID: candidate.sessionID }, { signal })
-        candidate.cost = info.cost as unknown as RaceRecord["candidates"][number]["cost"]
-        candidate.tokens = info.tokens as unknown as RaceRecord["candidates"][number]["tokens"]
-      } catch {
-        // Cost/tokens are informational; a missing read must not fail the race.
-      }
-    }
+    await Promise.allSettled(
+      candidates.map(async (candidate) => {
+        if (!candidate.sessionID) return
+        if (signal.aborted || Date.now() >= deadline) return
+        try {
+          const info = await deps.ctx.session.get(
+            { sessionID: candidate.sessionID },
+            { signal },
+          )
+          candidate.cost = info.cost as unknown as RaceRecord["candidates"][number]["cost"]
+          candidate.tokens = info.tokens as unknown as RaceRecord["candidates"][number]["tokens"]
+        } catch {
+          // Cost/tokens are informational; a missing read must not fail the race.
+        }
+      }),
+    )
 
     // Snapshot each candidate before running any tests. The diff is the
     // authoritative artifact for apply; the display stays bounded. A failed,
     // timed-out, or permission-blocked candidate is not a finished tree and
-    // must not be committed or offered for apply.
-    for (const candidate of candidates) {
-      if (!candidate.sessionID || candidate.state !== "idle") continue
+    // must not be committed or offered for apply. Snapshots are safe to run in
+    // parallel only when every candidate owns its worktree.
+    const snapshotOne = async (candidate: CandidateRecord): Promise<void> => {
+      if (!candidate.sessionID || candidate.state !== "idle") return
       if (signal.aborted || Date.now() >= deadline) {
         candidate.state = timedOut() ? "timeout" : "aborted"
         candidate.error = timedOut()
@@ -1516,7 +1529,7 @@ async function runRaceBody(
           : "race aborted before snapshot"
         candidate.diffComplete = false
         candidate.applyStrategy = "none"
-        continue
+        return
       }
       try {
         await snapshotCandidate(
@@ -1531,6 +1544,15 @@ async function runRaceBody(
         candidate.diffComplete = false
         candidate.applyStrategy = "none"
       }
+    }
+    if (race.mode === "worktrees") {
+      await runWithConcurrency(
+        candidates,
+        Math.max(1, Math.min(4, deps.options.maxConcurrentSessions)),
+        snapshotOne,
+      )
+    } else {
+      for (const candidate of candidates) await snapshotOne(candidate)
     }
 
     // E2E commands are serialized across candidates to avoid port/DB clashes.

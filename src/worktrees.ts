@@ -379,6 +379,31 @@ export async function createWorktrees(
   return created
 }
 
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let next = 0
+  const workers = Array.from(
+    { length: Math.max(1, Math.min(limit, items.length)) },
+    async () => {
+      for (;;) {
+        const index = next++
+        if (index >= items.length) return
+        results[index] = await fn(items[index], index)
+      }
+    },
+  )
+  await Promise.all(workers)
+  return results
+}
+
+function worktreeConcurrency(deps: WorktreeDeps): number {
+  return Math.max(2, Math.min(4, deps.options.maxConcurrentSessions))
+}
+
 export async function listWorktrees(
   deps: WorktreeDeps,
   signal?: AbortSignal,
@@ -393,31 +418,35 @@ export async function listWorktrees(
     { projectID },
     { signal: signal ?? new AbortController().signal },
   )
-  const views: WorktreeView[] = []
-  for (const entry of inventory) {
-    const record = worktreeFor(deps.worktrees, entry.directory)
-    const dirty = await isDirty(deps, entry.directory, signal)
-    const branch = await branchOf(deps, entry.directory, signal)
-    views.push({
-      directory: entry.directory,
-      runID: record?.runID ?? "external",
-      createdAt: record?.createdAt ?? 0,
-      sessions: record?.sessions ?? [],
-      base: record?.base,
-      branch: branch ?? record?.branch,
-      name: record?.name,
-      strategy: strategyFrom(entry.strategy) ?? record?.strategy ?? "unknown",
-      state: record?.state ?? "ready",
-      dirty: dirty.dirty,
-      dirtyFiles: dirty.files,
-      ...(record?.ownerSessionID ? { ownerSessionID: record.ownerSessionID } : {}),
-      ...(record?.ownerDirectory ? { ownerDirectory: record.ownerDirectory } : {}),
-    })
-  }
+  const views = await mapWithConcurrency(
+    inventory,
+    worktreeConcurrency(deps),
+    async (entry): Promise<WorktreeView> => {
+      const record = worktreeFor(deps.worktrees, entry.directory)
+      const dirty = await isDirty(deps, entry.directory, signal)
+      const branch = await branchOf(deps, entry.directory, signal)
+      return {
+        directory: entry.directory,
+        runID: record?.runID ?? "external",
+        createdAt: record?.createdAt ?? 0,
+        sessions: record?.sessions ?? [],
+        base: record?.base,
+        branch: branch ?? record?.branch,
+        name: record?.name,
+        strategy: strategyFrom(entry.strategy) ?? record?.strategy ?? "unknown",
+        state: record?.state ?? "ready",
+        dirty: dirty.dirty,
+        dirtyFiles: dirty.files,
+        ...(record?.ownerSessionID ? { ownerSessionID: record.ownerSessionID } : {}),
+        ...(record?.ownerDirectory ? { ownerDirectory: record.ownerDirectory } : {}),
+      }
+    },
+  )
+  const known = new Set(views.map((view) => normalizeDirectory(view.directory)))
   for (const record of deps.worktrees.values()) {
     if (record.state !== "ready") continue
     if (record.projectID && record.projectID !== projectID) continue
-    if (views.some((view) => sameDirectory(view.directory, record.directory))) continue
+    if (known.has(normalizeDirectory(record.directory))) continue
     views.push({
       ...record,
       dirty: false,
@@ -439,50 +468,43 @@ export async function removeWorktrees(
     )
   }
   const projectID = projectIDOf(deps.ctx)
-  const results: RemoveWorktreeResult[] = []
   const root = deps.ctx.location?.directory
   const canonical = deps.ctx.location?.project?.canonical
 
-  for (const directory of directories) {
+  const removeOne = async (directory: string): Promise<RemoveWorktreeResult> => {
     if (root && sameDirectory(root, directory)) {
-      results.push({ directory, removed: false, reason: "refusing to remove the project root" })
-      continue
+      return { directory, removed: false, reason: "refusing to remove the project root" }
     }
     if (canonical && sameDirectory(canonical, directory)) {
-      results.push({ directory, removed: false, reason: "refusing to remove the project root" })
-      continue
+      return { directory, removed: false, reason: "refusing to remove the project root" }
     }
     const record = worktreeFor(deps.worktrees, directory)
     if (!record) {
-      results.push({
+      return {
         directory,
         removed: false,
         reason: "worktree was not created by this plugin",
-      })
-      continue
+      }
     }
     if (record.projectID && record.projectID !== projectID) {
-      results.push({
+      return {
         directory,
         removed: false,
         reason: "worktree belongs to another project",
-      })
-      continue
+      }
     }
     if (record.state === "removed") {
-      results.push({ directory, removed: true, reason: "worktree is already removed" })
-      continue
+      return { directory, removed: true, reason: "worktree is already removed" }
     }
 
     const dirty = await isDirty(deps, record.directory, signal)
     if (dirty.dirty && !options.force) {
-      results.push({
+      return {
         directory,
         removed: false,
         dirty: true,
         reason: "worktree has uncommitted changes; pass force: true and confirm: true to remove it",
-      })
-      continue
+      }
     }
 
     let active = false
@@ -512,12 +534,11 @@ export async function removeWorktrees(
       }
     }
     if (active && !options.force) {
-      results.push({
+      return {
         directory,
         removed: false,
         reason: "worktree has active sessions; stop them or pass force: true",
-      })
-      continue
+      }
     }
 
     let archivedSessions = 0
@@ -542,21 +563,27 @@ export async function removeWorktrees(
       )
       record.state = "removed"
       rememberWorktreeInMemory(deps.worktrees, record)
-      results.push({ directory, removed: true, dirty: dirty.dirty, archivedSessions })
+      return { directory, removed: true, dirty: dirty.dirty, archivedSessions }
     } catch (error) {
       const message = String((error as { message?: string })?.message ?? error)
       const forceRequired = /force|dirty|modified|untracked/i.test(message)
       if (forceRequired) record.state = "orphan"
       rememberWorktreeInMemory(deps.worktrees, record)
-      results.push({
+      return {
         directory,
         removed: false,
         dirty: dirty.dirty,
         orphan: record.state === "orphan",
         reason: message,
-      })
+      }
     }
   }
+
+  const results = await mapWithConcurrency(
+    directories,
+    worktreeConcurrency(deps),
+    removeOne,
+  )
   await persistWorktrees(deps.ctx, deps.worktrees)
   return results
 }
