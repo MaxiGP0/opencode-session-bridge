@@ -265,6 +265,14 @@ const run = await tools.sessions.bestOf({
 - `same-directory` mode is for comparing answers, not for safe apply: the
   candidates share one working tree, so snapshots are marked incomplete and
   `applyStrategy` is `none`.
+- Snapshots never capture secret-like files (`.env*`, `*.pem`, `*.key`,
+  `id_rsa`, `credentials`, `secrets.json/yaml`, `.npmrc`, `.pypirc`, etc.) into
+  patches, output, storage, or temp files. Such a candidate is marked
+  `unsupported: true`, `diffComplete: false`, `applyStrategy: "none"`, with a
+  bounded `secretPaths` list for manual review. Generated artifact trees
+  (`node_modules`, `dist`, `build`, `out`, `coverage`, `.next`, `target`,
+  `vendor`) are excluded from the patch and also make the candidate
+  non-applicable.
 - `waitAny`/`waitAll` detect background shells/subagents through the
   experimental `experimental.idle` hook when the plugin instance that owns the
   session receives it. For a worker in another location, the orchestrator may

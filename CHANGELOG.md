@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- P0-3: race snapshots no longer capture secret-like files into patches,
+  output, storage, or temp files, even when the worker committed them. Affected
+  candidates are marked `unsupported`, `diffComplete: false`,
+  `applyStrategy: "none"`, with a bounded `secretPaths` list. Artifact trees are
+  excluded from patches and make the candidate non-applicable.
+
 - P0-2: `runID`/`raceID` are validated as a single safe path segment before
   reaching the filesystem, and `writePatchFile`/`removeRacePatches` hash any
   legacy or hostile ID and verify containment under the plugin temp directory.

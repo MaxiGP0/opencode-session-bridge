@@ -275,6 +275,13 @@ const run = await tools.sessions.bestOf({
 - `same-directory` sirve para comparar respuestas, no para apply seguro: los
   candidatos comparten un solo árbol, así que los snapshots se marcan
   incompletos y `applyStrategy` es `none`.
+- Los snapshots nunca capturan archivos tipo secreto (`.env*`, `*.pem`,
+  `*.key`, `id_rsa`, `credentials`, `secrets.json/yaml`, `.npmrc`, `.pypirc`,
+  etc.) en parches, output, storage ni archivos temporales. Ese candidato se
+  marca `unsupported: true`, `diffComplete: false`, `applyStrategy: "none"`, con
+  una lista acotada `secretPaths` para revisión manual. Los árboles de
+  artefactos (`node_modules`, `dist`, `build`, `out`, `coverage`, `.next`,
+  `target`, `vendor`) se excluyen del parche y también impiden el apply.
 - `waitAny`/`waitAll` detectan shells/subagentes en background con el hook
   experimental `experimental.idle` cuando lo recibe la instancia del plugin que
   posee la sesión. Para un worker en otra location, el orquestador puede no ver

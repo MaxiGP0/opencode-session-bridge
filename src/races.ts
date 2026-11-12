@@ -105,6 +105,8 @@ export type CandidateRecord = {
   pendingPermissions?: Array<{ id: string; action: string; resources?: string[] }>
   background?: Array<{ kind: string; description?: string; command?: string }>
   unsupported?: boolean
+  /** Secret-like paths detected in the snapshot. Never includes file contents. */
+  secretPaths?: string[]
   applyStrategy: "cherry-pick" | "patch" | "none"
 }
 
@@ -611,6 +613,7 @@ export function shapeCandidate(
       ? { tokens: compact(candidate.tokens, 200) || undefined }
       : {}),
     ...(candidate.unsupported ? { unsupported: true } : {}),
+    ...(candidate.secretPaths?.length ? { secretPaths: candidate.secretPaths } : {}),
     ...(candidate.retry ? { retry: candidate.retry } : {}),
     ...(candidate.pendingPermissions?.length
       ? { pendingPermissions: candidate.pendingPermissions }

@@ -562,8 +562,44 @@ function hasSecretPaths(paths: string[]): boolean {
   return paths.some((value) => SECRET_PATH.test(value.replace(/\\/g, "/")))
 }
 
+function secretPathsOf(paths: string[]): string[] {
+  return [...new Set(paths.filter((value) => SECRET_PATH.test(value.replace(/\\/g, "/"))))]
+    .slice(0, 20)
+}
+
 function hasArtifactPaths(paths: string[]): boolean {
   return paths.some((value) => ARTIFACT_PATH.test(value.replace(/\\/g, "/")))
+}
+
+const ARTIFACT_ROOTS = new Set([
+  "node_modules",
+  "dist",
+  "build",
+  "out",
+  "coverage",
+  ".next",
+  ".nuxt",
+  "target",
+  "vendor",
+])
+
+/**
+ * Pathspec exclusions keep generated trees out of the snapshot patch. The
+ * candidate is still marked unsupported for apply; this only avoids storing
+ * megabytes of build output that cannot be applied safely.
+ */
+function artifactExclusions(paths: string[]): string[] {
+  const roots = new Set<string>()
+  for (const value of paths) {
+    const parts = value.replace(/\\/g, "/").split("/")
+    const index = parts.findIndex((part) => ARTIFACT_ROOTS.has(part))
+    if (index >= 0) roots.add(parts.slice(0, index + 1).join("/"))
+  }
+  return [...roots].slice(0, 20)
+}
+
+function patchSecretPaths(patch: string): string[] {
+  return secretPathsOf(parsePatchFiles(patch).map((file) => file.file))
 }
 
 function strategyOf(record: { strategy: WorktreeStrategy } | undefined): WorktreeStrategy {
@@ -579,6 +615,7 @@ function candidateApplyStrategy(
   candidate: CandidateRecord,
   options: BridgeOptions,
 ): "cherry-pick" | "patch" | "none" {
+  if (candidate.unsupported) return "none"
   if (candidate.commit && candidate.strategy === "worktree") return "cherry-pick"
   if (candidate.patchFile || (candidate.patch && candidate.diffComplete)) return "patch"
   if (candidate.commit) return "cherry-pick"
@@ -592,10 +629,21 @@ async function capturePatch(
   commit: string | undefined,
   base: string | undefined,
   signal: AbortSignal,
+  exclude: string[] = [],
 ): Promise<{ patch: string; source: CandidateRecord["snapshotSource"]; complete: boolean }> {
+  const excludeSpecs = exclude.map((entry) => `:(exclude)${entry}`)
   if (commit && base) {
     const result = await deps.git(
-      ["diff", "--binary", "--no-color", "--no-ext-diff", `${base}..${commit}`],
+      [
+        "diff",
+        "--binary",
+        "--no-color",
+        "--no-ext-diff",
+        `${base}..${commit}`,
+        "--",
+        ".",
+        ...excludeSpecs,
+      ],
       directory,
       { timeoutMs: deps.options.gitTimeoutMs, signal, maxBuffer: HARD_PATCH_LIMIT * 2 },
     )
@@ -606,7 +654,7 @@ async function capturePatch(
 
   // Intent-to-add makes untracked files visible to `git diff` without
   // committing them. The reset only clears the index flag.
-  const add = await deps.git(["add", "-N", "--", "."], directory, {
+  const add = await deps.git(["add", "-N", "--", ".", ...excludeSpecs], directory, {
     timeoutMs: deps.options.gitTimeoutMs,
     signal,
   })
@@ -615,7 +663,7 @@ async function capturePatch(
   }
   try {
     const result = await deps.git(
-      ["diff", "--binary", "--no-color", "--no-ext-diff"],
+      ["diff", "--binary", "--no-color", "--no-ext-diff", "--", ".", ...excludeSpecs],
       directory,
       { timeoutMs: deps.options.gitTimeoutMs, signal, maxBuffer: HARD_PATCH_LIMIT * 2 },
     )
@@ -654,6 +702,23 @@ async function capturePatch(
   return { patch: "", source: "none", complete: false }
 }
 
+async function changedPaths(
+  deps: OrchestrationDeps,
+  directory: string,
+  base: string | undefined,
+  commit: string | undefined,
+  signal: AbortSignal,
+): Promise<string[]> {
+  if (!commit || !base || commit === base) return []
+  const result = await deps.git(
+    ["diff", "--name-only", "--no-color", `${base}..${commit}`],
+    directory,
+    { timeoutMs: deps.options.gitTimeoutMs, signal },
+  )
+  if (!gitOk(result)) return []
+  return result.stdout.split(/\r?\n/).filter(Boolean)
+}
+
 async function snapshotCandidate(
   deps: OrchestrationDeps,
   race: RaceRecord,
@@ -684,14 +749,43 @@ async function snapshotCandidate(
     if (value && value !== "HEAD") branch = value
   }
 
-  const unsafeSecrets = hasSecretPaths(paths)
-  const artifacts = hasArtifactPaths(paths)
+  const unsafeSecrets = secretPathsOf(paths)
+  let artifacts = hasArtifactPaths(paths)
   const wantCommit =
     (input.snapshot === "commit" ||
       (input.snapshot === "auto" && deps.options.allowSnapshotCommits)) &&
     !artifacts
 
-  if (dirty && wantCommit && !unsafeSecrets) {
+  // Never capture, persist, or apply a snapshot that contains a secret file.
+  // The worker's tree and commit are left untouched for manual review.
+  const markUnsupported = (secrets: string[]): CandidateRecord => {
+    candidate.commit = commit
+    candidate.branch = branch
+    candidate.base = base
+    candidate.patch = undefined
+    candidate.patchFile = undefined
+    candidate.patchBytes = 0
+    candidate.diffComplete = false
+    candidate.snapshotSource = "none"
+    candidate.files = []
+    candidate.diffStats = { files: 0, additions: 0, deletions: 0 }
+    candidate.testFilesChanged = false
+    candidate.ciFilesChanged = false
+    candidate.skippedTests = false
+    candidate.unsupported = true
+    candidate.secretPaths = secrets
+    candidate.verification = "unknown"
+    candidate.strategy = strategyOf(worktreeFor(deps.worktrees, candidate.directory))
+    candidate.applyStrategy = "none"
+    return candidate
+  }
+
+  if (unsafeSecrets.length) {
+    commit = await resolveCommit(deps, directory, "HEAD", signal)
+    return markUnsupported(unsafeSecrets)
+  }
+
+  if (dirty && wantCommit) {
     const add = await deps.git(["add", "-A", "--", "."], directory, {
       timeoutMs: deps.options.gitTimeoutMs,
       signal,
@@ -720,6 +814,16 @@ async function snapshotCandidate(
     commit = await resolveCommit(deps, directory, "HEAD", signal)
   }
 
+  const committedPaths =
+    commit && base && commit !== base ? await changedPaths(deps, directory, base, commit, signal) : []
+  const committedSecrets = secretPathsOf(committedPaths)
+  if (committedSecrets.length) {
+    return markUnsupported(committedSecrets)
+  }
+  const changed = [...new Set([...committedPaths, ...paths])]
+  artifacts ||= hasArtifactPaths(changed)
+  const exclude = artifactExclusions(changed)
+
   if (dirty || (commit && base && commit !== base)) {
     const captured = await capturePatch(
       deps,
@@ -727,10 +831,16 @@ async function snapshotCandidate(
       commit && base && commit !== base ? commit : undefined,
       base,
       signal,
+      exclude,
     )
     patch = captured.patch
     source = captured.source
     complete = captured.complete
+  }
+
+  const capturedSecrets = patchSecretPaths(patch)
+  if (capturedSecrets.length) {
+    return markUnsupported(capturedSecrets)
   }
 
   const fallbackFiles: VcsFileDiff[] = []
@@ -747,6 +857,8 @@ async function snapshotCandidate(
         { signal },
       )
       for (const file of result?.data ?? []) {
+        if (hasSecretPaths([file.file])) continue
+        if (hasArtifactPaths([file.file])) continue
         fallbackFiles.push({
           file: file.file,
           patch: file.patch ?? "",

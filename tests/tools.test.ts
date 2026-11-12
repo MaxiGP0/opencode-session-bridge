@@ -2826,6 +2826,105 @@ describe("orchestration tools", () => {
     }
   })
 
+  it("P0-3: never exposes secret file contents in race patches or storage", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const secret = "SESSION_BRIDGE_SUPER_SECRET_VALUE"
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        realWorktrees: true,
+        options: {
+          allowSnapshotCommits: true,
+          allowWorktreeManagement: true,
+          maxRaceCandidates: 2,
+          gitTimeoutMs: 30_000,
+        },
+        onPrompt: async ({ directory, index }) => {
+          if (index === 0) {
+            await writeFile(path.join(directory, ".env"), `TOKEN=${secret}\n`, "utf8")
+          } else {
+            await writeFile(path.join(directory, "feature.txt"), "feature\n", "utf8")
+          }
+        },
+      })
+      const result = await harness.executeRaw("race", {
+        prompt: "implement it",
+        count: 2,
+        mode: "worktrees",
+        base: repo.base,
+        keepWorktrees: false,
+        timeoutMs: 30_000,
+      })
+      const output = result.output as Record<string, unknown>
+      expect(JSON.stringify(output)).not.toContain(secret)
+      const flagged = (output.candidates as Array<Record<string, unknown>>).find((entry) =>
+        Array.isArray(entry.secretPaths) && (entry.secretPaths as string[]).includes(".env"),
+      )
+      expect(flagged).toBeTruthy()
+      expect(flagged).toMatchObject({
+        unsupported: true,
+        diffComplete: false,
+        applyStrategy: "none",
+      })
+      expect(flagged?.patchFile).toBeUndefined()
+      expect(JSON.stringify(harness.state.storage.get("session-bridge:races"))).not.toContain(
+        secret,
+      )
+      await harness.executeRaw("raceCleanup", {
+        raceID: String(output.raceID),
+        confirm: true,
+        force: true,
+      })
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("P0-3: detects secrets already committed by a worker", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const secret = "SESSION_BRIDGE_COMMITTED_SECRET"
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        realWorktrees: true,
+        options: {
+          allowSnapshotCommits: true,
+          allowWorktreeManagement: true,
+          maxRaceCandidates: 2,
+          gitTimeoutMs: 30_000,
+        },
+        onPrompt: async ({ directory }) => {
+          await writeFile(path.join(directory, ".env"), `TOKEN=${secret}\n`, "utf8")
+          await runGit(["add", "-A"], directory)
+          await runGit(["-c", "user.name=test", "-c", "user.email=test@localhost", "commit", "-m", "secret"], directory)
+        },
+      })
+      const result = await harness.executeRaw("race", {
+        prompt: "implement it",
+        count: 2,
+        mode: "worktrees",
+        base: repo.base,
+        keepWorktrees: false,
+        timeoutMs: 30_000,
+      })
+      const output = result.output as Record<string, unknown>
+      expect(JSON.stringify(output)).not.toContain(secret)
+      for (const candidate of output.candidates as Array<Record<string, unknown>>) {
+        expect(candidate.unsupported).toBe(true)
+        expect(candidate.applyStrategy).toBe("none")
+        expect(candidate.patch).toBeUndefined()
+        expect(candidate.files).toEqual([])
+      }
+      await harness.executeRaw("raceCleanup", {
+        raceID: String(output.raceID),
+        confirm: true,
+        force: true,
+      })
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
   it("O-4: does not snapshot candidates whose admission failed", async () => {
     const repo = await makeTempRepo()
     try {
