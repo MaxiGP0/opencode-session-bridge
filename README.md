@@ -267,6 +267,8 @@ const run = await tools.sessions.bestOf({
   `stdoutTruncated`/`stderrTruncated`; they do not kill a passing test. Output is
   decoded as UTF-8 across chunk boundaries. On POSIX the child runs in its own
   process group so timeout/abort also stops servers it spawned.
+  Test commands are parsed platform-aware: on Windows backslashes are literal
+  path separators, and `%`/`!` are rejected because `cmd` would expand them.
   Tests run serially per candidate. If a command needs secrets or services that
   do not exist locally, the result is `tests: { skipped: true, reason }`; the
   plugin never claims the E2E passed.

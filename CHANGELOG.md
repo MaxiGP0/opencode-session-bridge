@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- P1-4: `parseCommand` is platform-aware on Windows: backslashes are literal
+  path separators, so quoted `C:\Program Files\...` paths survive, and `%`/`!`
+  are rejected instead of being silently expanded by `cmd`. POSIX escaping is
+  unchanged.
+
 - P1-3: `runCommand` no longer kills a process when stdout/stderr exceed
   `maxBuffer`; it truncates the displayed output and sets the truncation flags.
   Callers can opt into `killOnOverflow: true`. Output is decoded as UTF-8 across

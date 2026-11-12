@@ -277,9 +277,11 @@ const run = await tools.sessions.bestOf({
   `stdoutTruncated`/`stderrTruncated`; no matan un test que pasa. La salida se
   decodifica como UTF-8 entre chunks. En POSIX el hijo corre en su propio grupo
   de procesos, así que timeout/abort también detiene servidores que haya
-  lanzado. Los tests se ejecutan en serie por candidato. Si un comando necesita
-  secretos o servicios que no existen localmente: `tests: { skipped: true,
-  reason }`; el plugin nunca afirma que el E2E pasó.
+  lanzado. Los comandos de test se parsean según la plataforma: en Windows la
+  barra invertida es un separador literal y `%`/`!` se rechazan porque `cmd` los
+  expandiría. Los tests se ejecutan en serie por candidato. Si un comando
+  necesita secretos o servicios que no existen localmente: `tests: { skipped:
+  true, reason }`; el plugin nunca afirma que el E2E pasó.
 - `same-directory` sirve para comparar respuestas, no para apply seguro: los
   candidatos comparten un solo árbol, así que los snapshots se marcan
   incompletos y `applyStrategy` es `none`.

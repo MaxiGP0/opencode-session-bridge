@@ -121,7 +121,10 @@ export function parseCommand(command: string): ParsedCommand {
       escaped = false
       continue
     }
-    if (character === "\\" && quote !== "'") {
+    // On Windows a backslash is a path separator, not an escape. In cmd it
+    // cannot escape a quote either; doubling `""` inside a quoted argument is
+    // handled by the quote branches below.
+    if (!WINDOWS && character === "\\" && quote !== "'") {
       escaped = true
       continue
     }
@@ -143,6 +146,13 @@ export function parseCommand(command: string): ParsedCommand {
         current = ""
       }
       continue
+    }
+    if (WINDOWS && (character === "%" || character === "!")) {
+      return {
+        ok: false,
+        error:
+          "cmd variable expansion (% and !) is not allowed on Windows; use a script file instead",
+      }
     }
     if (SHELL_METACHARACTERS.test(character)) {
       return {

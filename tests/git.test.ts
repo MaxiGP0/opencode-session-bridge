@@ -35,6 +35,30 @@ describe("command parsing", () => {
     expect(parseCommand("cmd /c npm test")).toMatchObject({ ok: false })
     expect(parseCommand("   ")).toMatchObject({ ok: false })
   })
+
+  it("P1-4: keeps Windows backslashes and rejects cmd variable expansion", () => {
+    if (process.platform === "win32") {
+      expect(parseCommand('node "C:\\Program Files\\app\\script.js"')).toEqual({
+        ok: true,
+        file: "node",
+        args: ["C:\\Program Files\\app\\script.js"],
+      })
+      expect(parseCommand("node .\\script.js")).toEqual({
+        ok: true,
+        file: "node",
+        args: [".\\script.js"],
+      })
+      expect(parseCommand("npm test %PATH%")).toMatchObject({ ok: false })
+      expect(parseCommand("npm test !PATH!")).toMatchObject({ ok: false })
+    } else {
+      expect(parseCommand('node "a\\"b"')).toEqual({
+        ok: true,
+        file: "node",
+        args: ['a"b'],
+      })
+      expect(parseCommand("npm test %PATH%")).toMatchObject({ ok: true })
+    }
+  })
 })
 
 describe("environment and redaction", () => {
