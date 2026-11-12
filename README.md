@@ -322,9 +322,13 @@ true`; without it the call fails before creating an integration worktree. The
 command is parsed with `parseCommand` up front. It refuses a dirty target, an
 in-progress merge/rebase/
 cherry-pick, a base that is not an ancestor, an incomplete patch, or a
-cherry-pick without a commit. It verifies in an integration worktree first when
+cherry-pick without a commit. Idempotency is checked before the clean-target
+gate: retrying an already applied candidate (including one applied with
+`commit: false`, which leaves staged changes) returns `alreadyApplied: true`,
+`applied: false`, `targetDirty`, and bounded `dirtyPaths` without touching the
+target. It verifies in an integration worktree first when
 `verifyCommand` or `dryRun` is used, creates a backup branch before touching the
-target, is idempotent (`alreadyApplied`), and rolls back on failure. `commit`
+target, and rolls back on failure. `commit`
 and `push` are separate opt-ins. Push never uses force and requires
 `allowPushCandidates`; a rejected push is reported and left for a manual
 rebase/retest. The plugin does not rebase automatically.

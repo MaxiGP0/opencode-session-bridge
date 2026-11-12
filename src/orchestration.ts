@@ -1655,6 +1655,10 @@ export type ApplyResult = {
   pushed?: boolean
   pushError?: string
   verification?: ApplyVerification
+  /** True when an already-applied candidate sits on a dirty target. */
+  targetDirty?: boolean
+  /** Bounded list of paths already modified before the apply. */
+  dirtyPaths?: string[]
   reason?: string
   error?: string
 }
@@ -1964,6 +1968,32 @@ export async function applyCandidate(
   }
   APPLY_LOCKS.add(lockKey)
   try {
+    const beforeStatus = await deps.git(["status", "--porcelain=v1"], target, {
+      timeoutMs: deps.options.gitTimeoutMs,
+      signal,
+    })
+    const before = gitOk(beforeStatus) ? statusPaths(beforeStatus.stdout) : []
+
+    // Idempotency must be checked before requiring a clean target: an apply
+    // without `commit: true` intentionally leaves staged changes, and retrying
+    // the same candidate must report alreadyApplied instead of "target dirty".
+    if (await isAlreadyApplied(deps, target, candidate, input.strategy, signal)) {
+      const clean = await targetIsClean(deps, target, signal)
+      return {
+        state: "ok",
+        applied: false,
+        alreadyApplied: true,
+        dryRun: input.dryRun,
+        strategy: input.strategy,
+        targetDirectory: target,
+        base: race.base,
+        ...(candidate.commit ? { commit: candidate.commit } : {}),
+        targetDirty: !clean.clean,
+        ...(before.length ? { dirtyPaths: before.slice(0, 20) } : {}),
+        reason: "candidate is already applied",
+      }
+    }
+
     const clean = await targetIsClean(deps, target, signal)
     if (!clean.clean) throw new Error(clean.reason ?? "target is not clean")
 
@@ -1995,26 +2025,6 @@ export async function applyCandidate(
       }
     } else {
       integrationBase = await resolveCommit(deps, target, "HEAD", signal)
-    }
-
-    const beforeStatus = await deps.git(["status", "--porcelain=v1"], target, {
-      timeoutMs: deps.options.gitTimeoutMs,
-      signal,
-    })
-    const before = gitOk(beforeStatus) ? statusPaths(beforeStatus.stdout) : []
-
-    if (await isAlreadyApplied(deps, target, candidate, input.strategy, signal)) {
-      return {
-        state: "ok",
-        applied: false,
-        alreadyApplied: true,
-        dryRun: input.dryRun,
-        strategy: input.strategy,
-        targetDirectory: target,
-        base: race.base,
-        ...(candidate.commit ? { commit: candidate.commit } : {}),
-        reason: "candidate is already applied",
-      }
     }
 
     let integrationDirectory: string | undefined

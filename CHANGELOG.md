@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- P1-7: `applyCandidate` checks idempotency before requiring a clean target.
+  Retrying an already applied candidate, including one applied with
+  `commit: false`, returns `alreadyApplied: true`/`applied: false` with
+  `targetDirty` and bounded `dirtyPaths` instead of rejecting the dirty index.
+  A target with unrelated changes still fails before apply.
+
 - P1-6: the `race`/`bestOf` timeout is now wall-clock from entry, including
   base resolution, worktrees, session creation, snapshots, and tests. An internal
   abort signal stops setup and marks pending candidates `timeout`/`aborted`;

@@ -332,9 +332,13 @@ sin esa opción la llamada falla antes de crear el worktree de integración. El
 comando se parsea con `parseCommand` al inicio. Rechaza un target dirty, un
 merge/rebase/cherry-pick en curso,
 una base que no es ancestro, un parche incompleto o un cherry-pick sin commit.
-Verifica primero en un worktree de integración cuando se usa `verifyCommand` o
-`dryRun`, crea una rama de respaldo antes de tocar el target, es idempotente
-(`alreadyApplied`) y hace rollback ante fallo. `commit` y `push` son opt-ins
+La idempotencia se comprueba antes del gate de target limpio: reintentar un
+candidato ya aplicado (incluido uno con `commit: false`, que deja cambios
+staged) devuelve `alreadyApplied: true`, `applied: false`, `targetDirty` y
+`dirtyPaths` acotados sin tocar el target. Verifica primero en un worktree de
+integración cuando se usa `verifyCommand` o
+`dryRun`, crea una rama de respaldo antes de tocar el target y hace rollback
+ante fallo. `commit` y `push` son opt-ins
 separados. El push nunca usa force y requiere `allowPushCandidates`; un push
 rechazado se reporta y queda para rebase/retest manual. El plugin no hace rebase
 automático.

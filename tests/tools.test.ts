@@ -3418,6 +3418,24 @@ describe("orchestration tools", () => {
       expect((await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()).toBe(before)
       const status = await runGit(["status", "--porcelain=v1"], repo.directory)
       expect(status.stdout).toContain("feature.txt")
+
+      const retry = await harness.executeRaw("applyCandidate", {
+        raceID: race.raceID,
+        candidateID: "candidate-1",
+        strategy: "apply",
+        dryRun: false,
+        commit: false,
+        confirm: true,
+      })
+      expect(retry.output).toMatchObject({
+        state: "ok",
+        applied: false,
+        alreadyApplied: true,
+        targetDirty: true,
+      })
+      expect((retry.output as Record<string, unknown>).dirtyPaths).toContain("feature.txt")
+      const afterRetry = await runGit(["status", "--porcelain=v1"], repo.directory)
+      expect(afterRetry.stdout).toBe(status.stdout)
     } finally {
       await repo.cleanup()
     }
