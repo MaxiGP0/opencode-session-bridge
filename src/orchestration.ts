@@ -1180,6 +1180,44 @@ export async function runRace(
   input: RaceInput,
   signal: AbortSignal,
 ): Promise<RaceRunResult> {
+  const controller = new AbortController()
+  let timedOut = false
+  const onAbort = () => controller.abort(signal.reason)
+  if (signal.aborted) onAbort()
+  else signal.addEventListener("abort", onAbort, { once: true })
+  const startedAt = Date.now()
+  const deadline = startedAt + input.timeoutMs
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort(new DOMException("race wall clock exceeded", "TimeoutError"))
+  }, Math.max(1, input.timeoutMs))
+  const handle = timer as unknown as { unref?: () => void }
+  if (typeof handle.unref === "function") handle.unref()
+  try {
+    return await runRaceBody(
+      deps,
+      context,
+      input,
+      controller.signal,
+      deadline,
+      () => timedOut,
+      () => signal.aborted,
+    )
+  } finally {
+    clearTimeout(timer)
+    signal.removeEventListener("abort", onAbort)
+  }
+}
+
+async function runRaceBody(
+  deps: OrchestrationDeps,
+  context: ToolExecuteContext,
+  input: RaceInput,
+  signal: AbortSignal,
+  deadline: number,
+  timedOut: () => boolean,
+  callerAborted: () => boolean,
+): Promise<RaceRunResult> {
   const targetDirectory = deps.ctx.location?.directory
   if (!targetDirectory) throw new Error("ctx.location.directory is not available")
   const raceID = input.runID ?? createRaceID()
@@ -1298,6 +1336,16 @@ export async function runRace(
         verification: "unknown",
         applyStrategy: "none",
       }
+      if (signal.aborted || Date.now() >= deadline) {
+        candidate.state = timedOut() ? "timeout" : "aborted"
+        candidate.error = timedOut()
+          ? "race wall clock exceeded before this candidate started"
+          : "race aborted before this candidate started"
+        candidate.verification = "unknown"
+        candidate.applyStrategy = "none"
+        candidates.push(candidate)
+        continue
+      }
       try {
         const created = await withRequest(signal, deps.options.requestTimeoutMs, (request) =>
           deps.ctx.session.create(
@@ -1376,7 +1424,11 @@ export async function runRace(
         candidate.messageID = admitted.id
         candidate.state = "running"
       } catch (error) {
-        candidate.state = "error"
+        candidate.state = signal.aborted
+          ? timedOut()
+            ? "timeout"
+            : "aborted"
+          : "error"
         candidate.error = formatError(error)
       }
       candidates.push(candidate)
@@ -1384,9 +1436,15 @@ export async function runRace(
     race.candidates = candidates
     await rememberRace(deps.ctx, deps.races, race)
 
-    const deadline = Date.now() + input.timeoutMs
     await runWithConcurrency(candidates, deps.options.maxConcurrentSessions, async (candidate) => {
       if (!candidate.sessionID || candidate.state === "error") return
+      if (signal.aborted || Date.now() >= deadline) {
+        candidate.state = timedOut() ? "timeout" : "aborted"
+        candidate.error = timedOut()
+          ? "race wall clock exceeded while waiting for this candidate"
+          : "race aborted while waiting for this candidate"
+        return
+      }
       const remaining = Math.max(1, deadline - Date.now())
       const result = await waitOne(
         deps,
@@ -1410,6 +1468,7 @@ export async function runRace(
 
     for (const candidate of candidates) {
       if (!candidate.sessionID) continue
+      if (signal.aborted || Date.now() >= deadline) break
       try {
         const info = await deps.ctx.session.get({ sessionID: candidate.sessionID }, { signal })
         candidate.cost = info.cost as unknown as RaceRecord["candidates"][number]["cost"]
@@ -1425,6 +1484,15 @@ export async function runRace(
     // must not be committed or offered for apply.
     for (const candidate of candidates) {
       if (!candidate.sessionID || candidate.state !== "idle") continue
+      if (signal.aborted || Date.now() >= deadline) {
+        candidate.state = timedOut() ? "timeout" : "aborted"
+        candidate.error = timedOut()
+          ? "race wall clock exceeded before snapshot"
+          : "race aborted before snapshot"
+        candidate.diffComplete = false
+        candidate.applyStrategy = "none"
+        continue
+      }
       try {
         await snapshotCandidate(
           deps,
@@ -1443,6 +1511,15 @@ export async function runRace(
     // E2E commands are serialized across candidates to avoid port/DB clashes.
     for (const candidate of candidates) {
       if (!candidate.sessionID || candidate.state !== "idle") continue
+      if (signal.aborted) {
+        candidate.tests = {
+          skipped: true,
+          reason: timedOut() ? "race wall clock exceeded" : "race aborted",
+        }
+        candidate.verification = "unknown"
+        candidate.applyStrategy = candidateApplyStrategy(candidate, deps.options)
+        continue
+      }
       const remaining = deadline - Date.now()
       if (remaining <= 0) {
         candidate.tests = { skipped: true, reason: "race wall clock exceeded" }
@@ -1482,6 +1559,7 @@ export async function runRace(
     await rememberRace(deps.ctx, deps.races, race)
 
     if (!input.keepWorktrees && race.worktrees.length) {
+      const cleanupController = new AbortController()
       const removed = await removeWorktrees(
         {
           ctx: deps.ctx,
@@ -1492,7 +1570,7 @@ export async function runRace(
         },
         race.worktrees,
         { force: false, archiveSessions: true },
-        signal,
+        cleanupController.signal,
       )
       const cleanup: RaceCleanup = {
         at: Date.now(),
@@ -1509,6 +1587,15 @@ export async function runRace(
     const ranking = rankCandidates(candidates)
     return { race, ranking }
   } catch (error) {
+    for (const candidate of candidates) {
+      if (candidate.state !== "running") continue
+      candidate.state = timedOut() ? "timeout" : "aborted"
+      candidate.error ??= timedOut()
+        ? "race wall clock exceeded"
+        : "race aborted"
+      candidate.verification = "unknown"
+      candidate.applyStrategy = "none"
+    }
     race.status = "failed"
     race.updatedAt = Date.now()
     race.candidates = candidates
@@ -1517,6 +1604,7 @@ export async function runRace(
       .map((record) => record.directory)
     await rememberRace(deps.ctx, deps.races, race).catch(() => undefined)
     if (worktrees.length && !input.keepWorktrees) {
+      const cleanup = new AbortController()
       await removeWorktrees(
         {
           ctx: deps.ctx,
@@ -1527,8 +1615,15 @@ export async function runRace(
         },
         worktrees.map((record) => record.directory),
         { force: false, archiveSessions: true },
-        signal,
+        cleanup.signal,
       ).catch(() => undefined)
+    }
+    if (signal.aborted) {
+      const idle = candidates.filter((candidate) => candidate.state === "idle").length
+      race.status = idle === candidates.length ? "completed" : idle > 0 ? "partial" : "failed"
+      race.updatedAt = Date.now()
+      await rememberRace(deps.ctx, deps.races, race).catch(() => undefined)
+      return { race, ranking: rankCandidates(candidates) }
     }
     throw error
   }

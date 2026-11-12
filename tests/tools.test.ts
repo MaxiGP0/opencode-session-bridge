@@ -99,6 +99,7 @@ type HarnessOptions = {
   cursorNext?: string | null
   modelDefault?: unknown
   createGate?: Promise<void>
+  createDelayMs?: number
   promptGate?: Promise<void>
   createConflictOnce?: boolean
   enableLive?: boolean
@@ -334,9 +335,12 @@ function makeHarness(options: HarnessOptions = {}) {
         agent?: string
         model?: unknown
         location?: { directory?: string }
-      }) => {
+      }, requestOptions?: { signal?: AbortSignal }) => {
         createCalls++
         createInputs.push(input as Record<string, unknown>)
+        if (options.createDelayMs) {
+          await delayWithSignal(options.createDelayMs, requestOptions?.signal)
+        }
         if (options.createGate) await options.createGate
         const location = options.locationMismatch
           ? { directory: "C:/elsewhere" }
@@ -2758,6 +2762,42 @@ describe("orchestration tools", () => {
     const sessions = output.sessions as Array<Record<string, unknown>>
     expect(sessions[0]?.state).toBe("running")
     expect((sessions[0]?.background as unknown[]).length).toBe(1)
+  })
+
+  it("P1-6: enforces the race wall clock during setup and stops creating candidates", async () => {
+    const repo = await makeTempRepo()
+    try {
+      const harness = makeHarness({
+        repoDirectory: repo.directory,
+        options: {
+          maxRaceCandidates: 3,
+          maxConcurrentSessions: 1,
+          pollIntervalMs: 20,
+          permissionPollMs: 1_000,
+          gitTimeoutMs: 30_000,
+        },
+        createDelayMs: 800,
+      })
+      const started = Date.now()
+      const result = await harness.executeRaw("race", {
+        prompt: "implement it",
+        count: 3,
+        mode: "same-directory",
+        keepWorktrees: false,
+        timeoutMs: 1_000,
+      })
+      const elapsed = Date.now() - started
+      expect(elapsed).toBeLessThan(1_800)
+      expect(harness.state.createCalls).toBeLessThanOrEqual(2)
+      const output = result.output as Record<string, unknown>
+      expect(output.state).toBe("ok")
+      expect((output.candidates as unknown[]).length).toBe(3)
+      expect((output.candidates as Array<Record<string, unknown>>).some((entry) =>
+        entry.state === "timeout" || entry.state === "aborted",
+      )).toBe(true)
+    } finally {
+      await repo.cleanup()
+    }
   })
 
   it("P1-2: wait does not return idle when the session is busy with a newer turn", async () => {

@@ -258,7 +258,12 @@ const run = await tools.sessions.bestOf({
 
 - `race`/`bestOf` create unique `messageID`s (`${raceID}:${i}`), snapshot the
   candidate worktree (a local commit when safe, otherwise a patch that includes
-  untracked files), and never use the truncated display diff for apply.
+  untracked files), and never use the truncated display diff for apply. The
+  `timeoutMs` wall clock starts when the tool call enters, before base
+  resolution, worktrees, or session creation. At the deadline the internal
+  signal aborts setup/waits/snapshots, pending candidates are marked
+  `timeout`/`aborted`, no new candidates are created, and cleanup runs with an
+  independent signal.
 - Binaries, renames, mode changes, submodules, and LFS are detected. A candidate
   whose patch cannot represent them is marked `unsupported` and is not applied
   blindly.

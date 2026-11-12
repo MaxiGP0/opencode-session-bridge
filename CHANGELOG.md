@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- P1-6: the `race`/`bestOf` timeout is now wall-clock from entry, including
+  base resolution, worktrees, session creation, snapshots, and tests. An internal
+  abort signal stops setup and marks pending candidates `timeout`/`aborted`;
+  no candidates are created after the deadline, and cleanup uses an independent
+  signal so ephemeral worktrees are still removed.
+
 - P1-5: directory identity drops trailing separators (except filesystem roots)
   and lowercases on Windows. The storage namespace, open mappings, legacy
   comparisons, worktree registry keys, and derived `msg_` prompt IDs now use the

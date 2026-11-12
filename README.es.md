@@ -269,7 +269,12 @@ const run = await tools.sessions.bestOf({
 
 - `race`/`bestOf` generan `messageID` únicos (`${raceID}:${i}`), capturan el
   worktree del candidato (commit local cuando es seguro; si no, un parche que
-  incluye untracked) y nunca usan el diff truncado de display para aplicar.
+  incluye untracked) y nunca usan el diff truncado de display para aplicar. El
+  timeout `timeoutMs` es wall-clock desde que entra la tool call, antes de
+  resolver la base, crear worktrees o sesiones. Al vencer, la señal interna
+  aborta setup/esperas/snapshots, los candidatos pendientes quedan
+  `timeout`/`aborted`, no se crean candidatos nuevos y la limpieza usa una señal
+  independiente.
 - Se detectan binarios, renames, cambios de modo, submodules y LFS. Un candidato
   cuyo parche no puede representarlos se marca `unsupported` y no se aplica a
   ciegas.
