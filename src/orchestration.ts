@@ -23,6 +23,7 @@ import {
   parseCommand,
   removeRacePatches,
   runCommand,
+  safePatchSegment,
   writePatchFile,
   type CommandResult,
   type GitRunner,
@@ -1590,7 +1591,7 @@ async function createIntegrationWorktree(
         const created = await ctx.worktree.create(
           {
             projectID,
-            name: `apply-${raceID}`.slice(0, 64),
+            name: `apply-${safePatchSegment(raceID)}`.slice(0, 64),
             branch: base,
           },
           { signal },

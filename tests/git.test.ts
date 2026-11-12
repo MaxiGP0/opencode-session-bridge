@@ -6,9 +6,12 @@ import {
   normalizeWorktreeLineEndings,
   parseCommand,
   redactSecrets,
+  removeRacePatches,
   runCommand,
   runGit,
   safeEnvironment,
+  safePatchSegment,
+  writePatchFile,
 } from "../src/git.ts"
 
 describe("command parsing", () => {
@@ -101,6 +104,24 @@ describe("runCommand", () => {
       expect(result.durationMs).toBeLessThan(4_000)
     } finally {
       await rm(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("race patch files", () => {
+  it("P0-2: keeps patch paths inside the plugin temp directory for hostile IDs", async () => {
+    const root = path.resolve(tmpdir(), "opencode-session-bridge", "races")
+    const hostile = "../../../../escape"
+    const file = await writePatchFile(hostile, "../../evil", "patch")
+    try {
+      expect(path.resolve(file).startsWith(root + path.sep)).toBe(true)
+      expect(safePatchSegment(hostile).startsWith("race-")).toBe(true)
+      expect(safePatchSegment("race_safe-1")).toBe("race_safe-1")
+      await removeRacePatches(hostile)
+      const { access } = await import("node:fs/promises")
+      await expect(access(file)).rejects.toThrow()
+    } finally {
+      await removeRacePatches(hostile)
     }
   })
 })

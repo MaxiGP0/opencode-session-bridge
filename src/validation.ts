@@ -1,4 +1,5 @@
 import { codePointLength, parseModel } from "./format.ts"
+import { isSafePathSegment } from "./directories.ts"
 import { t, type StringKey } from "./i18n.ts"
 import type { BridgeOptions } from "./options.ts"
 import type { Lang } from "./types.ts"
@@ -83,6 +84,27 @@ function optionalBoundedString(
   return text
 }
 
+/**
+ * IDs used as a filesystem path segment (run/race) must not contain path
+ * separators, `..`, drive markers, control characters, spaces, or Unicode.
+ * The plugin generates safe IDs; reject anything else at the boundary.
+ */
+function optionalSafeId(
+  value: unknown,
+  key: StringKey,
+  max: number,
+  field: string,
+  lang: Lang,
+): string | undefined {
+  const text = optionalBoundedString(value, key, max, field, lang)
+  if (text !== undefined && !isSafePathSegment(text)) {
+    throw new ValidationError(
+      `${field} must match ^[A-Za-z0-9][A-Za-z0-9._-]*$ and must not contain '..'`,
+    )
+  }
+  return text
+}
+
 function requireBoundedId(
   value: unknown,
   key: StringKey,
@@ -94,6 +116,22 @@ function requireBoundedId(
   if (codePointLength(text) > options.maxIdChars) {
     throw new ValidationError(
       t(lang, "fieldTooLong", { field, min: 1, max: options.maxIdChars }),
+    )
+  }
+  return text
+}
+
+function requireSafeId(
+  value: unknown,
+  key: StringKey,
+  field: string,
+  options: BridgeOptions,
+  lang: Lang,
+): string {
+  const text = requireBoundedId(value, key, field, options, lang)
+  if (!isSafePathSegment(text)) {
+    throw new ValidationError(
+      `${field} must match ^[A-Za-z0-9][A-Za-z0-9._-]*$ and must not contain '..'`,
     )
   }
   return text
@@ -367,7 +405,7 @@ export function parseOpenInput(input: unknown, lang: Lang, options: BridgeOption
       "directory",
       lang,
     ),
-    runID: optionalBoundedString(
+    runID: optionalSafeId(
       data.runID,
       "invalidRunID",
       options.maxIdChars,
@@ -833,7 +871,7 @@ export function parseWorktreesInput(
       "branch",
       lang,
     ),
-    runID: optionalBoundedString(
+    runID: optionalSafeId(
       data.runID,
       "invalidRunID",
       options.maxIdChars,
@@ -1033,7 +1071,7 @@ export function parseRaceInput(input: unknown, lang: Lang, options: BridgeOption
       true,
       { min: 100, max: options.maxTestOutputChars },
     ),
-    runID: optionalBoundedString(data.runID, "invalidRunID", options.maxIdChars, "runID", lang),
+    runID: optionalSafeId(data.runID, "invalidRunID", options.maxIdChars, "runID", lang),
     maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
   }
 }
@@ -1055,7 +1093,7 @@ export type ApplyInput = {
 export function parseApplyInput(input: unknown, lang: Lang, options: BridgeOptions): ApplyInput {
   const data = record(input, lang)
   return {
-    raceID: requireBoundedId(data.raceID, "invalidRaceID", "raceID", options, lang),
+    raceID: requireSafeId(data.raceID, "invalidRaceID", "raceID", options, lang),
     candidateID: requireBoundedId(
       data.candidateID,
       "invalidCandidateID",
@@ -1103,7 +1141,7 @@ export function parseRaceStatusInput(
 ): RaceStatusInput {
   const data = record(input, lang)
   return {
-    raceID: optionalBoundedString(data.raceID, "invalidRaceID", options.maxIdChars, "raceID", lang),
+    raceID: optionalSafeId(data.raceID, "invalidRaceID", options.maxIdChars, "raceID", lang),
     maxOutputChars: maxOutput(data.maxOutputChars, lang, options),
   }
 }
@@ -1123,7 +1161,7 @@ export function parseRaceCleanupInput(
 ): RaceCleanupInput {
   const data = record(input, lang)
   return {
-    raceID: requireBoundedId(data.raceID, "invalidRaceID", "raceID", options, lang),
+    raceID: requireSafeId(data.raceID, "invalidRaceID", "raceID", options, lang),
     confirm: requireBoolean(data.confirm, "invalidConfirm", lang),
     force: optionalBoolean(data.force, "invalidInput", lang, false),
     archiveSessions: optionalBoolean(data.archiveSessions, "invalidInput", lang, true),

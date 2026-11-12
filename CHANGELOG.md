@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- P0-2: `runID`/`raceID` are validated as a single safe path segment before
+  reaching the filesystem, and `writePatchFile`/`removeRacePatches` hash any
+  legacy or hostile ID and verify containment under the plugin temp directory.
+  `createIntegrationWorktree` also sanitizes the worktree name.
+
 - P0-1: worker permission rules now append the deny preset after every
   caller-provided rule (OpenCode uses the last matching rule), filter caller
   `allow` rules for protected actions/resources, and deny

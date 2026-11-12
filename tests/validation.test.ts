@@ -1,13 +1,18 @@
 import { describe, expect, it } from "vitest"
 import { DEFAULT_OPTIONS, parseOptions } from "../src/options.ts"
 import {
+  parseApplyInput,
   parseListInput,
   parseOpenInput,
   parsePermissionsInput,
+  parseRaceCleanupInput,
+  parseRaceInput,
+  parseRaceStatusInput,
   parseReadInput,
   parseReplyInput,
   parseStatusInput,
   parseUpdateInput,
+  parseWorktreesInput,
   ValidationError,
 } from "../src/validation.ts"
 
@@ -126,6 +131,29 @@ describe("input validation", () => {
       parseOptions({ maxOutputChars: 50_000, maxOutputTotalChars: 30_000 })
         .maxOutputTotalChars,
     ).toBe(30_000)
+  })
+
+  it("P0-2: rejects unsafe run/race IDs used as filesystem segments", () => {
+    for (const runID of ["../../escape", "a/b", "a\\b", "C:evil", "..", "with space", "ñ"]) {
+      expect(() => parseRaceInput({ prompt: "hi", runID }, "en", DEFAULT_OPTIONS)).toThrow(
+        ValidationError,
+      )
+      expect(() =>
+        parseWorktreesInput({ action: "create", runID }, "en", DEFAULT_OPTIONS),
+      ).toThrow(ValidationError)
+    }
+    expect(parseRaceInput({ prompt: "hi", runID: "run_1.safe-2" }, "en", DEFAULT_OPTIONS).runID).toBe(
+      "run_1.safe-2",
+    )
+
+    const race = { raceID: "../../escape", candidateID: "candidate-1", confirm: true }
+    expect(() => parseApplyInput(race, "en", DEFAULT_OPTIONS)).toThrow(ValidationError)
+    expect(() => parseRaceStatusInput({ raceID: "../../escape" }, "en", DEFAULT_OPTIONS)).toThrow(
+      ValidationError,
+    )
+    expect(() =>
+      parseRaceCleanupInput({ raceID: "../../escape", confirm: true }, "en", DEFAULT_OPTIONS),
+    ).toThrow(ValidationError)
   })
 
   it("accepts an omitted argument object for tools without required fields", () => {

@@ -42,6 +42,15 @@ export function hasParentSegment(value: string): boolean {
   return value.split(/[\\/]+/).some((segment) => segment === "..")
 }
 
+/**
+ * IDs that may be used as a single filesystem path segment. Generated race,
+ * run, and candidate IDs use this shape; anything else must be hashed before
+ * it reaches `path.join`.
+ */
+export function isSafePathSegment(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) && !value.includes("..")
+}
+
 export type DirectoryValidationOptions = {
   projectDirectory?: string
   projectCanonical?: string

@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process"
+import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
+import { isPathInside, isSafePathSegment } from "./directories.ts"
 
 const WINDOWS = process.platform === "win32"
 const DEFAULT_TIMEOUT_MS = 120_000
@@ -441,14 +443,41 @@ export async function writePatchFile(
   candidateID: string,
   patch: string,
 ): Promise<string> {
-  const directory = path.join(tmpdir(), "opencode-session-bridge", "races", raceID)
+  const directory = racePatchDirectory(raceID)
   await mkdir(directory, { recursive: true })
-  const file = path.join(directory, `${candidateID.replace(/[^A-Za-z0-9_.-]/g, "_")}.patch`)
+  const file = path.join(directory, `${safePatchSegment(candidateID, "candidate")}.patch`)
+  if (!isPathInside(file, directory)) {
+    throw new Error("candidateID escapes the race patch directory")
+  }
   await writeFile(file, patch, "utf8")
   return file
 }
 
 export async function removeRacePatches(raceID: string): Promise<void> {
-  const directory = path.join(tmpdir(), "opencode-session-bridge", "races", raceID)
+  const directory = racePatchDirectory(raceID)
   await rm(directory, { recursive: true, force: true }).catch(() => undefined)
+}
+
+function patchRoot(): string {
+  return path.join(tmpdir(), "opencode-session-bridge", "races")
+}
+
+/**
+ * A race ID may come from tool input or from legacy storage. Only a single,
+ * safe path segment is used on disk; any other value is replaced by a stable
+ * hash so a crafted ID can never escape the plugin's temp directory.
+ */
+export function safePatchSegment(value: string, fallback = "race"): string {
+  if (isSafePathSegment(value) && value.length <= 128) return value
+  const digest = createHash("sha256").update(value).digest("hex").slice(0, 32)
+  return `${fallback}-${digest}`
+}
+
+function racePatchDirectory(raceID: string): string {
+  const root = patchRoot()
+  const directory = path.join(root, safePatchSegment(raceID))
+  if (!isPathInside(directory, root)) {
+    throw new Error("raceID escapes the plugin temp directory")
+  }
+  return directory
 }

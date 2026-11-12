@@ -222,6 +222,10 @@ const listed = await tools.sessions.worktrees({ action: "list" })
 
 `create` uses `ctx.worktree.create` (never a shell fallback) when
 `allowWorktreeManagement: true` and handles partial creation with rollback.
+`runID` is an internal identifier: it must match
+`^[A-Za-z0-9][A-Za-z0-9._-]*$` and cannot contain path separators, `..`,
+spaces, drive markers, or control characters. The same rule applies to race
+IDs, which are hashed before any path construction as a second barrier.
 `list` reports directory, branch, base, strategy, dirty state, and associated
 sessions. `remove` only touches tracked worktrees, refuses the project root,
 keeps dirty or active worktrees unless `force: true` plus `confirm: true`, and
