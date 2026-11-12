@@ -728,7 +728,12 @@ tests o CI no se consideren confiables, y `allowWorkerOrchestration` queda en
     opcionales. El truncado es seguro para pares sustitutos Unicode y está
     acotado por los límites solicitados. Una segunda pasada global aplica
     `maxOutputTotalChars` sobre el `output` serializado, recortando arrays de
-    atrás hacia adelante y conservando los campos críticos.
+    atrás hacia adelante y conservando los campos críticos. También acota las
+    estructuras anidadas de `race`/`raceStatus`: elimina candidatos desde el
+    final conservando el primero y el `recommended`, y luego recorta archivos,
+    stdout/stderr de tests, parche, texto y errores. Los flags visibles son
+    `candidatesTruncated`, `filesTruncated`, `testsTruncated` y
+    `patchTruncated`; los IDs, el estado y el primer candidato sobreviven.
 11. Una cache en vivo observa hooks de prompt, eventos `session.inbox.*` y
     eventos durables de ejecución/retry (solo IDs y delivery, nunca el texto del
     prompt) para informar trabajo encolado y fallos de ejecución. La suscripción

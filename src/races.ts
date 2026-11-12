@@ -551,6 +551,8 @@ export function boundedTests(
   }
 }
 
+const SHAPE_FILE_LIMIT = 20
+
 export function shapeCandidate(
   candidate: CandidateRecord,
   options: BridgeOptions,
@@ -560,18 +562,23 @@ export function shapeCandidate(
   maxErrorChars = options.maxErrorChars,
 ): Record<string, unknown> {
   let used = 0
-  const files = candidate.files.slice(0, 50).map((file) => {
+  let patchTruncated = false
+  const shownFiles = candidate.files.slice(0, SHAPE_FILE_LIMIT)
+  const files = shownFiles.map((file) => {
     const patch = file.patch ?? ""
     if (!patch) return file
     const remaining = Math.max(0, maxPatchChars - used)
     const shown = truncateCodePoints(patch, remaining, "…")
     used += codePointLength(shown)
+    const truncated = shown !== patch || Boolean(file.patchTruncated)
+    if (truncated) patchTruncated = true
     return {
       ...file,
       patch: shown,
-      ...(shown !== patch || file.patchTruncated ? { patchTruncated: true } : {}),
+      ...(truncated ? { patchTruncated: true } : {}),
     }
   })
+  const tests = boundedTests(candidate.tests, maxTestChars)
   return {
     candidateID: candidate.candidateID,
     sessionID: candidate.sessionID,
@@ -597,8 +604,14 @@ export function shapeCandidate(
         }
       : {}),
     diffStats: candidate.diffStats,
-    files: files.slice(0, 50),
-    ...(files.length > 50 ? { filesTruncated: true } : {}),
+    files,
+    ...(candidate.files.length > shownFiles.length || patchTruncated
+      ? { filesTruncated: true }
+      : {}),
+    ...(tests?.stdoutTruncated || tests?.stderrTruncated ? { testsTruncated: true } : {}),
+    ...(candidate.patch && codePointLength(candidate.patch) > maxPatchChars
+      ? { patchTruncated: true }
+      : {}),
     patchBytes: candidate.patchBytes,
     diffComplete: candidate.diffComplete,
     snapshotSource: candidate.snapshotSource,
@@ -607,7 +620,7 @@ export function shapeCandidate(
     ciFilesChanged: candidate.ciFilesChanged,
     skippedTests: candidate.skippedTests,
     verification: candidate.verification,
-    tests: boundedTests(candidate.tests, maxTestChars),
+    tests,
     ...(candidate.cost !== undefined ? { cost: compact(candidate.cost, 100) || undefined } : {}),
     ...(candidate.tokens !== undefined
       ? { tokens: compact(candidate.tokens, 200) || undefined }

@@ -216,8 +216,13 @@ const CRITICAL_OUTPUT_KEYS = new Set([
   "raceID",
   "candidateID",
   "candidates",
+  "candidatesTruncated",
+  "filesTruncated",
+  "testsTruncated",
+  "patchTruncated",
   "recommended",
   "rankingReasons",
+  "race",
   "applied",
   "alreadyApplied",
   "dryRun",
@@ -310,6 +315,167 @@ export function boundOutputTotal(output: unknown, maxChars: number): unknown {
         result.pendingTruncated = true
       }
     }
+    if (fits()) return result
+  }
+
+  const shrinkStringIn = (
+    item: Record<string, unknown>,
+    key: string,
+    flag: string,
+  ): boolean => {
+    const value = item[key]
+    if (typeof value !== "string" || value.length === 0) return false
+    const next = shrinkString(value)
+    if (next) item[key] = next
+    else delete item[key]
+    item[flag] = true
+    return true
+  }
+
+  const shrinkCandidate = (item: Record<string, unknown>): boolean => {
+    const files = item.files
+    if (Array.isArray(files)) {
+      if (files.length > 1) {
+        item.files = files.slice(0, 1)
+        item.filesTruncated = true
+        return true
+      }
+      const file = files[0]
+      if (file && typeof file === "object" && !Array.isArray(file)) {
+        const entry = file as Record<string, unknown>
+        if (shrinkStringIn(entry, "patch", "patchTruncated")) {
+          item.filesTruncated = true
+          return true
+        }
+        for (const key of Object.keys(entry)) {
+          if (key === "file" || key === "status") continue
+          if (typeof entry[key] === "string" && key !== "patch") {
+            const next = shrinkString(entry[key] as string)
+            if (next) entry[key] = next
+            else delete entry[key]
+            item.filesTruncated = true
+            return true
+          }
+        }
+      }
+    }
+    const tests = item.tests
+    if (tests && typeof tests === "object" && !Array.isArray(tests)) {
+      const entry = tests as Record<string, unknown>
+      for (const key of ["stdout", "stderr"]) {
+        if (shrinkStringIn(entry, key, "stdoutTruncated")) {
+          item.testsTruncated = true
+          return true
+        }
+      }
+      for (const key of ["setup", "teardown"]) {
+        const summary = entry[key]
+        if (!summary || typeof summary !== "object" || Array.isArray(summary)) continue
+        const nested = summary as Record<string, unknown>
+        for (const outputKey of ["stdout", "stderr"]) {
+          if (shrinkStringIn(nested, outputKey, "stdoutTruncated")) {
+            item.testsTruncated = true
+            return true
+          }
+        }
+      }
+      for (const key of ["command", "reason"]) {
+        if (shrinkStringIn(entry, key, "testsTruncated")) {
+          item.testsTruncated = true
+          return true
+        }
+      }
+    }
+    for (const [key, flag] of [
+      ["patch", "patchTruncated"],
+      ["text", "textTruncated"],
+      ["error", "errorTruncated"],
+    ] as const) {
+      if (shrinkStringIn(item, key, flag)) return true
+    }
+    return false
+  }
+
+  const trimCandidates = (): boolean => {
+    const current = result.candidates
+    if (!Array.isArray(current) || current.length <= 1) return false
+    const recommended =
+      typeof result.recommended === "string" ? result.recommended : undefined
+    const copy = [...current]
+    let changed = false
+    while (copy.length > 1 && !fits()) {
+      const recommendedIndex = recommended
+        ? copy.findIndex(
+            (entry) =>
+              entry &&
+              typeof entry === "object" &&
+              (entry as Record<string, unknown>).candidateID === recommended,
+          )
+        : -1
+      let dropIndex = copy.length - 1
+      if (dropIndex === recommendedIndex) dropIndex--
+      if (dropIndex <= 0) break
+      copy.splice(dropIndex, 1)
+      changed = true
+      result.candidates = copy
+    }
+    if (changed) result.candidatesTruncated = true
+    return changed
+  }
+
+  if (trimCandidates()) {
+    if (fits()) return result
+  }
+
+  let candidateGuard = 0
+  while (!fits() && candidateGuard++ < 500) {
+    const current = result.candidates
+    if (!Array.isArray(current) || current.length === 0) break
+    const recommended =
+      typeof result.recommended === "string" ? result.recommended : undefined
+    const order: number[] = []
+    for (let index = current.length - 1; index >= 1; index--) {
+      const entry = current[index]
+      if (
+        entry &&
+        typeof entry === "object" &&
+        (entry as Record<string, unknown>).candidateID === recommended
+      ) {
+        continue
+      }
+      order.push(index)
+    }
+    order.push(0)
+    const recommendedIndex = recommended
+      ? current.findIndex(
+          (entry) =>
+            entry &&
+            typeof entry === "object" &&
+            (entry as Record<string, unknown>).candidateID === recommended,
+        )
+      : -1
+    if (recommendedIndex > 0) order.push(recommendedIndex)
+    let changed = false
+    for (const index of order) {
+      const entry = current[index]
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue
+      if (shrinkCandidate(entry as Record<string, unknown>)) {
+        changed = true
+        break
+      }
+    }
+    if (!changed) break
+  }
+  if (fits()) return result
+
+  // raceStatus wraps the race in `{ race, state }`; bound the nested object
+  // with the remaining budget while preserving identity fields.
+  if (result.race && typeof result.race === "object" && !Array.isArray(result.race)) {
+    const overhead = jsonLength({ ...result, race: null })
+    result.race = boundOutputTotal(
+      result.race,
+      Math.max(2_000, maxChars - overhead),
+    )
     if (fits()) return result
   }
 

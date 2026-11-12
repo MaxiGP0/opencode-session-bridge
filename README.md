@@ -716,7 +716,12 @@ cannot use orchestration tools.
     IDs, pending permissions, and errors before optional text/tools. Truncation
     is safe for Unicode surrogate pairs and bounded by the requested limits.
     A second, global pass enforces `maxOutputTotalChars` over the serialized
-    `output`, trimming arrays last-to-first and preserving critical fields.
+    `output`, trimming arrays last-to-first and preserving critical fields. It
+    also bounds nested `race`/`raceStatus` structures: candidates are dropped
+    from the end while keeping the first and `recommended`, then candidate
+    files, test stdout/stderr, patch, text, and errors are shrunk. Visible flags
+    are `candidatesTruncated`, `filesTruncated`, `testsTruncated`, and
+    `patchTruncated`; IDs, status, and the first candidate survive the trim.
 11. A live in-memory cache observes prompt hooks, `session.inbox.*` events, and
     durable execution/retry events (IDs and delivery only, never prompt text)
     to report foreign queued work and execution failures. The subscription

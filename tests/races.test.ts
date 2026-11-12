@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest"
+import { boundOutputTotal } from "../src/output.ts"
+import { DEFAULT_OPTIONS } from "../src/options.ts"
 import {
   analyzeDiffs,
   isCiPath,
@@ -6,8 +8,10 @@ import {
   parsePatchFiles,
   patchDisablesTests,
   rankCandidates,
+  shapeRace,
   verificationFor,
   type CandidateRecord,
+  type RaceRecord,
 } from "../src/races.ts"
 
 function candidate(overrides: Partial<CandidateRecord>): CandidateRecord {
@@ -186,5 +190,69 @@ describe("race diff analysis", () => {
     const ranking = rankCandidates([skipped])
     expect(ranking.recommended).toBeUndefined()
     expect(ranking.rankingReasons).toContain("tests-skipped")
+  })
+
+  it("P1-1: bounds a large race to the global output budget and keeps critical IDs", () => {
+    const files = Array.from({ length: 50 }, (_, index) => ({
+      file: `src/file-${index}.ts`,
+      status: "modified" as const,
+      additions: 10,
+      deletions: 2,
+      patch: `+${"x".repeat(1_000)}\n`,
+    }))
+    const candidates = Array.from({ length: 8 }, (_, index) =>
+      candidate({
+        candidateID: `candidate-${index + 1}`,
+        index,
+        files,
+        diffStats: { files: 50, additions: 500, deletions: 100 },
+        patch: `diff-${index}-${"y".repeat(5_000)}`,
+        patchBytes: 5_000,
+        text: "z".repeat(4_000),
+        tests: {
+          skipped: false,
+          passed: true,
+          exitCode: 0,
+          stdout: "o".repeat(20_000),
+          stderr: "e".repeat(20_000),
+        },
+      }),
+    )
+    const race: RaceRecord = {
+      raceID: "race_budget",
+      createdAt: 1,
+      updatedAt: 2,
+      targetDirectory: "C:/repo",
+      mode: "worktrees",
+      prompt: "implement it",
+      base: "base",
+      keepWorktrees: false,
+      status: "completed",
+      candidates,
+      worktrees: [],
+    }
+    const shaped = shapeRace(race, DEFAULT_OPTIONS, rankCandidates(candidates))
+    const bounded = boundOutputTotal({ ...shaped, state: "ok" }, 20_000) as Record<
+      string,
+      unknown
+    >
+    expect(JSON.stringify(bounded).length).toBeLessThanOrEqual(20_000)
+    expect(bounded.raceID).toBe("race_budget")
+    expect(bounded.status).toBe("completed")
+    const survivors = bounded.candidates as Array<Record<string, unknown>>
+    expect(survivors.length).toBeGreaterThanOrEqual(1)
+    expect(survivors[0]?.candidateID).toBe("candidate-1")
+    expect(bounded.candidatesTruncated).toBe(true)
+    expect(survivors[0]?.filesTruncated).toBe(true)
+
+    const wrapped = boundOutputTotal(
+      { race: shaped, state: "ok" },
+      20_000,
+    ) as Record<string, unknown>
+    expect(JSON.stringify(wrapped).length).toBeLessThanOrEqual(20_000)
+    expect((wrapped.race as Record<string, unknown>).raceID).toBe("race_budget")
+    expect(
+      ((wrapped.race as Record<string, unknown>).candidates as unknown[]).length,
+    ).toBeGreaterThanOrEqual(1)
   })
 })

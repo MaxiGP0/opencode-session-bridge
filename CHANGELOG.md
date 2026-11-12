@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- P1-1: the global output budget now bounds nested `race`/`raceStatus`
+  candidate arrays, per-candidate files, test output, patches, and text.
+  `filesTruncated` is computed against the real file count and new
+  `candidatesTruncated`, `testsTruncated`, and `patchTruncated` flags make the
+  lost detail visible while IDs and state survive.
+
 ### Security
 
 - P0-5: `applyCandidate` now rejects `verifyCommand` unless
