@@ -53,6 +53,12 @@ export type WaitOptions = {
   initialPermissionCheckAt?: number
   requireAnchor?: boolean
   promptMessageID?: string
+  /**
+   * Reject an anchor whose creation time is older than this epoch ms. Used
+   * when the session reports busy with a turn that the transcript has not
+   * persisted yet; prevents a stale last-user anchor from returning idle.
+   */
+  minimumAnchorCreatedAt?: number
   pollIntervalMs?: number
   maxPollIntervalMs?: number
   permissionPollMs?: number
@@ -182,6 +188,8 @@ export type Evaluation = {
   anchorCreatedAt?: number
   hasTurnAssistant: boolean
   queued: boolean
+  /** The visible anchor predates the turn the session is currently running. */
+  staleAnchor?: boolean
 }
 
 function isRelevant(message: MessageLike | undefined): boolean {
@@ -243,6 +251,23 @@ export function evaluateTurn(messages: MessageLike[], options: WaitOptions): Eva
   const anchorMessage = messages[anchorIndex]
   const anchorCreatedAt = anchorMessage?.time?.created ?? options.admittedAt
   const anchorFound = hasExplicitAnchor
+
+  if (
+    options.minimumAnchorCreatedAt !== undefined &&
+    (typeof anchorCreatedAt !== "number" ||
+      anchorCreatedAt < options.minimumAnchorCreatedAt)
+  ) {
+    return {
+      done: false,
+      startIndex: anchorIndex,
+      anchorFound,
+      anchorMessage,
+      anchorCreatedAt,
+      hasTurnAssistant: false,
+      queued: true,
+      staleAnchor: true,
+    }
+  }
 
   if (anchorMessage?.type !== "user") {
     for (let index = anchorIndex + 1; index < messages.length; index++) {
@@ -664,6 +689,7 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
           }
           if (
             sawSuccessEvent &&
+            !evaluation.staleAnchor &&
             (evaluation.hasTurnAssistant || evaluation.anchorMessage?.type === "user") &&
             !evaluation.queued
           ) {
@@ -1114,6 +1140,7 @@ export async function waitForTurn(ctx: WaitContext, options: WaitOptions): Promi
       // never persists an `idle` message within the settle window.
       if (
         settleRemaining === 0 &&
+        !evaluation.staleAnchor &&
         sawSuccessEvent &&
         (evaluation.hasTurnAssistant || evaluation.anchorMessage?.type === "user") &&
         !evaluation.queued

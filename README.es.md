@@ -705,7 +705,11 @@ tests o CI no se consideren confiables, y `allowWorkerOrchestration` queda en
 5. Un turno exitoso requiere el ancla como mensaje de usuario, un `idle`
    posterior y un mensaje de assistant/compaction después del ancla. Los idles
    del turno anterior se ignoran, incluso tras prompts encolados o `steer`. Un
-   idle failed/interrupted puede completar un turno sin texto del asistente.
+   idle failed/interrupted puede completar un turno sin texto del asistente. Si
+   la sesión está `busy` y el usuario visible más reciente es anterior a
+   `session.time.busy`, el ancla es obsoleta: `wait` sigue esperando el próximo
+   turno en vez de devolver el resultado anterior, e informa `anchorStale:
+   true` / `waitingFor: "next-turn"`.
 6. Un retry del proveedor (`session.status` con `type: "retry"` o
    `session.retry.scheduled`) se informa como `retrying` con intento, motivo y
    próximo reintento. `next`/`at` son epoch ms absolutos; el `content` muestra

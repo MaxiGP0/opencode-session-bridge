@@ -694,7 +694,11 @@ cannot use orchestration tools.
 5. A successful turn requires the anchor as a user message, a later `idle`, and
    an assistant/compaction message after the anchor. Idles from the previous
    turn are ignored, including after queued/steered prompts. A failed or
-   interrupted idle can complete a turn without assistant text.
+   interrupted idle can complete a turn without assistant text. If the session
+   reports `busy` and the newest visible user message predates
+   `session.time.busy`, the anchor is considered stale: `wait` keeps waiting for
+   the next turn instead of returning the previous result, and reports
+   `anchorStale: true` / `waitingFor: "next-turn"`.
 6. A provider retry (`session.status` with `type: "retry"` or
    `session.retry.scheduled`) is reported as `retrying` with the attempt,
    reason, and next retry. `next`/`at` are absolute epoch milliseconds;

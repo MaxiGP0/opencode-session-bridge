@@ -118,6 +118,32 @@ afterEach(() => {
 })
 
 describe("waitForTurn", () => {
+  it("P1-2: does not finish on an anchor older than the busy turn", async () => {
+    const old = [user("old", "old prompt", 1), assistant("old-answer", "old answer", 2), idle("old-idle", 3)]
+    const fresh = [
+      ...old,
+      user("fresh", "fresh prompt", 101),
+      assistant("fresh-answer", "fresh answer", 102),
+      idle("fresh-idle", 103),
+    ]
+    const snapshots = [old, old, fresh]
+    const { ctx, stats } = makeContext({
+      context: (call) => snapshots[Math.min(call - 1, snapshots.length - 1)],
+    })
+    const result = await waitForTurn(ctx, {
+      sessionID: "ses_1",
+      timeoutMs: 2_000,
+      requireAnchor: false,
+      minimumAnchorCreatedAt: 100,
+      pollIntervalMs: 10,
+      permissionPollMs: 1_000,
+    })
+    expect(result.state).toBe("idle")
+    expect(result.startIndex).toBe(3)
+    expect(summarizeTurn(result.messages, result.startIndex).text).toBe("fresh answer")
+    expect(stats.contextCalls).toBeGreaterThanOrEqual(3)
+  })
+
   it("uses the prompt ID anchor and needs at most two context reads on a normal turn", async () => {
     const { ctx, stats } = makeContext({
       wait: async () => {

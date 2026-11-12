@@ -2760,6 +2760,49 @@ describe("orchestration tools", () => {
     expect((sessions[0]?.background as unknown[]).length).toBe(1)
   })
 
+  it("P1-2: wait does not return idle when the session is busy with a newer turn", async () => {
+    const old: MessageLike[] = [
+      { id: "old", type: "user", text: "old prompt", time: { created: 1 } },
+      {
+        id: "old-answer",
+        type: "assistant",
+        content: [{ type: "text", text: "old answer" }],
+        time: { created: 2 },
+      },
+      { id: "old-idle", type: "idle", outcome: "succeeded", time: { created: 3 } },
+    ]
+    const fresh: MessageLike[] = [
+      ...old,
+      { id: "fresh", type: "user", text: "fresh prompt", time: { created: 51 } },
+      {
+        id: "fresh-answer",
+        type: "assistant",
+        content: [{ type: "text", text: "fresh answer" }],
+        time: { created: 52 },
+      },
+      { id: "fresh-idle", type: "idle", outcome: "succeeded", time: { created: 53 } },
+    ]
+    const harness = makeHarness({
+      sessions: [
+        fakeSession("ses_busy", {
+          time: { created: 1, updated: 50, busy: 50, idle: 3 },
+        }),
+        fakeSession("ses_caller", { model: { providerID: "p", id: "m" } }),
+      ],
+      messages: { ses_busy: old },
+      contextSnapshots: [old, old, fresh],
+      options: { pollIntervalMs: 20, permissionPollMs: 1_000 },
+    })
+    const result = await harness.executeRaw("wait", {
+      sessionID: "ses_busy",
+      timeoutMs: 2_000,
+    })
+    expect(result.output).toMatchObject({ state: "idle" })
+    expect(result.output).toMatchObject({ text: "fresh answer" })
+    expect((result.output as Record<string, unknown>).lastMessageID).toBe("fresh-idle")
+    expect(harness.state.contextCalls).toBeGreaterThanOrEqual(3)
+  })
+
   it("O-2/O-4/O-5: worktree race, snapshot, ranking, and cleanup", async () => {
     const repo = await makeTempRepo()
     try {

@@ -2709,6 +2709,16 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
 
       const running = liveRunning ?? isRunning(session, messages)
       const user = lastUser(messages)
+      const busySince =
+        typeof session.time?.busy === "number" &&
+        (typeof session.time?.idle !== "number" || session.time.busy > session.time.idle)
+          ? session.time.busy
+          : undefined
+      const staleAnchor =
+        !targetMessageID &&
+        busySince !== undefined &&
+        (user?.time?.created ?? 0) < busySince
+      const minimumAnchorCreatedAt = staleAnchor ? busySince : undefined
       const anchorID = targetMessageID ?? user?.id
       const evaluation = anchorID
         ? evaluateTurn(messages, {
@@ -2717,6 +2727,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
             requireAnchor: Boolean(targetMessageID),
             promptMessageID: targetMessageID,
             timeoutMs: data.timeoutMs,
+            ...(minimumAnchorCreatedAt !== undefined ? { minimumAnchorCreatedAt } : {}),
           })
         : undefined
 
@@ -2763,7 +2774,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         }
       }
 
-      if (!targetMessageID && !running && !contextFailed && (!user || evaluation?.done)) {
+      if (!targetMessageID && !running && !contextFailed && !staleAnchor && (!user || evaluation?.done)) {
         if (!user) {
           const idle = lastIdle(messages)
           const lastOutcome = idle?.outcome ?? session.outcome
@@ -2828,17 +2839,18 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
 
       const turn = await waitForTurn(deps.ctx, {
         sessionID: data.sessionID,
-        anchorID,
-        promptText: targetMessageID ? undefined : user?.text,
-        admittedAt: targetMessageID ? undefined : user?.time?.created,
+        anchorID: staleAnchor ? undefined : anchorID,
+        promptText: targetMessageID || staleAnchor ? undefined : user?.text,
+        admittedAt: targetMessageID || staleAnchor ? undefined : user?.time?.created,
         timeoutMs: remainingMs(),
         signal,
         initialMessages: contextFailed ? undefined : messages,
         initialFetchCount: messagesResult.status === "fulfilled" ? 1 : 0,
         initialPermissions: pending,
         initialPermissionCheckAt: permissionCheckedAt,
-        requireAnchor: Boolean(anchorID),
-        promptMessageID: targetMessageID ?? user?.id,
+        requireAnchor: !staleAnchor && Boolean(anchorID),
+        promptMessageID: staleAnchor ? undefined : (targetMessageID ?? user?.id),
+        ...(minimumAnchorCreatedAt !== undefined ? { minimumAnchorCreatedAt } : {}),
         ...waitConfig(deps, context, data.sessionID),
       })
       if (turn.state === "aborted") throw abortError(signal)
@@ -2883,7 +2895,9 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
       }
       return {
         content,
-        output: turnOutputValue(data.sessionID, session.title, turn, deps.options),
+        output: turnOutputValue(data.sessionID, session.title, turn, deps.options, {
+          ...(staleAnchor ? { anchorStale: true, waitingFor: "next-turn" } : {}),
+        }),
       }
     },
     "couldNotWait",

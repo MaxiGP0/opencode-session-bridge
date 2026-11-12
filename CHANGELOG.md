@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- P1-2: `wait` no longer returns `idle` while `session.get` reports `busy` and
+  the newest visible user message predates `session.time.busy`. It waits for the
+  next turn and reports `anchorStale`/`waitingFor: "next-turn"`. Explicit
+  `messageID` anchors keep their exact semantics.
+
 - P1-1: the global output budget now bounds nested `race`/`raceStatus`
   candidate arrays, per-candidate files, test output, patches, and text.
   `filesTruncated` is computed against the real file count and new

@@ -102,6 +102,9 @@ export type WaitOneResult = {
   lastMessageID?: string
   outcome?: string
   elapsedMs: number
+  /** Diagnostic: the visible transcript anchor predates the busy turn. */
+  anchorStale?: boolean
+  waitingFor?: "next-turn"
   retry?: {
     attempt: number
     message: string
@@ -249,16 +252,29 @@ async function waitOne(
   const pending = pendingResult.status === "fulfilled" ? pendingResult.value : []
   const permissionCheckedAt = Date.now()
   const live = deps.liveState?.get(sessionID)
-  const anchorID =
-    messageID ??
-    live?.pending[0]?.messageID ??
-    lastUser(messages)?.id
+  const lastVisibleUser = lastUser(messages)
+  const busySince =
+    typeof session.time?.busy === "number" &&
+    (typeof session.time?.idle !== "number" || session.time.busy > session.time.idle)
+      ? session.time.busy
+      : undefined
+  // A busy session whose newest visible user predates the current busy turn
+  // means the transcript is behind. Returning idle here would hand the caller
+  // the previous turn's result.
+  const staleAnchor =
+    !messageID &&
+    busySince !== undefined &&
+    (lastVisibleUser?.time?.created ?? 0) < busySince
+  const liveAnchor = staleAnchor ? undefined : live?.pending[0]?.messageID
+  const anchorID = messageID ?? liveAnchor ?? lastVisibleUser?.id
+  const minimumAnchorCreatedAt = staleAnchor ? busySince : undefined
   const evaluation = anchorID
     ? evaluateTurn(messages, {
         sessionID,
         anchorID,
         requireAnchor: Boolean(messageID),
         timeoutMs: timeout,
+        ...(minimumAnchorCreatedAt !== undefined ? { minimumAnchorCreatedAt } : {}),
       })
     : undefined
 
@@ -271,10 +287,14 @@ async function waitOne(
       elapsedMs: Date.now() - started,
       pendingPermissions: pendingOutput(pending),
       settled: false,
+      ...(staleAnchor ? { anchorStale: true, waitingFor: "next-turn" as const } : {}),
     }
   }
 
-  if (evaluation?.done || (!anchorID && !isRunning(session, messages))) {
+  if (
+    evaluation?.done ||
+    (!evaluation?.staleAnchor && !anchorID && !isRunning(session, messages))
+  ) {
     let background: LiveBackground[] | undefined
     if (deps.liveState) {
       background = deps.liveState.get(sessionID).background
@@ -300,17 +320,18 @@ async function waitOne(
 
   const turn = await waitForTurn(deps.ctx, {
     sessionID,
-    anchorID,
-    promptText: messageID ? undefined : lastUser(messages)?.text,
-    admittedAt: messageID ? undefined : lastUser(messages)?.time?.created,
+    anchorID: staleAnchor ? undefined : anchorID,
+    promptText: messageID || staleAnchor ? undefined : lastVisibleUser?.text,
+    admittedAt: messageID || staleAnchor ? undefined : lastVisibleUser?.time?.created,
     timeoutMs: remaining(),
     signal,
     initialMessages: messagesResult.status === "fulfilled" ? messages : undefined,
     initialFetchCount: messagesResult.status === "fulfilled" ? 1 : 0,
     initialPermissions: pending,
     initialPermissionCheckAt: permissionCheckedAt,
-    requireAnchor: Boolean(anchorID),
-    promptMessageID: anchorID,
+    requireAnchor: !staleAnchor && Boolean(anchorID),
+    promptMessageID: staleAnchor ? undefined : anchorID,
+    ...(minimumAnchorCreatedAt !== undefined ? { minimumAnchorCreatedAt } : {}),
     pollIntervalMs: deps.options.pollIntervalMs,
     maxPollIntervalMs: deps.options.maxPollIntervalMs,
     permissionPollMs: deps.options.permissionPollMs,
@@ -353,12 +374,13 @@ async function waitOne(
   return {
     sessionID,
     state,
-    messageID: anchorID,
+    messageID: staleAnchor ? (turn.anchorMessage?.id ?? anchorID) : anchorID,
     lastMessageID: summary?.lastMessageID ?? turn.messages[turn.messages.length - 1]?.id,
     outcome: summary?.outcome ?? turn.idle?.outcome,
     elapsedMs: Date.now() - started,
     retry: retryOutput(turn.retry),
     pendingPermissions: pendingOutput(turn.pendingPermissions),
+    ...(staleAnchor ? { anchorStale: true, waitingFor: "next-turn" as const } : {}),
     ...(error ? { error } : {}),
     ...(background ? { background: backgroundOutput(background) } : {}),
     settled: state === "idle" || state === "error",
