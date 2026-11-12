@@ -777,6 +777,8 @@ tests o CI no se consideren confiables, y `allowWorkerOrchestration` queda en
     stdout/stderr de tests, parche, texto y errores. Los flags visibles son
     `candidatesTruncated`, `filesTruncated`, `testsTruncated` y
     `patchTruncated`; los IDs, el estado y el primer candidato sobreviven.
+    `jsonSafe` también convierte objetos y arrays circulares en `"[Circular]"`
+    antes de llegar a Code Mode o a `JSON.stringify`.
 11. Una cache en vivo observa hooks de prompt, eventos `session.inbox.*` y
     eventos durables de ejecución/retry (solo IDs y delivery, nunca el texto del
     prompt) para informar trabajo encolado y fallos de ejecución. La suscripción

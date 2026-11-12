@@ -159,10 +159,14 @@ export function jsonSafe(value: unknown, path = new WeakSet<object>()): unknown 
   if (type === "bigint") return String(value)
   if (type === "function" || type === "symbol") return undefined
   if (Array.isArray(value)) {
-    return value.map((item) => {
-      const converted = jsonSafe(item, path)
-      return converted === undefined ? null : converted
+    if (path.has(value)) return "[Circular]"
+    path.add(value)
+    const converted = value.map((item) => {
+      const result = jsonSafe(item, path)
+      return result === undefined ? null : result
     })
+    path.delete(value)
+    return converted
   }
   if (type !== "object") return undefined
   const object = value as Record<string, unknown>

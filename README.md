@@ -763,6 +763,8 @@ cannot use orchestration tools.
     files, test stdout/stderr, patch, text, and errors are shrunk. Visible flags
     are `candidatesTruncated`, `filesTruncated`, `testsTruncated`, and
     `patchTruncated`; IDs, status, and the first candidate survive the trim.
+    `jsonSafe` also converts circular objects and arrays to `"[Circular]"`
+    before they reach Code Mode or `JSON.stringify`.
 11. A live in-memory cache observes prompt hooks, `session.inbox.*` events, and
     durable execution/retry events (IDs and delivery only, never prompt text)
     to report foreign queued work and execution failures. The subscription
