@@ -301,7 +301,10 @@ await tools.sessions.applyCandidate({
 ```
 
 `applyCandidate` requires a registered race, `allowApplyCandidates`, and
-`confirm: true`. It refuses a dirty target, an in-progress merge/rebase/
+`confirm: true`. A `verifyCommand` additionally requires `allowTestCommands:
+true`; without it the call fails before creating an integration worktree. The
+command is parsed with `parseCommand` up front. It refuses a dirty target, an
+in-progress merge/rebase/
 cherry-pick, a base that is not an ancestor, an incomplete patch, or a
 cherry-pick without a commit. It verifies in an integration worktree first when
 `verifyCommand` or `dryRun` is used, creates a backup branch before touching the

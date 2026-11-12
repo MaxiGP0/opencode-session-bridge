@@ -3030,6 +3030,7 @@ describe("orchestration tools", () => {
         initialRaces: [race],
         options: {
           allowApplyCandidates: true,
+          allowTestCommands: true,
           allowWorktreeManagement: true,
           allowPushCandidates: true,
           gitTimeoutMs: 30_000,
@@ -3075,6 +3076,98 @@ describe("orchestration tools", () => {
         confirm: true,
       })
       expect(second.output).toMatchObject({ alreadyApplied: true, applied: false })
+    } finally {
+      await repo.cleanup()
+    }
+  })
+
+  it("P0-5: verifyCommand requires allowTestCommands", async () => {
+    const repo = await makeTempRepo()
+    try {
+      await writeFile(path.join(repo.directory, "feature.txt"), "feature\n", "utf8")
+      await runGit(["add", "."], repo.directory)
+      await runGit(["commit", "-m", "feature"], repo.directory)
+      const commit = (await runGit(["rev-parse", "HEAD"], repo.directory)).stdout.trim()
+      const patch = (await runGit(["diff", "--binary", repo.base, commit], repo.directory)).stdout
+      await runGit(["reset", "--hard", repo.base], repo.directory)
+      const race = {
+        raceID: "race_verify_optin",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        targetDirectory: repo.directory,
+        mode: "worktrees",
+        prompt: "implement it",
+        base: repo.base,
+        keepWorktrees: false,
+        status: "completed",
+        worktrees: [],
+        candidates: [
+          {
+            candidateID: "candidate-1",
+            index: 0,
+            messageID: "msg_1",
+            directory: repo.directory,
+            strategy: "clone",
+            base: repo.base,
+            patch,
+            patchBytes: patch.length,
+            diffComplete: true,
+            snapshotSource: "git-patch",
+            files: [],
+            diffStats: { files: 1, additions: 1, deletions: 0 },
+            testFilesChanged: false,
+            ciFilesChanged: false,
+            skippedTests: false,
+            verification: "unknown",
+            tests: { skipped: true, reason: "no test command" },
+            state: "idle",
+            elapsedMs: 10,
+            applyStrategy: "patch",
+          },
+        ],
+      }
+      const input = {
+        raceID: race.raceID,
+        candidateID: "candidate-1",
+        strategy: "apply",
+        verifyCommand: 'node -e "require(\'fs\').writeFileSync(\'verify-ran.txt\',\'1\')"',
+        dryRun: true,
+        confirm: true,
+      }
+
+      const denied = makeHarness({
+        repoDirectory: repo.directory,
+        worktreeMissing: true,
+        initialRaces: [race],
+        options: {
+          allowApplyCandidates: true,
+          allowWorktreeManagement: true,
+          gitTimeoutMs: 30_000,
+        },
+      })
+      const blocked = await denied.executeRaw("applyCandidate", input)
+      expect(blocked.output).toMatchObject({ state: "error" })
+      expect(String((blocked.output as Record<string, unknown>).error)).toContain(
+        "allowTestCommands",
+      )
+
+      const allowed = makeHarness({
+        repoDirectory: repo.directory,
+        worktreeMissing: true,
+        initialRaces: [race],
+        options: {
+          allowApplyCandidates: true,
+          allowTestCommands: true,
+          allowWorktreeManagement: true,
+          gitTimeoutMs: 30_000,
+        },
+      })
+      const result = await allowed.executeRaw("applyCandidate", input)
+      expect(result.output).toMatchObject({
+        state: "ok",
+        dryRun: true,
+        verification: { passed: true },
+      })
     } finally {
       await repo.cleanup()
     }
@@ -3129,6 +3222,7 @@ describe("orchestration tools", () => {
         initialRaces: [baseRace],
         options: {
           allowApplyCandidates: true,
+          allowTestCommands: true,
           allowWorktreeManagement: true,
           gitTimeoutMs: 30_000,
         },
@@ -3222,6 +3316,7 @@ describe("orchestration tools", () => {
         initialRaces: [race],
         options: {
           allowApplyCandidates: true,
+          allowTestCommands: true,
           allowWorktreeManagement: true,
           gitTimeoutMs: 30_000,
         },
@@ -3313,6 +3408,7 @@ describe("orchestration tools", () => {
         initialRaces: [race],
         options: {
           allowApplyCandidates: true,
+          allowTestCommands: true,
           allowWorktreeManagement: true,
           gitTimeoutMs: 30_000,
         },

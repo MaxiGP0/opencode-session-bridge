@@ -1790,6 +1790,17 @@ export async function applyCandidate(
   if (!deps.options.allowApplyCandidates) {
     throw new Error("allowApplyCandidates is false; enable it to apply a candidate")
   }
+  if (input.verifyCommand) {
+    if (!deps.options.allowTestCommands) {
+      throw new Error(
+        "verifyCommandDisabled: verifyCommand requires allowTestCommands: true",
+      )
+    }
+    const parsed = parseCommand(input.verifyCommand)
+    if (!parsed.ok) {
+      throw new Error(`verifyCommand is invalid: ${parsed.error}`)
+    }
+  }
   await assertPermission(deps.ctx, context, "session_bridge.apply", [
     input.raceID,
     input.candidateID,

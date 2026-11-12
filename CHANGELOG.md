@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- P0-5: `applyCandidate` now rejects `verifyCommand` unless
+  `allowTestCommands: true` is set, before creating an integration worktree or
+  touching the target. `verifyCommand` is parsed with `parseCommand` up front.
+  This is a behavior change: previously `allowApplyCandidates` alone was enough.
+
 - P0-4: the worker role is persistent while the session exists. The 7-day TTL
   no longer deletes registrations, touches refresh in memory and persist at most
   once per minute, and the 500-entry LRU evicts the least recently seen stale

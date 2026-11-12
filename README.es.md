@@ -310,7 +310,10 @@ await tools.sessions.applyCandidate({
 ```
 
 `applyCandidate` exige una carrera registrada, `allowApplyCandidates` y
-`confirm: true`. Rechaza un target dirty, un merge/rebase/cherry-pick en curso,
+`confirm: true`. Un `verifyCommand` requiere además `allowTestCommands: true`;
+sin esa opción la llamada falla antes de crear el worktree de integración. El
+comando se parsea con `parseCommand` al inicio. Rechaza un target dirty, un
+merge/rebase/cherry-pick en curso,
 una base que no es ancestro, un parche incompleto o un cherry-pick sin commit.
 Verifica primero en un worktree de integración cuando se usa `verifyCommand` o
 `dryRun`, crea una rama de respaldo antes de tocar el target, es idempotente

@@ -121,9 +121,10 @@ describe("session registry", () => {
 
     const first = touchWorkerSession(workers, "ses_old_worker")
     expect(first.persist).toBe(true)
-    const second = touchWorkerSession(workers, "ses_old_worker", Date.now() + 1_000)
+    const later = Date.now() + 1_000
+    const second = touchWorkerSession(workers, "ses_old_worker", later)
     expect(second.persist).toBe(false)
-    expect(second.entry?.at).toBe(Date.now() + 1_000)
+    expect(second.entry?.at).toBe(later)
   })
 
   it("P0-4: LRU eviction prefers stale workers and never drops a recently seen one", async () => {
