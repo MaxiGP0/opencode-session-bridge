@@ -172,6 +172,7 @@ export default Plugin.define({
         races,
         git: runGit,
         refreshWorkers,
+        persistWorkers: () => persistWorkerSessions(ctx, workerSessions),
       })
     })
 

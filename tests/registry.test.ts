@@ -4,14 +4,19 @@ import {
   forgetOpenSessionsBySessionID,
   forgetOwnedSession,
   isOwnedSession,
+  isWorkerSession,
   loadOpenSessions,
   loadOwnedSessions,
   lookupOpenSession,
   OWNED_TTL_MS,
   rememberOpenSession,
   rememberOwnedSession,
+  rememberWorkerSession,
+  touchWorkerSession,
+  WORKER_TTL_MS,
   type OpenSessionMapping,
   type OwnedSessions,
+  type WorkerSessions,
 } from "../src/registry.ts"
 import type { PluginContext } from "../src/types.ts"
 
@@ -99,6 +104,54 @@ describe("session registry", () => {
 
     const loaded = await loadOpenSessions(ctx)
     expect(loaded.has("msg_other")).toBe(false)
+  })
+
+  it("P0-4: keeps the worker role beyond the old TTL and touches it cheaply", async () => {
+    const { ctx } = makeContext("C:/repo")
+    const workers: WorkerSessions = new Map()
+    await rememberWorkerSession(ctx, workers, {
+      sessionID: "ses_old_worker",
+      targetDirectory: "C:/repo",
+      at: Date.now() - WORKER_TTL_MS - 1,
+    })
+    expect(isWorkerSession(workers, "ses_old_worker")).toMatchObject({
+      sessionID: "ses_old_worker",
+      role: "worker",
+    })
+
+    const first = touchWorkerSession(workers, "ses_old_worker")
+    expect(first.persist).toBe(true)
+    const second = touchWorkerSession(workers, "ses_old_worker", Date.now() + 1_000)
+    expect(second.persist).toBe(false)
+    expect(second.entry?.at).toBe(Date.now() + 1_000)
+  })
+
+  it("P0-4: LRU eviction prefers stale workers and never drops a recently seen one", async () => {
+    const { ctx } = makeContext("C:/repo")
+    const workers: WorkerSessions = new Map()
+    const now = Date.now()
+    workers.set("ses_recent", {
+      sessionID: "ses_recent",
+      at: now,
+      targetDirectory: "C:/repo",
+      role: "worker",
+    })
+    for (let index = 0; index < 500; index++) {
+      workers.set(`ses_stale_${index}`, {
+        sessionID: `ses_stale_${index}`,
+        at: now - 2 * 60 * 60 * 1_000,
+        targetDirectory: "C:/repo",
+        role: "worker",
+      })
+    }
+    await rememberWorkerSession(ctx, workers, {
+      sessionID: "ses_new",
+      targetDirectory: "C:/repo",
+    })
+    expect(workers.size).toBe(500)
+    expect(workers.has("ses_recent")).toBe(true)
+    expect(workers.has("ses_new")).toBe(true)
+    expect(workers.has("ses_stale_0")).toBe(false)
   })
 
   it("P1-7: coalesces registry writes and flushes the final state", async () => {

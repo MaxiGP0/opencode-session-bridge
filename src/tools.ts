@@ -67,6 +67,7 @@ import {
   getProcessWorkerSessions,
   isOwnedSession,
   isWorkerSession,
+  touchWorkerSession,
   lookupOpenSession,
   rememberOpenSession,
   rememberOwnedSession,
@@ -219,6 +220,7 @@ export type ToolDeps = {
   git?: GitRunner
   validateDirectory?: DirectoryValidator
   refreshWorkers?: () => Promise<void>
+  persistWorkers?: () => Promise<void>
 }
 
 function orchestrationDeps(deps: ToolDeps): OrchestrationDeps {
@@ -1009,6 +1011,15 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
               deps.workerSessions ?? getProcessWorkerSessions(),
               context.sessionID,
             )
+          }
+          if (worker) {
+            const touch = touchWorkerSession(
+              deps.workerSessions ?? getProcessWorkerSessions(),
+              context.sessionID,
+            )
+            if (touch.persist && deps.persistWorkers) {
+              await deps.persistWorkers().catch(() => undefined)
+            }
           }
           if (worker && !deps.options.allowWorkerOrchestration) {
             return {

@@ -204,6 +204,10 @@ pushed automatically.
   permission preset also denies `session_bridge.*`, `git push`, `git worktree`,
   `git checkout`/`switch`, `--force`, and `external_directory`. Enable
   `allowWorkerOrchestration: true` only for trusted workers.
+- The worker role is persistent while the session exists: it no longer expires
+  after 7 days. Last-seen times refresh in memory on every tool call and are
+  persisted at most once per minute. The 500-entry soft cap evicts least-recently
+  seen workers and never evicts one seen within the last hour.
 - `open({ messageID })` includes the target directory in the mapping and the
   in-flight key. The same `messageID` in another directory is a conflict, not a
   silent reuse.

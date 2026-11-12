@@ -9,7 +9,10 @@ const MAX_OPEN = 500
 const MAX_WORKERS = 500
 const OPEN_TTL_MS = 7 * 24 * 60 * 60 * 1_000
 export const OWNED_TTL_MS = 30 * 24 * 60 * 60 * 1_000
+/** Deprecated: worker registrations are persistent; kept for older callers. */
 export const WORKER_TTL_MS = 7 * 24 * 60 * 60 * 1_000
+/** A worker seen inside this window is never evicted by the soft LRU cap. */
+const ACTIVE_WORKER_WINDOW_MS = 60 * 60 * 1_000
 
 export type SessionRole = "orchestrator" | "worker"
 
@@ -57,6 +60,8 @@ export type WorkerSessionEntry = {
   ownerDirectory?: string
   targetDirectory: string
   role: "worker"
+  /** In-memory only: last time this touch was persisted. */
+  touchPersistedAt?: number
 }
 
 export type WorkerSessions = Map<string, WorkerSessionEntry>
@@ -311,11 +316,29 @@ export function isWorkerSession(
   if (!sessionID) return undefined
   const entry = workers.get(sessionID)
   if (!entry) return undefined
-  if (now - entry.at > WORKER_TTL_MS) {
-    workers.delete(sessionID)
-    return undefined
-  }
+  // The worker role is persistent while the session exists. Refreshing `at`
+  // keeps the in-memory LRU honest without writing storage on every call.
+  if (now > entry.at) entry.at = now
   return entry
+}
+
+export const WORKER_TOUCH_INTERVAL_MS = 60_000
+
+/**
+ * Refreshes the in-memory last-seen timestamp and reports whether the touch
+ * should be persisted. Callers persist at most once per minute per worker.
+ */
+export function touchWorkerSession(
+  workers: WorkerSessions,
+  sessionID: string | undefined,
+  now = Date.now(),
+): { entry?: WorkerSessionEntry; persist: boolean } {
+  const entry = isWorkerSession(workers, sessionID, now)
+  if (!entry) return { persist: false }
+  const last = entry.touchPersistedAt ?? 0
+  if (now - last < WORKER_TOUCH_INTERVAL_MS) return { entry, persist: false }
+  entry.touchPersistedAt = now
+  return { entry, persist: true }
 }
 
 /**
@@ -331,13 +354,17 @@ export function getProcessWorkerSessions(): WorkerSessions {
 }
 
 function pruneWorkers(workers: WorkerSessions, now = Date.now()): void {
-  for (const [sessionID, entry] of workers) {
-    if (now - entry.at > WORKER_TTL_MS) workers.delete(sessionID)
-  }
   while (workers.size > MAX_WORKERS) {
-    const oldest = workers.keys().next().value
-    if (typeof oldest !== "string") break
-    workers.delete(oldest)
+    // Evict the least recently seen entry, but never one observed inside the
+    // active window. A burst of active workers can temporarily exceed the cap;
+    // silently dropping an active worker would re-enable orchestration tools.
+    let oldest: [string, WorkerSessionEntry] | undefined
+    for (const entry of workers) {
+      if (now - entry[1].at <= ACTIVE_WORKER_WINDOW_MS) continue
+      if (!oldest || entry[1].at < oldest[1].at) oldest = entry
+    }
+    if (!oldest) break
+    workers.delete(oldest[0])
   }
 }
 

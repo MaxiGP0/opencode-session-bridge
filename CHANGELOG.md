@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- P0-4: the worker role is persistent while the session exists. The 7-day TTL
+  no longer deletes registrations, touches refresh in memory and persist at most
+  once per minute, and the 500-entry LRU evicts the least recently seen stale
+  worker without dropping one seen in the last hour.
+
 - P0-3: race snapshots no longer capture secret-like files into patches,
   output, storage, or temp files, even when the worker committed them. Affected
   candidates are marked `unsupported`, `diffComplete: false`,

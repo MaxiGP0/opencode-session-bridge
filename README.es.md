@@ -213,6 +213,10 @@ pushea automáticamente.
   preset también deniega `session_bridge.*`, `git push`, `git worktree`,
   `git checkout`/`switch`, `--force` y `external_directory`. Habilita
   `allowWorkerOrchestration: true` solo para workers de confianza.
+- El rol de worker es persistente mientras exista la sesión: ya no caduca a los
+  7 días. El último uso se refresca en memoria en cada tool call y se persiste
+  como máximo una vez por minuto. El límite blando de 500 entradas expulsa a los
+  workers menos usados y nunca a uno visto en la última hora.
 - `open({ messageID })` incluye el directorio target en el mapping y en la clave
   in-flight. El mismo `messageID` en otro directorio es un conflicto, no una
   reutilización silenciosa.
