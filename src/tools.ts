@@ -221,6 +221,7 @@ export type ToolDeps = {
   validateDirectory?: DirectoryValidator
   refreshWorkers?: () => Promise<void>
   persistWorkers?: () => Promise<void>
+  workerRefreshStats?: () => { count: number; lastAt?: number }
 }
 
 function orchestrationDeps(deps: ToolDeps): OrchestrationDeps {
@@ -1006,11 +1007,16 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
             context.sessionID,
           )
           if (!worker && deps.refreshWorkers) {
-            await deps.refreshWorkers()
-            worker = isWorkerSession(
-              deps.workerSessions ?? getProcessWorkerSessions(),
-              context.sessionID,
-            )
+            const knownOrchestrator =
+              context.sessionID &&
+              deps.ownedSessions.get(context.sessionID)?.role === "orchestrator"
+            if (!knownOrchestrator) {
+              await deps.refreshWorkers()
+              worker = isWorkerSession(
+                deps.workerSessions ?? getProcessWorkerSessions(),
+                context.sessionID,
+              )
+            }
           }
           if (worker) {
             const touch = touchWorkerSession(
@@ -3089,6 +3095,13 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         return !record.projectID || !projectID || record.projectID === String(projectID)
       })
       const workers = [...(deps.workerSessions ?? getProcessWorkerSessions()).values()]
+      const workerRefresh = deps.workerRefreshStats?.() ?? { count: 0 }
+      const workerSummary = {
+        count: workers.length,
+        recent: workers.filter((entry) => Date.now() - entry.at <= 60 * 60 * 1_000).length,
+        refreshCount: workerRefresh.count,
+        lastRefreshAt: workerRefresh.lastAt,
+      }
       const lastCleanupAt = races
         .map((race) => race.cleanup?.at)
         .filter((value): value is number => typeof value === "number")
@@ -3145,7 +3158,9 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
         `${t(lang, "lastUpdate")}: ${formatTimestamp(live?.lastEventAt, lang)}`,
         `registry: owned=${registry?.owned ?? 0} open=${registry?.open ?? 0} dirty=${
           registry?.dirtyOwned || registry?.dirtyOpen ? "yes" : "no"
-        } workers=${workers.length}`,
+        } workers=${workerSummary.count} (recent=${workerSummary.recent}, refreshes=${
+          workerSummary.refreshCount
+        })`,
         `live: sessions=${live?.sessions ?? 0} pending=${live?.pending ?? 0}`,
         `queues: sessions=${queuedPrompts.size} entries=${queueEntries}`,
         `races: count=${raceSummary.count} running=${raceSummary.running} candidates=${
@@ -3169,7 +3184,7 @@ export function registerTools(editor: ToolEditor, deps: ToolDeps): void {
           queues: { sessions: queuedPrompts.size, entries: queueEntries },
           races: raceSummary,
           worktrees: worktreeSummary,
-          workers: { count: workers.length },
+          workers: workerSummary,
           stream: {
             eventSubscribe: capabilities.eventSubscribe,
             lastEventAt: live?.lastEventAt,

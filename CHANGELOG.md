@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Performance
+
+- P1-8: worker storage is no longer read on every tool call. Refreshes are
+  throttled to one per 2 seconds, skipped for known orchestrator sessions, and
+  same-process worker registrations are visible immediately. `diagnostics`
+  exposes refresh counters.
+
 ### Fixed
 
 - P1-7: `applyCandidate` checks idempotency before requiring a clean target.

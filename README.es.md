@@ -216,7 +216,11 @@ pushea automáticamente.
 - El rol de worker es persistente mientras exista la sesión: ya no caduca a los
   7 días. El último uso se refresca en memoria en cada tool call y se persiste
   como máximo una vez por minuto. El límite blando de 500 entradas expulsa a los
-  workers menos usados y nunca a uno visto en la última hora.
+  workers menos usados y nunca a uno visto en la última hora. El storage de
+  workers se relee como máximo cada 2 segundos y se omite para orquestadores
+  conocidos; los workers creados en el mismo proceso se reconocen al instante.
+  `diagnostics` informa `workers.count`, `workers.recent`, `refreshCount` y
+  `lastRefreshAt`.
 - `open({ messageID })` incluye el directorio target en el mapping y en la clave
   in-flight. El mismo `messageID` en otro directorio es un conflicto, no una
   reutilización silenciosa.

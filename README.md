@@ -207,7 +207,11 @@ pushed automatically.
 - The worker role is persistent while the session exists: it no longer expires
   after 7 days. Last-seen times refresh in memory on every tool call and are
   persisted at most once per minute. The 500-entry soft cap evicts least-recently
-  seen workers and never evicts one seen within the last hour.
+  seen workers and never evicts one seen within the last hour. Worker storage is
+  re-read at most once every 2 seconds and skipped for known orchestrators;
+  workers created in the same process are recognized immediately.
+  `diagnostics` reports `workers.count`, `workers.recent`, `refreshCount`, and
+  `lastRefreshAt`.
 - `open({ messageID })` includes the target directory in the mapping and the
   in-flight key. The same `messageID` in another directory is a conflict, not a
   silent reuse.

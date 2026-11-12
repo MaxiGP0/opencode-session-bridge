@@ -103,7 +103,19 @@ export default Plugin.define({
     const registrations: RegistrationLike[] = []
     const liveController = new AbortController()
 
+    const WORKER_REFRESH_INTERVAL_MS = 2_000
+    let lastWorkerRefreshAt = 0
+    let workerRefreshCount = 0
     const refreshWorkers = async () => {
+      const now = Date.now()
+      if (
+        lastWorkerRefreshAt > 0 &&
+        now - lastWorkerRefreshAt < WORKER_REFRESH_INTERVAL_MS
+      ) {
+        return
+      }
+      lastWorkerRefreshAt = now
+      workerRefreshCount++
       const loaded = await loadWorkerSessions(ctx)
       for (const [sessionID, entry] of loaded) workerSessions.set(sessionID, entry)
       for (const [sessionID, entry] of getProcessWorkerSessions()) workerSessions.set(sessionID, entry)
@@ -173,6 +185,10 @@ export default Plugin.define({
         git: runGit,
         refreshWorkers,
         persistWorkers: () => persistWorkerSessions(ctx, workerSessions),
+        workerRefreshStats: () => ({
+          count: workerRefreshCount,
+          lastAt: lastWorkerRefreshAt || undefined,
+        }),
       })
     })
 

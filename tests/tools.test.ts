@@ -146,6 +146,7 @@ function makeHarness(options: HarnessOptions = {}) {
   const messages = new Map<string, MessageLike[]>()
   const permissions = new Map<string, PermissionLike[]>()
   const storage = new Map<string, unknown>()
+  const storageGets = new Map<string, number>()
   if (options.initialRaces) storage.set("session-bridge:races", options.initialRaces)
   if (options.initialWorktrees) storage.set("session-bridge:worktrees", options.initialWorktrees)
   if (options.initialWorkers) storage.set("session-bridge:workers", options.initialWorkers)
@@ -236,7 +237,10 @@ function makeHarness(options: HarnessOptions = {}) {
         }
       : undefined,
     storage: {
-      get: async (key: string) => storage.get(key),
+      get: async (key: string) => {
+        storageGets.set(key, (storageGets.get(key) ?? 0) + 1)
+        return storage.get(key)
+      },
       set: async (key: string, value: unknown) => {
         storage.set(key, value)
       },
@@ -550,6 +554,7 @@ function makeHarness(options: HarnessOptions = {}) {
     messages,
     permissions,
     storage,
+    storageGets,
     promptCalls,
     admissions,
     updateCalls,
@@ -2798,6 +2803,39 @@ describe("orchestration tools", () => {
     } finally {
       await repo.cleanup()
     }
+  })
+
+  it("P1-8: throttles worker refreshes across orchestrator tool calls", async () => {
+    const harness = makeHarness()
+    await harness.ready
+    const afterSetup = harness.state.storageGets.get("session-bridge:workers") ?? 0
+    for (let index = 0; index < 5; index++) {
+      await harness.execute("status", { sessionID: "ses_1" })
+    }
+    const afterCalls = harness.state.storageGets.get("session-bridge:workers") ?? 0
+    expect(afterCalls - afterSetup).toBeLessThanOrEqual(1)
+
+    const diagnostics = await harness.executeRaw("diagnostics", {})
+    const output = diagnostics.output as Record<string, unknown>
+    expect((output.workers as Record<string, unknown>).refreshCount).toBeGreaterThanOrEqual(1)
+  })
+
+  it("P1-8: recognizes a worker created in this process without a storage read", async () => {
+    const harness = makeHarness()
+    const opened = await harness.executeRaw("open", {
+      prompt: "work",
+      wait: true,
+      runID: "run_worker_local",
+    })
+    const workerID = String((opened.output as Record<string, unknown>).sessionID)
+    const before = harness.state.storageGets.get("session-bridge:workers") ?? 0
+    const blocked = await harness.executeRaw(
+      "status",
+      { sessionID: workerID },
+      { sessionID: workerID },
+    )
+    expect(blocked.output).toMatchObject({ state: "error", worker: true })
+    expect(harness.state.storageGets.get("session-bridge:workers") ?? 0).toBe(before)
   })
 
   it("P1-2: wait does not return idle when the session is busy with a newer turn", async () => {
