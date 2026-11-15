@@ -326,7 +326,7 @@ const run = await tools.sessions.bestOf({
   carrera terminada más antigua por `updatedAt`, nunca una running, y borra sus
   patch files. El cap de worktrees expulsa primero `removed`/`orphan` y nunca un
   worktree `ready` con sesiones o creado en la última hora.
-- `worktrees` `list` consulta dirty/branch con concurrencia acotada (2–4,
+- `worktrees` `list` consulta dirty/branch con concurrencia acotada (1–4,
   derivada de `maxConcurrentSessions`) y `remove` procesa directorios
   independientes en paralelo preservando el orden. Los candidatos de race se
   crean con `maxConcurrentSessions`; los snapshots de candidatos en worktrees

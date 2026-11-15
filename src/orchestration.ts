@@ -1226,7 +1226,6 @@ export async function runRace(
       controller.signal,
       deadline,
       () => timedOut,
-      () => signal.aborted,
     )
   } finally {
     clearTimeout(timer)
@@ -1241,7 +1240,6 @@ async function runRaceBody(
   signal: AbortSignal,
   deadline: number,
   timedOut: () => boolean,
-  callerAborted: () => boolean,
 ): Promise<RaceRunResult> {
   const targetDirectory = deps.ctx.location?.directory
   if (!targetDirectory) throw new Error("ctx.location.directory is not available")

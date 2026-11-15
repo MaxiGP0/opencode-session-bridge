@@ -316,7 +316,7 @@ const run = await tools.sessions.bestOf({
   never a running one, and removes its patch files. The worktree cap evicts
   `removed`/`orphan` records first and never a `ready` worktree with sessions or
   one created in the last hour.
-- Worktree `list` checks dirty state/branch with bounded concurrency (2–4,
+- Worktree `list` checks dirty state/branch with bounded concurrency (1–4,
   derived from `maxConcurrentSessions`), and `remove` processes independent
   directories in parallel while preserving result order. Race candidates are
   created with `maxConcurrentSessions`; snapshots for worktree candidates use

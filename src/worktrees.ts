@@ -423,7 +423,7 @@ async function mapWithConcurrency<T, R>(
 }
 
 function worktreeConcurrency(deps: WorktreeDeps): number {
-  return Math.max(2, Math.min(4, deps.options.maxConcurrentSessions))
+  return Math.max(1, Math.min(4, deps.options.maxConcurrentSessions))
 }
 
 export async function listWorktrees(
