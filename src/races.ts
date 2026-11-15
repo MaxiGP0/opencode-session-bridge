@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto"
 import { codePointLength, compact, truncateCodePoints } from "./format.ts"
+import { removeRacePatches } from "./git.ts"
 import type { BridgeOptions } from "./options.ts"
 import type { PluginContext } from "./types.ts"
 import type { WorktreeStrategy } from "./worktrees.ts"
@@ -156,16 +157,35 @@ function validTimestamp(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined
 }
 
-function pruneRaces(races: RaceRegistry, now = Date.now()): void {
+function pruneRaces(
+  races: RaceRegistry,
+  now = Date.now(),
+  retentionMs = DEFAULT_RETENTION_MS,
+): string[] {
+  const removed: string[] = []
   for (const [raceID, race] of races) {
     if (race.status === "running") continue
-    if (now - race.updatedAt > DEFAULT_RETENTION_MS) races.delete(raceID)
+    if (now - race.updatedAt > retentionMs) {
+      races.delete(raceID)
+      removed.push(raceID)
+    }
   }
   while (races.size > MAX_RACES) {
-    const oldest = races.keys().next().value
-    if (typeof oldest !== "string") break
-    races.delete(oldest)
+    // Evict the oldest finished race; never drop one that is still running.
+    let oldestID: string | undefined
+    let oldestAt = Number.POSITIVE_INFINITY
+    for (const [raceID, race] of races) {
+      if (race.status === "running") continue
+      if (race.updatedAt < oldestAt) {
+        oldestAt = race.updatedAt
+        oldestID = raceID
+      }
+    }
+    if (!oldestID) break
+    races.delete(oldestID)
+    removed.push(oldestID)
   }
+  return removed
 }
 
 export function createRaceID(): string {
@@ -173,7 +193,10 @@ export function createRaceID(): string {
   return `race_${Date.now().toString(36)}_${random}`
 }
 
-export async function loadRaces(ctx: PluginContext): Promise<RaceRegistry> {
+export async function loadRaces(
+  ctx: PluginContext,
+  options: { retentionMs?: number } = {},
+): Promise<RaceRegistry> {
   const races: RaceRegistry = new Map()
   try {
     const raw = await ctx.storage?.get(RACES_KEY)
@@ -195,7 +218,10 @@ export async function loadRaces(ctx: PluginContext): Promise<RaceRegistry> {
     // Storage is optional.
   }
   for (const [raceID, race] of processRaces) races.set(raceID, race)
-  pruneRaces(races)
+  const removed = pruneRaces(races, Date.now(), options.retentionMs)
+  for (const raceID of removed) {
+    await removeRacePatches(raceID)
+  }
   return races
 }
 
@@ -261,9 +287,10 @@ export type RacePersistence = {
 export function createRacePersistence(
   ctx: PluginContext,
   races: RaceRegistry,
-  options: { flushDelayMs?: number } = {},
+  options: { flushDelayMs?: number; retentionMs?: number } = {},
 ): RacePersistence {
   const flushDelayMs = Math.max(1, options.flushDelayMs ?? 300)
+  const retentionMs = options.retentionMs
   let dirty = false
   let timer: ReturnType<typeof setTimeout> | undefined
   let flushing: Promise<void> | undefined
@@ -306,10 +333,17 @@ export function createRacePersistence(
 
   return {
     remember(race) {
+      races.delete(race.raceID)
       races.set(race.raceID, race)
+      processRaces.delete(race.raceID)
       processRaces.set(race.raceID, race)
-      pruneRaces(races)
-      pruneRaces(processRaces)
+      const removed = [
+        ...pruneRaces(races, Date.now(), retentionMs),
+        ...pruneRaces(processRaces, Date.now(), retentionMs),
+      ]
+      for (const raceID of removed) {
+        void removeRacePatches(raceID)
+      }
       dirty = true
       schedule()
     },
@@ -337,11 +371,21 @@ export async function rememberRace(
   ctx: PluginContext,
   races: RaceRegistry,
   race: RaceRecord,
+  options: { retentionMs?: number } = {},
 ): Promise<void> {
+  races.delete(race.raceID)
   races.set(race.raceID, race)
+  processRaces.delete(race.raceID)
   processRaces.set(race.raceID, race)
-  pruneRaces(races)
-  pruneRaces(processRaces)
+  const removed = pruneRaces(races, Date.now(), options.retentionMs)
+  const removedProcess = pruneRaces(
+    processRaces,
+    Date.now(),
+    options.retentionMs,
+  )
+  for (const raceID of [...removed, ...removedProcess]) {
+    await removeRacePatches(raceID)
+  }
   await persistRaces(ctx, races)
 }
 

@@ -311,7 +311,11 @@ const run = await tools.sessions.bestOf({
   `patchFile`; storage keeps `patchFile`, `patchHash`, `patchBytes`, and file
   summaries instead of the full patch or `files[].patch`. `applyCandidate`
   reads the patch file. Worktree registry writes are batched per
-  create/remove operation.
+  create/remove operation. `raceRetentionMs` is applied when loading and
+  remembering races; pruning evicts the oldest finished race by `updatedAt`,
+  never a running one, and removes its patch files. The worktree cap evicts
+  `removed`/`orphan` records first and never a `ready` worktree with sessions or
+  one created in the last hour.
 - Worktree `list` checks dirty state/branch with bounded concurrency (2–4,
   derived from `maxConcurrentSessions`), and `remove` processes independent
   directories in parallel while preserving result order. Race candidates are
@@ -657,7 +661,7 @@ default.
 | `maxDiffBytes` | `200000` | Maximum displayed diff bytes per candidate. Apply uses the commit or full patch, not this display cap. |
 | `maxTestOutputChars` | `20000` | Maximum stdout/stderr characters per test command. |
 | `maxRaceWallClockMs` | `600000` | Default race wall-clock timeout. |
-| `raceRetentionMs` | `604800000` | Race record retention. |
+| `raceRetentionMs` | `604800000` | Retention for finished race records. Running races are never pruned. |
 | `gitTimeoutMs` | `120000` | Timeout for git/verification commands. |
 | `debug` | `false` | Reserved for diagnostic logging. |
 

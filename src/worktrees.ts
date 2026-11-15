@@ -49,6 +49,8 @@ export type WorktreeDeps = {
 const WORKTREES_KEY = "session-bridge:worktrees"
 const MAX_WORKTREES = 200
 const WORKTREE_TTL_MS = 30 * 24 * 60 * 60 * 1_000
+/** A ready worktree created inside this window is never evicted by the cap. */
+const WORKTREE_ACTIVE_WINDOW_MS = 60 * 60 * 1_000
 
 const processWorktrees: WorktreeRegistry = new Map()
 
@@ -83,9 +85,29 @@ function pruneWorktrees(records: WorktreeRegistry, now = Date.now()): void {
     }
   }
   while (records.size > MAX_WORKTREES) {
-    const oldest = records.keys().next().value
-    if (typeof oldest !== "string") break
-    records.delete(oldest)
+    let oldest: [string, WorktreeRecord] | undefined
+    let oldestPriority = Number.POSITIVE_INFINITY
+    for (const entry of records) {
+      const record = entry[1]
+      // Never evict a ready worktree that has sessions or recent activity.
+      if (
+        record.state === "ready" &&
+        (record.sessions.length > 0 || now - record.createdAt < WORKTREE_ACTIVE_WINDOW_MS)
+      ) {
+        continue
+      }
+      const priority = record.state === "ready" ? 1 : 0
+      if (
+        !oldest ||
+        priority < oldestPriority ||
+        (priority === oldestPriority && record.createdAt < oldest[1].createdAt)
+      ) {
+        oldest = entry
+        oldestPriority = priority
+      }
+    }
+    if (!oldest) break
+    records.delete(oldest[0])
   }
 }
 

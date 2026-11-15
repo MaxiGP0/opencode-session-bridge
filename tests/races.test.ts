@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest"
+import { access } from "node:fs/promises"
 import { boundOutputTotal } from "../src/output.ts"
 import { DEFAULT_OPTIONS } from "../src/options.ts"
+import { writePatchFile } from "../src/git.ts"
 import {
   analyzeDiffs,
   isCiPath,
   isTestPath,
+  loadRaces,
   parsePatchFiles,
   patchDisablesTests,
   rankCandidates,
@@ -39,6 +42,40 @@ function candidate(overrides: Partial<CandidateRecord>): CandidateRecord {
     applyStrategy: "cherry-pick",
     ...overrides,
   }
+}
+
+function raceRecord(
+  raceID: string,
+  overrides: Partial<RaceRecord> = {},
+): RaceRecord {
+  return {
+    raceID,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    targetDirectory: "C:/repo",
+    mode: "worktrees",
+    prompt: "implement it",
+    keepWorktrees: false,
+    status: "completed",
+    candidates: [],
+    worktrees: [],
+    ...overrides,
+  }
+}
+
+function raceContext(storage: Map<string, unknown>) {
+  return {
+    storage: {
+      get: async (key: string) => storage.get(key),
+      set: async (key: string, value: unknown) => {
+        storage.set(key, value)
+      },
+      remove: async (key: string) => {
+        storage.delete(key)
+      },
+      scan: async () => ({ entries: [] }),
+    },
+  } as unknown as import("../src/types.ts").PluginContext
 }
 
 describe("race diff analysis", () => {
@@ -192,6 +229,43 @@ describe("race diff analysis", () => {
     expect(ranking.rankingReasons).toContain("tests-skipped")
   })
 
+  it("P2-3: applies raceRetentionMs and never evicts a running race", async () => {
+    const storage = new Map<string, unknown>()
+    const now = Date.now()
+    const running = Array.from({ length: 50 }, (_, index) =>
+      raceRecord(`race_running_${index}`, { status: "running", updatedAt: now }),
+    )
+    const finished = raceRecord("race_finished", {
+      status: "completed",
+      updatedAt: now - 1_000,
+    })
+    const expired = raceRecord("race_expired", {
+      status: "completed",
+      updatedAt: now - 120_000,
+    })
+    storage.set("session-bridge:races", [...running, finished, expired])
+    const ctx = raceContext(storage)
+
+    const loaded = await loadRaces(ctx, { retentionMs: 60_000 })
+    expect(loaded.has("race_expired")).toBe(false)
+    expect(loaded.has("race_finished")).toBe(false)
+    expect(loaded.size).toBe(50)
+    expect([...loaded.values()].every((race) => race.status === "running")).toBe(true)
+  })
+
+  it("P2-3: removes patch files when a race is pruned", async () => {
+    const storage = new Map<string, unknown>()
+    const raceID = "race_prune_patch"
+    const file = await writePatchFile(raceID, "candidate-1", "diff --git a/a b/a\n")
+    storage.set("session-bridge:races", [
+      raceRecord(raceID, { status: "completed", updatedAt: Date.now() - 120_000 }),
+    ])
+    await loadRaces(raceContext(storage), { retentionMs: 60_000 })
+    await expect(access(file)).rejects.toThrow()
+  })
+})
+
+describe("race output budget", () => {
   it("P1-1: bounds a large race to the global output budget and keeps critical IDs", () => {
     const files = Array.from({ length: 50 }, (_, index) => ({
       file: `src/file-${index}.ts`,

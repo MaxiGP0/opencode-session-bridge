@@ -24,6 +24,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- P2-3 (quick win): `raceRetentionMs` now drives race pruning. Finished races
+  are evicted oldest-`updatedAt` first, running races are never evicted, and
+  pruned races remove their patch files. The worktree cap prefers
+  `removed`/`orphan` records and never evicts a ready worktree with sessions or
+  recent activity.
+
 - P1-11: `jsonSafe` now tracks arrays as well as objects, so a self-referencing
   array becomes `"[Circular]"` instead of overflowing the stack. Sibling arrays
   and repeated non-circular references are preserved.

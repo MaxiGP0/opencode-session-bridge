@@ -90,8 +90,10 @@ export default Plugin.define({
     const openSessions = await loadOpenSessions(ctx)
     const workerSessions = await loadWorkerSessions(ctx)
     const worktrees = await loadWorktrees(ctx)
-    const races = await loadRaces(ctx)
-    const racePersistence = createRacePersistence(ctx, races)
+    const races = await loadRaces(ctx, { retentionMs: options.raceRetentionMs })
+    const racePersistence = createRacePersistence(ctx, races, {
+      retentionMs: options.raceRetentionMs,
+    })
     const registry = createRegistryPersistence(ctx, ownedSessions, openSessions)
     const inFlightOpens = new Map<string, OpenInflight>()
     const inFlightSends = new Map<string, SendInflight>()

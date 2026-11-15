@@ -322,6 +322,10 @@ const run = await tools.sessions.bestOf({
   `patchBytes` y resúmenes de archivos, no el parche completo ni
   `files[].patch`. `applyCandidate` lee el patch file. Las escrituras del
   registro de worktrees se agrupan por operación de create/remove.
+  `raceRetentionMs` se aplica al cargar y recordar races; la poda expulsa la
+  carrera terminada más antigua por `updatedAt`, nunca una running, y borra sus
+  patch files. El cap de worktrees expulsa primero `removed`/`orphan` y nunca un
+  worktree `ready` con sesiones o creado en la última hora.
 - `worktrees` `list` consulta dirty/branch con concurrencia acotada (2–4,
   derivada de `maxConcurrentSessions`) y `remove` procesa directorios
   independientes en paralelo preservando el orden. Los candidatos de race se
@@ -669,7 +673,7 @@ default.
 | `maxDiffBytes` | `200000` | Máximo de bytes de diff mostrados por candidato. El apply usa el commit o el parche completo, no este límite de display. |
 | `maxTestOutputChars` | `20000` | Máximo de caracteres stdout/stderr por comando de test. |
 | `maxRaceWallClockMs` | `600000` | Timeout global por defecto de una carrera. |
-| `raceRetentionMs` | `604800000` | Retención de registros de carrera. |
+| `raceRetentionMs` | `604800000` | Retención de carreras terminadas. Las carreras running nunca se podan. |
 | `gitTimeoutMs` | `120000` | Timeout para comandos git/verificación. |
 | `debug` | `false` | Reservado para diagnóstico. |
 
